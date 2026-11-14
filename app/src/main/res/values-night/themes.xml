@@ -1,0 +1,5 @@
+<resources>
+
+    <!-- 夜间主题：跟随系统深色模式。 -->
+    <style name="Theme.TaskManager" parent="android:Theme.Material.NoActionBar" />
+</resources>

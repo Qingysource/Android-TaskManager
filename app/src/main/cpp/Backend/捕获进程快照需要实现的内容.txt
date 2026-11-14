@@ -1,0 +1,49 @@
+Linux服务捕获进程快照中需要提供的内容信息，抓取请求会携带需要的信息，然后服务只抓取需要的信息到进程快照返回就行，为了节省自由，我们建议提前规划好快照里描述进程的数据结构的位置
+
+名称	定义与获取办法	linux 服务获取情况
+名称	进程短名称（命令名），内核线程以方括号标注；读取 /proc/[pid]/stat 第 2 字段（comm），Android 同 Linux	linux 服务可直接收集
+程序包名称	仅 Android 应用有效，对应应用包名；Linux 进程无此字段；Android 通过 UID 映射包管理器获取包名，Linux 留空	安卓服务查询间接获得需要
+PID	进程唯一标识符；读取 /proc/[pid] 目录名，Android 同 Linux	linux 服务可直接收集
+状态	进程当前运行状态（运行 / 休眠 / 不可中断 / 僵尸 / 停止等）；读取 /proc/[pid]/stat 第 3 字段，Android 同 Linux	linux 服务可直接收集
+用户名	进程所属用户，格式为「用户名 (UID)」；读取 /proc/[pid]/status 中 UID 字段，映射 /etc/passwd 得到用户名，Android 额外映射包管理器	linux 服务可直接收集
+会话 ID	进程所属会话的标识；读取 /proc/[pid]/stat 第 6 字段（session），Android 同 Linux	linux 服务可直接收集
+进程组 ID	进程所属进程组标识（原作业对象分组能力）；读取 /proc/[pid]/stat 第 5 字段（pgid），Android 同 Linux	linux 服务可直接收集
+cgroup 标识	进程所属 cgroup 路径（原作业对象资源管控能力）；读取 /proc/[pid]/cgroup 文件，Android 同 Linux	linux 服务可直接收集
+CPU 使用率	进程单位时间内的 CPU 占用比例；采样 /proc/[pid]/stat 中 utime+stime 的增量，与系统总 CPU 时间增量做比值计算，Android 同逻辑	linux 服务可直接收集
+CPU 时间	进程启动后累计消耗的 CPU 总时间（用户态 + 内核态）；读取 /proc/[pid]/stat 中 utime+stime，按时钟节拍转换为秒，Android 同 Linux	linux 服务可直接收集
+CPU 周期数	进程消耗的 CPU 硬件时钟周期总数；通过 perf_event_open 系统调用或 perf stat -p <pid> 获取，Android 需内核支持 perf	linux 服务可直接收集
+常驻内存大小	进程当前占用的物理内存总量（RSS）；读取 /proc/[pid]/statm 第 2 字段，按页大小转换为字节，Android 同 Linux	linux 服务可直接收集
+峰值常驻内存	进程运行期间达到的最大物理内存值（Peak RSS）；读取 /proc/[pid]/status 中 VmHWM 字段，Android 同 Linux	linux 服务可直接收集
+常驻内存增量	两次采样间常驻内存的变化量；前后两次 RSS 数值做差值计算，Android 同逻辑	linux 服务可直接收集
+活动私有常驻内存	进程独占、且处于活动状态的物理内存；通过 /proc/[pid]/smaps 统计 Private_Dirty + Private_Active 部分，Android 同逻辑	linux 服务可直接收集
+私有常驻内存	进程独占的物理内存，不与其他进程共享；通过 /proc/[pid]/smaps 统计 Private_Dirty + Private_Clean 部分，Android 同逻辑	linux 服务可直接收集
+共享常驻内存	进程与其他进程共享的物理内存；通过 /proc/[pid]/smaps 统计 Shared_Dirty + Shared_Clean 部分，Android 同逻辑	linux 服务可直接收集
+虚拟内存大小	进程已分配的虚拟地址空间总量（VSS）；读取 /proc/[pid]/statm 第 1 字段，按页大小转换为字节，Android 同 Linux	linux 服务可直接收集
+页面错误总数	进程启动后累计触发的缺页异常总次数；读取 /proc/[pid]/stat 中 min_flt + maj_flt 之和，Android 同 Linux	linux 服务可直接收集
+页面错误增量	两次采样间缺页异常的新增次数；前后两次总缺页数做差值计算，Android 同逻辑	linux 服务可直接收集
+基本优先级 (Linux)	Linux 内核层进程调度优先级（nice 值，-20~19）；读取 /proc/[pid]/stat 第 19 字段（nice），Android 内核层同逻辑	linux 服务可直接收集
+基本优先级 (Android)	Android 框架层进程优先级（oom_adj / 进程等级）；读取 /proc/[pid]/oom_adj 或通过 ActivityManager 获取进程优先级等级，Linux 留空	安卓服务查询间接获得需要
+文件描述符数	进程当前打开的文件描述符总数；统计 /proc/[pid]/fd/ 目录下的条目数，Android 同 Linux	linux 服务可直接收集
+线程数	进程包含的线程总数；统计 /proc/[pid]/task/ 目录下的条目数，Android 同 Linux	linux 服务可直接收集
+I/O 读取次数	进程触发读系统调用的总次数；读取 /proc/[pid]/io 中 syscr 字段，Android 同 Linux	linux 服务可直接收集
+I/O 写入次数	进程触发写系统调用的总次数；读取 /proc/[pid]/io 中 syscw 字段，Android 同 Linux	linux 服务可直接收集
+I/O 读取字节	进程从磁盘 / 设备读取的总字节数；读取 /proc/[pid]/io 中 read_bytes 字段，Android 同 Linux	linux 服务可直接收集
+I/O 写入字节	进程向磁盘 / 设备写入的总字节数；读取 /proc/[pid]/io 中 write_bytes 字段，Android 同 Linux	linux 服务可直接收集
+路径名称	进程可执行文件的完整路径，内核线程留空；读取 /proc/[pid]/exe 符号链接的目标路径，Android 同 Linux、应用进程返回 APK 路径	linux 服务可直接收集
+命令行	进程启动时的完整命令行与参数；读取 /proc/[pid]/cmdline 文件，Android 同 Linux、应用进程返回包名 / 组件名	linux 服务可直接收集
+安全上下文	进程的 SELinux 安全域标识；读取 /proc/[pid]/attr/current 文件，Android 同 Linux	linux 服务可直接收集
+目标 API 版本	仅 Android 应用有效，对应应用目标 SDK 版本，Linux 留空；Android 通过包管理器读取应用 targetSdkVersion	安卓服务查询间接获得需要
+平台	进程运行的指令集位数（32 位 / 64 位）；读取 /proc/[pid]/exe ELF 文件头的 EI_CLASS 字段判断，Android 同逻辑	linux 服务可直接收集
+体系架构	进程对应的 CPU 指令集架构（x86/arm/arm64 等）；读取 ELF 文件头 e_machine 字段判断，Android 同逻辑	linux 服务可直接收集
+管理员特权	进程是否具备管理员（root）权限；判断进程有效 UID 是否为 0，是则为「是」，否则为「否」，Android 同逻辑	linux 服务可直接收集
+描述	仅 Android 应用填充应用显示名称（如「设置」），其余进程留空；Android 通过包管理器读取应用的 label 显示名称，Linux / Android 系统进程留空	安卓服务查询间接获得需要
+NX 保护	进程是否开启数据执行保护（不可执行位）；检查 /proc/[pid]/maps 是否存在同时可写可执行段，结合内核 NX 配置判断，Android 同逻辑	linux 服务可直接收集
+GPU 使用率	进程占用 GPU 的比例；Linux 依赖厂商驱动接口（如 nvidia-smi、DRM 节点），Android 依赖厂商扩展接口 /systrace	linux 服务可直接收集
+GPU 引擎	进程占用的 GPU 硬件引擎类型；Linux/Android 均依赖 GPU 厂商驱动提供的统计接口	linux 服务可直接收集
+专用 GPU 内存	进程独占的 GPU 显存大小；Linux/Android 均依赖 GPU 厂商驱动提供的统计接口	linux 服务可直接收集
+共享 GPU 内存	进程共享使用的 GPU 内存大小；Linux/Android 均依赖 GPU 厂商驱动提供的统计接口	linux 服务可直接收集
+CET 控制流强制保护	硬件级控制流 / 堆栈保护开启状态（影子栈 + 间接分支跟踪）；读取 /proc/[pid]/status 中相关标志位，结合内核 CET 支持状态判断，Android 同逻辑	linux 服务可直接收集
+隔离状态	仅两种状态：AndroidContainer（安卓应用沙箱容器进程）、留空（非安卓容器进程）；Android 普通应用进程标记为 AndroidContainer，系统核心进程、root 进程等留空，Linux 全部留空	安卓服务查询间接获得需要
+
+
+
