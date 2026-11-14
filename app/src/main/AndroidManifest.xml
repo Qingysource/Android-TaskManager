@@ -1,10 +1,51 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 添加网络权限 -->
-    <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+        [OVERLAY-v1] 浮窗权限组（回退浮窗时：删掉 SYSTEM_ALERT_WINDOW 一条即可；
+                     FOREGROUND_SERVICE / FOREGROUND_SERVICE_SPECIAL_USE / POST_NOTIFICATIONS
+                     属于"UIService 常驻前台"，不要再删）
+        - SYSTEM_ALERT_WINDOW             画"其他应用上方"的窗口，属于特殊应用权限，
+                                          只能引导用户去系统设置里手动开；
+        - FOREGROUND_SERVICE              UIService 是常驻前台服务：界面关掉后它仍要采集数据、
+                                          维持上游服务与身份，普通后台服务会被系统回收；
+        - FOREGROUND_SERVICE_SPECIAL_USE  targetSdk 34+ 的前台服务必须声明用途类型；
+        - POST_NOTIFICATIONS              前台服务通知（Android 13+ 未授权时通知不显示，
+                                          服务本身照常运行，只是用户看不到"正在后台运行"）。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+        Shizuku 授权口径（缺一条都拿不到 binder）：
+        - API_V23：声明本应用按 Shizuku 的运行时权限模型申请授权；
+        - 下面的 ShizukuProvider：Shizuku 是通过 ContentProvider 把服务 binder
+          送进应用进程的，没声明它，Shizuku.pingBinder() 永远 false，
+          表现为"请求权限"立刻失败。
+
+        [SHIZUKU-v1] 回退时：删掉这条 uses-permission 与 application 里的 <provider>，
+                    并把 ShizukuManager 一起摘掉即可，不影响其它功能。
+    -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+    <!--
+        包可见性声明（Android 11+ 必需）。
+
+        要判断"Shizuku 装没装""服务在不在跑"，以及要能 startActivity 打开 Shizuku 让用户
+        启动服务，就必须让本应用"看得见" moe.shizuku.privileged.api。
+        没有这段声明，PackageManager.getPackageInfo / getLaunchIntentForPackage 会直接抛
+        NameNotFound，表现为"永远显示未安装 Shizuku"，而设备上其实是装了的。
+    -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <!--
+        应用整体配置：备份规则、图标、主题。
+        界面完全由 Compose 绘制，这里的主题主要作用于启动窗口与系统装饰。
+    -->
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -15,7 +56,13 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.TaskManager">
 
-        <!-- Shizuku Provider 配置 -->
+        <!--
+            Shizuku 的 binder 入口（必需，缺了它授权永远失败）。
+
+            authorities 用 ${applicationId}.shizuku 是 Shizuku 的固定约定，
+            由 rikka.shizuku:provider 里的 ShizukuProvider 负责转发 binder；
+            android:permission 把 provider 保护起来，别的应用读不到本进程的这条通道。
+        -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -24,18 +71,60 @@
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
+        <!--
+            应用唯一入口 Activity：单 Activity + Compose 多页面导航，
+            进入后由 MainActivity.onCreate() 启动下列服务并初始化权限通道。
+        -->
         <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:label="@string/app_name"
-            android:theme="@style/Theme.TaskManager"
-            android:windowSoftInputMode="adjustResize">
+            android:name="com.android.taskmanager.MainActivity"
+            android:exported="true">
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
         </activity>
+
+        <!--
+            UI 辅助服务：数据中枢（设置持久化 + 上游服务维护 + 轮询 + [OVERLAY-v1] 浮窗管理）。
+
+            **常驻前台服务**：界面只是它的视图，服务本身不依赖 Activity 存活，
+            由 MainActivity 用 startForegroundService 拉起，onCreate/onStartCommand 里立即
+            startForeground，并返回 START_STICKY（被系统回收后自动重建）。
+            - stopWithTask="false"：用户从最近任务里划掉应用，服务继续运行（默认值也是 false，
+                                   这里显式写出，避免以后被误改）；
+            - foregroundServiceType="specialUse"：targetSdk 34+ 必须声明类型，
+                                   Manifest 用 <property> 说明具体用途。
+            （浮窗只是在这条服务之上额外挂了一个窗口，开/关只改通知文案。）
+        -->
+        <service
+            android:name="com.android.taskmanager.service.UIService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="task_manager_data_hub" />
+
+        </service>
+
+        <!-- Android Framework 数据服务（预留：进程、内存、CPU 等数据源） -->
+        <service
+            android:name="com.android.taskmanager.data.AndroidService"
+            android:exported="false" />
+
+        <!-- Linux 数据服务（预留：/proc 数据源，需要 Root 或 Shizuku 授权） -->
+        <service
+            android:name="com.android.taskmanager.data.LinuxService"
+            android:exported="false" />
+
+        <!--
+            TODO(预留): 接入真实数据采集后需要补充权限声明，例如：
+            QUERY_ALL_PACKAGES（应用历史、启动项）、PACKAGE_USAGE_STATS（使用统计，需用户特殊授权）、
+            REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 等。当前保持最小权限。
+        -->
     </application>
 
 </manifest>
