@@ -71,6 +71,25 @@ import com.android.taskmanager.service.ShizukuManager
 import com.android.taskmanager.service.RootManager
 
 // ============================================================
+// Full-screen Chart Summary
+// ============================================================
+
+/**
+ * 图形摘要视图开关（进程级共享状态）。
+ *
+ * 为什么需要一个跨组件的东西：进入摘要视图要求 MainPage 把左侧导航栏、页名行、
+ * 窄屏顶栏全部让出来；而退出（长按图表）发生在 PerformanceScreen 内部。
+ * 这两个 Composable 不是父子关系，只能靠同一个状态打通。
+ *
+ * 只在性能页生效：MainPage 判断时同时看开关和当前页，切到别的页不会误伤。
+ */
+object ChartSummaryView {
+
+    /** 是否处于图形摘要视图。 */
+    val active = mutableStateOf(false)
+}
+
+// ============================================================
 // Activity Entry
 // ============================================================
 
@@ -550,7 +569,16 @@ private fun MainPage(
         // 响应式断点：宽度 >= 600dp 视为宽屏（平板、折叠屏展开、桌面模式）
         val isWide = maxWidth >= 600.dp
 
-        if (isWide) {
+        // 图形摘要视图：性能页要求整页只剩图表，导航栏 / 页名行 / 顶栏全部让位。
+        // 用 if / else if 而不是在页面内部藏，是因为这三块都在本函数里画，
+        // 页面没有能力也不该去动别人的导航。
+        val chartSummary = ChartSummaryView.active.value && selectedPage == TaskPage.Performance
+
+        if (chartSummary) {
+
+            PageContent(selectedPage, settingsProvider, onSettingChanged)
+
+        } else if (isWide) {
             Row(Modifier.fillMaxSize()) {
                 WideTaskNavigation(
                     selectedPage = selectedPage,

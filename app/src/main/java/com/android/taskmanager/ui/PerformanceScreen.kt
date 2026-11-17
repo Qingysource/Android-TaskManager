@@ -59,6 +59,9 @@
  */
 package com.android.taskmanager
 
+import android.content.ClipData
+import android.content.Context
+
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -85,6 +88,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -107,6 +111,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -134,6 +139,13 @@ private val PERFORMANCE_WIDE_MIN_WIDTH = 520.dp
  */
 private const val PERFORMANCE_CHART_POINTS = 60
 
+/** 图表菜单里复制进剪贴板的文本：这一版是占位内容。 */
+private const val CHART_MENU_COPY_TEXT = "测试内容"
+
+/** 内核图形口径：整颗处理器的总利用率 / 逐个逻辑处理器。 */
+private const val CPU_KERNEL_GRAPH_TOTAL = "TOTAL"
+private const val CPU_KERNEL_GRAPH_LOGICAL = "LOGICAL"
+
 /** 窄屏底部硬件条的单项高度：一行文字，按压目标够大就行。 */
 private val PERFORMANCE_COMPACT_TAB_HEIGHT = 38.dp
 
@@ -142,9 +154,6 @@ private const val TEST_CHART_WINDOW_SECONDS = 60
 
 /** 硬件名称占位：CPU 用服务给的处理器商品名，取不到才回落它。 */
 private const val TEST_HARDWARE_NAME = "NAME"
-
-/** 左列迷你图取尾部多少个点：这个尺寸下再多就挤成一团了。 */
-private const val MINI_SPARKLINE_POINTS = 12
 
 /**
  * 左栏的五个硬件入口。
@@ -286,8 +295,79 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     // 历史点：大图与左列迷你图共用这一份，只有取哪些点、画在哪里不同
     val history = service?.performanceCpuHistory() ?: emptyList()
 
-    // 长按图表弹出的测试对话框
+    // 长按图表弹出的菜单
     var chartDialogVisible by remember { mutableStateOf(false) }
+
+    // 菜单里的两项选择：内核图形口径、是否显示内核时间。
+    // 现在只做到"选得中、关掉菜单再打开还留着"；画法要等逐核数据接到 UI 才真正生效。
+    var kernelGraphMode by rememberSaveable { mutableStateOf(CPU_KERNEL_GRAPH_TOTAL) }
+    var showKernelTime by rememberSaveable { mutableStateOf(false) }
+
+    // 双击图表切进摘要视图。
+    // 只认 CPU：其余四个硬件现在没有真实曲线，在它们上面双击会弹出一张 CPU 图，容易误解。
+    val enterChartSummary: () -> Unit = {
+        if (selected == HardwareKind.CPU) {
+            ChartSummaryView.active.value = true
+        }
+    }
+
+    // 图形摘要视图：整页只剩这一页的头部（名称行 / 标签行）与图表，图表吃满其余高度。
+    //
+    // 谁让位：主界面的导航栏与标题栏由 MainPage 让出，浮窗的标题栏与页签由 OverlayPageFrame 让出；
+    // 本页内部则不再画左栏硬件列表（横屏）与底部硬件条（竖屏 / 浮窗），
+    // 也不再画图表下面的统计块、明细块与预留区。
+    if (ChartSummaryView.active.value) {
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+
+            Text(
+                text = "双击图表退出图形摘要视图",
+
+                style = MaterialTheme.typography.bodySmall,
+
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(
+                modifier = Modifier.height(6.dp)
+            )
+
+            // wide 传 true：摘要里没有下方那两块，这个值只影响它们怎么排，传哪个都不影响结果；
+            // 传 true 是为了让名称行与标签行按"整行铺开"的排法走。
+            HardwareDetail(
+                kind = HardwareKind.CPU,
+
+                snapshot = snapshot,
+
+                history = history,
+
+                windowLabel = windowLabel,
+
+                wide = true,
+
+                hostedInOverlay = hostedInOverlay,
+
+                usageDecimals = usageDecimals,
+
+                // 摘要里长按不弹菜单：这里只有一张图，弹出来也没处可用
+                onChartLongPress = {},
+
+                onChartDoubleTap = { ChartSummaryView.active.value = false },
+
+                summary = true,
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+        }
+
+        return
+    }
 
     // 本页自己管左右两块的高度分配，所以 PageShell 关掉整页纵向滚动（否则 Row 的高度会被撑成无限）
     PageShell(scrollable = false) {
@@ -359,6 +439,8 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         onChartLongPress = { chartDialogVisible = true },
 
+                        onChartDoubleTap = enterChartSummary,
+
                         modifier = Modifier.weight(4f)
                             .fillMaxHeight()
                     )
@@ -388,6 +470,8 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         onChartLongPress = { chartDialogVisible = true },
 
+                        onChartDoubleTap = enterChartSummary,
+
                         modifier = Modifier.weight(1f)
                             .fillMaxWidth()
                     )
@@ -411,11 +495,19 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         PerformanceChartDialog(
             hostedInOverlay = hostedInOverlay,
 
-            points = history,
+            kernelGraphMode = kernelGraphMode,
 
-            windowLabel = windowLabel,
+            showKernelTime = showKernelTime,
 
-            currentText = snapshot.cpuUsageText(usageDecimals),
+            onKernelGraphModeChange = { kernelGraphMode = it },
+
+            onShowKernelTimeChange = { showKernelTime = it },
+
+            onEnterSummary = {
+                chartDialogVisible = false
+
+                ChartSummaryView.active.value = true
+            },
 
             onDismiss = { chartDialogVisible = false }
         )
@@ -538,15 +630,19 @@ private fun HardwareTab(
 }
 
 /**
- * 迷你趋势图：把同一份历史点的**尾部若干点**画成小折线。
+ * 迷你趋势图：与大图同一份历史、同一组横向槽位，只是画布更小。
  *
- * 和大图表是同一个数据源（[PerformanceScreen] 里那份 history），
- * 区别只有三处：取点数、尺寸、以及这里不画网格。
+ * 为什么要跟大图共用槽位：小图是"这一段统计范围"的缩略，范围必须和大图完全一致。
+ * 早先它自己取尾部十几个点，低更新速度下只覆盖几十秒，而大图覆盖几分钟 ——
+ * 两张图说的不是同一段时间，换硬件时看起来就像数据对不上。
  *
- * 横向同样按固定槽位、点数不足时贴右边生长（和大图一个规矩），
- * 所以刚进页面只看到右边一小段线，不会一上来就连满小图。
+ * 因此这里照抄大图的三条几何：
+ * 1) 只画最后 [PERFORMANCE_CHART_POINTS] 个点，多的老点丢掉；
+ * 2) 相邻两点落在相邻槽位，横向比例与大图逐槽对应（小图只是整体缩小）；
+ * 3) 点数不满时最老的点落在第 (总槽位 - 点数) 个槽上，曲线贴右边生长。
+ * 纵向同样是 0..100% 固定比例，所以同一点在两张图里的高低位置比例一致。
  *
- * 纵向比例固定 0..100%：迷你图不标刻度，比例和大图一致才不会看着不像。
+ * 视觉上仍与小图原有外观一致：圆角底衬、无网格、细线；差别只在取值范围统一了。
  */
 @Composable
 private fun MiniSparkline(
@@ -567,8 +663,14 @@ private fun MiniSparkline(
         MaterialTheme.colorScheme.surfaceVariant
     }
 
-    // 尾部 12 个点就够看出起伏；再多在这个尺寸下也挤成一团
-    val tail = remember(history) { history.takeLast(MINI_SPARKLINE_POINTS) }
+    // 与大图同一刀切法：多出来的老点丢掉，保证两张图覆盖同一段时间
+    val visible = remember(history) {
+        if (history.size > PERFORMANCE_CHART_POINTS) {
+            history.takeLast(PERFORMANCE_CHART_POINTS)
+        } else {
+            history
+        }
+    }
 
     Canvas(modifier = modifier) {
 
@@ -578,39 +680,43 @@ private fun MiniSparkline(
             cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx())
         )
 
-        if (tail.size < 2) {
+        val inset = 2.dp.toPx()
+
+        val usable = size.height - inset * 2
+
+        /** 百分比 -> 画布纵坐标：0% 贴底，100% 贴顶（与大图同一公式）。 */
+        fun yOf(percent: Float): Float =
+            size.height - inset - usable * (percent.coerceIn(0f, 100f) / 100f)
+
+        // 槽宽与大图同比例：59 段正好把宽度分完（0 号贴左、59 号贴右）
+        val slotWidth = size.width / (PERFORMANCE_CHART_POINTS - 1).toFloat()
+
+        if (visible.size < 2) {
 
             // 还没攒够点：贴右边缘点一个点，不拉横贯全宽的线
-            val fraction = (tail.lastOrNull()?.percent ?: 0f).coerceIn(0f, 100f) / 100f
-
-            val y = size.height - 3.dp.toPx() - (size.height - 6.dp.toPx()) * fraction
+            val fraction = (visible.lastOrNull()?.percent ?: 0f).coerceIn(0f, 100f)
 
             drawCircle(
                 color = lineColor,
 
                 radius = 1.5.dp.toPx(),
 
-                center = Offset(size.width - 2.dp.toPx(), y)
+                center = Offset(size.width - 2.dp.toPx(), yOf(fraction))
             )
 
             return@Canvas
         }
 
-        val inset = 3.dp.toPx()
-
-        val usable = size.height - inset * 2
-
-        val slotWidth = (size.width - 4.dp.toPx()) / (MINI_SPARKLINE_POINTS - 1).toFloat()
-
-        val startSlot = MINI_SPARKLINE_POINTS - tail.size
+        // 点数不满时，最老的点落在第 (总槽位 - 点数) 个槽上，左边空着等后面长满
+        val startSlot = PERFORMANCE_CHART_POINTS - visible.size
 
         val path = Path()
 
-        tail.forEachIndexed { index, point ->
+        visible.forEachIndexed { index, point ->
 
-            val x = 2.dp.toPx() + (startSlot + index) * slotWidth
+            val x = (startSlot + index) * slotWidth
 
-            val y = size.height - inset - usable * (point.percent.coerceIn(0f, 100f) / 100f)
+            val y = yOf(point.percent)
 
             if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
@@ -658,6 +764,8 @@ private fun HardwareDetail(
     hostedInOverlay: Boolean,
     usageDecimals: Int,
     onChartLongPress: () -> Unit,
+    onChartDoubleTap: () -> Unit,
+    summary: Boolean = false,
     modifier: Modifier = Modifier
 ) {
 
@@ -750,7 +858,8 @@ private fun HardwareDetail(
         )
 
         // 3) 趋势图（固定点数铺满全宽，换更新速度不换图）
-        //    宽度决定它吃多少高度：宽屏 1 份、竖屏 3 份（留 1 份给底部空白）、浮窗吃满
+        //    宽度决定它吃多少高度：宽屏 1 份、竖屏 3 份（留 1 份给底部空白）、浮窗吃满；
+        //    摘要视图里下面没有别的块，它直接吃掉整个剩余高度。
         DetailChartPlaceholder(
             points = history,
 
@@ -758,10 +867,18 @@ private fun HardwareDetail(
 
             onLongPress = onChartLongPress,
 
+            onDoubleTap = onChartDoubleTap,
+
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(chartWeight)
+                .weight(if (summary) 1f else chartWeight)
         )
+
+        // 摘要视图到此为止：统计块 / 明细块 / 底部留白都不画，
+        // 名称行与标签行留着，所以画面上仍然是这一页的头部，只是下面全部让给图。
+        if (summary) {
+            return
+        }
 
         Spacer(
             modifier = Modifier.height(12.dp)
@@ -1105,13 +1222,14 @@ private fun HardwareCompactBar(
  *
  * 只有一个点时不铺线，贴着右边缘点一个小圆点；一点都没有时用当前帧的利用率占位。
  *
- * 长按这里会弹一个测试对话框（[PerformanceChartDialog]）。
+ * 长按这里弹出图表菜单（[PerformanceChartDialog]）；快速双击则在图形摘要视图与原版式之间切换。
  */
 @Composable
 private fun DetailChartPlaceholder(
     points: List<CpuUsagePoint>,
     fallbackFraction: Float,
     onLongPress: () -> Unit,
+    onDoubleTap: () -> Unit,
     modifier: Modifier = Modifier
 ) {
 
@@ -1120,13 +1238,19 @@ private fun DetailChartPlaceholder(
     val lineColor = MaterialTheme.colorScheme.primary
     val background = MaterialTheme.colorScheme.surfaceVariant
 
-    // 长按手势：用 detectTapGestures 而不是 combinedClickable，
-    // Canvas 没有点击语义，这样最直接（也不会在浮窗里出令牌问题，它不新开窗口）
-    val longPressModifier = Modifier.pointerInput(Unit) {
-        detectTapGestures(onLongPress = { onLongPress() })
+    // 手势：长按弹菜单、快速双击进 / 出图形摘要视图。
+    //
+    // 用 detectTapGestures 而不是 combinedClickable —— Canvas 没有点击语义，这样最直接，
+    // 也不会在浮窗里出令牌问题（它不新开窗口）。
+    // 两者能共存：系统先等双击间隔判定，超过长按时长的按压才算长按。
+    val gestureModifier = Modifier.pointerInput(Unit) {
+        detectTapGestures(
+            onLongPress = { onLongPress() },
+            onDoubleTap = { onDoubleTap() }
+        )
     }
 
-    Canvas(modifier = modifier.then(longPressModifier)) {
+    Canvas(modifier = modifier.then(gestureModifier)) {
 
         drawRoundRect(
             color = background.copy(alpha = 0.35f),
@@ -1220,50 +1344,125 @@ private fun DetailChartPlaceholder(
         )
     }
 }
-
 /**
- * 长按图表弹出的对话框（**内容目前是测试内容**）。
+ * 长按图表弹出的菜单。
+ *
+ * 版式照 Windows 任务管理器那张图表选项：**不写标题**，一行行往下排，
+ * 项与项之间用横线分组；右括号里的字母是该项的快捷键提示（这一版只显示，暂不接键盘）。
  *
  * 为什么两套实现：普通界面有 Activity 令牌，用 AlertDialog 最省事；
  * 浮窗是 TYPE_APPLICATION_OVERLAY，弹 AlertDialog 会抛 BadTokenException 直接崩进程，
  * 所以改成在当前 Compose 窗口里自己画遮罩 + 卡片。两种观感一致（同项目其它页都是这个做法）。
+ *
+ * 五项现状：
+ * 1) 内核图形口径：选得中、记得住；【逻辑处理器】那条曲线要等逐核数据接到 UI 才真画出来；
+ * 2) 显示内核时间：状态留着，画法待定（内核时间还没采集）；
+ * 3) 图形摘要视图：整页只剩图表，长按图表退出；
+ * 4) 查看：只列出六个目标，点哪个都先关菜单什么也不做 —— 切页接口还没接；
+ * 5) 复制：把占位文本 [CHART_MENU_COPY_TEXT] 写进系统剪贴板。
  */
 @Composable
 private fun PerformanceChartDialog(
     hostedInOverlay: Boolean,
-    points: List<CpuUsagePoint>,
-    windowLabel: String,
-    currentText: String,
+    kernelGraphMode: String,
+    showKernelTime: Boolean,
+    onKernelGraphModeChange: (String) -> Unit,
+    onShowKernelTimeChange: (Boolean) -> Unit,
+    onEnterSummary: () -> Unit,
     onDismiss: () -> Unit
 ) {
 
-    val body: @Composable () -> Unit = {
+    // 查看的子项默认收着：菜单本来就五行，一上来全摊开太吵
+    var viewExpanded by remember { mutableStateOf(false) }
 
-        Text(
-            text = "当前帧利用率：$currentText",
+    val context = LocalContext.current
 
-            style = MaterialTheme.typography.bodyMedium
-        )
+    val menu: @Composable () -> Unit = {
 
-        Text(
-            text = "缓存点数：${points.size}",
+        Column(
+            modifier = Modifier.widthIn(min = 240.dp)
+        ) {
 
-            style = MaterialTheme.typography.bodyMedium
-        )
+            ChartMenuHeading("将内核图形更改为(H)")
 
-        Text(
-            text = "窗口：$windowLabel",
+            ChartMenuRow(
+                label = "总体利用率(O)",
 
-            style = MaterialTheme.typography.bodyMedium
-        )
+                marked = kernelGraphMode == CPU_KERNEL_GRAPH_TOTAL,
 
-        Text(
-            text = "采样间隔跟随设置页的实时更新速度；点数上限 512，按窗口自动裁掉最老的。",
+                indented = true
+            ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_TOTAL) }
 
-            style = MaterialTheme.typography.bodySmall,
+            ChartMenuRow(
+                label = "逻辑处理器(L)",
 
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+                marked = kernelGraphMode == CPU_KERNEL_GRAPH_LOGICAL,
+
+                indented = true
+            ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_LOGICAL) }
+
+            ChartMenuRow(
+                label = "显示内核时间(K)",
+
+                marked = showKernelTime
+            ) { onShowKernelTimeChange(!showKernelTime) }
+
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 6.dp),
+
+                color = MaterialTheme.colorScheme.outlineVariant
+            )
+
+            ChartMenuRow(
+                label = "图形摘要视图(W)"
+            ) { onEnterSummary() }
+
+            ChartMenuRow(
+                label = "查看(V)",
+
+                trailing = if (viewExpanded) "▾" else "▸"
+            ) { viewExpanded = !viewExpanded }
+
+            if (viewExpanded) {
+
+                // 六个目标排两行三列：这个宽度下再摊一列就挤了
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+
+                    ChartMenuTarget("CPU(P)", Modifier.weight(1f), onDismiss)
+
+                    ChartMenuTarget("内存(M)", Modifier.weight(1f), onDismiss)
+
+                    ChartMenuTarget("磁盘(D)", Modifier.weight(1f), onDismiss)
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+
+                    ChartMenuTarget("网络(N)", Modifier.weight(1f), onDismiss)
+
+                    ChartMenuTarget("GPU(G)", Modifier.weight(1f), onDismiss)
+
+                    ChartMenuTarget("NPU", Modifier.weight(1f), onDismiss)
+                }
+            }
+
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 6.dp),
+
+                color = MaterialTheme.colorScheme.outlineVariant
+            )
+
+            ChartMenuRow(
+                label = "复制(C)"
+            ) {
+                copyChartMenuText(context, CHART_MENU_COPY_TEXT)
+
+                onDismiss()
+            }
+        }
     }
 
     if (!hostedInOverlay) {
@@ -1271,27 +1470,12 @@ private fun PerformanceChartDialog(
         AlertDialog(
             onDismissRequest = onDismiss,
 
-            title = {
-                Text(
-                    text = "CPU 图表缓存（测试内容）",
-
-                    style = MaterialTheme.typography.titleLarge
-                )
-            },
-
             text = {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    body()
-                }
+                menu()
             },
 
-            confirmButton = {
-                Button(onClick = onDismiss) {
-                    Text("知道了")
-                }
-            }
+            // 这是菜单，不是提示：不摆"确定 / 取消"，点一项就办事、点空白就关
+            confirmButton = {}
         )
 
         return
@@ -1309,7 +1493,7 @@ private fun PerformanceChartDialog(
                 .clickable { onDismiss() }
         )
 
-        // 卡片：自己吃掉点击，别让点内容变成"点遮罩"
+        // 卡片：自己吃掉点击，别让点内容变成点遮罩
         Card(
             modifier = Modifier
                 .align(Alignment.Center)
@@ -1321,30 +1505,150 @@ private fun PerformanceChartDialog(
                 }
         ) {
             Column(
-                modifier = Modifier.padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                modifier = Modifier.padding(12.dp)
             ) {
-
-                Text(
-                    text = "CPU 图表缓存（测试内容）",
-
-                    style = MaterialTheme.typography.titleMedium
-                )
-
-                body()
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
-                ) {
-
-                    // 只留一个按钮：这个框是"知道了"性质的提示，再放"关闭"就是两个同义按钮
-                    Button(onClick = onDismiss) {
-                        Text("知道了")
-                    }
-                }
+                menu()
             }
         }
     }
+}
+
+/** 菜单里的分组标题：不可点，只给下面那组选项做说明。 */
+@Composable
+private fun ChartMenuHeading(text: String) {
+
+    Text(
+        text = text,
+
+        style = MaterialTheme.typography.bodyMedium,
+
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+
+        modifier = Modifier.padding(start = 4.dp, top = 6.dp, bottom = 2.dp)
+    )
+}
+
+/**
+ * 菜单里的一行选项。
+ *
+ * @param label 这一行的文字
+ * @param marked 选中标记：单选与复选共用，勾上就在左侧留一个勾
+ * @param indented 缩进一级，用于挂在分组标题下面的选项
+ * @param trailing 行尾提示字符（查看用箭头表示还能展开）
+ * @param onClick 点整行都算，不用非得点到字上
+ */
+@Composable
+private fun ChartMenuRow(
+    label: String,
+    marked: Boolean = false,
+    indented: Boolean = false,
+    trailing: String? = null,
+    onClick: () -> Unit
+) {
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(
+                start = if (indented) 20.dp else 4.dp,
+
+                end = 4.dp,
+
+                top = 8.dp,
+
+                bottom = 8.dp
+            ),
+
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+
+        // 固定 16.dp 宽：有没有勾都一样宽，选项文字才不会左右跳
+        Text(
+            text = if (marked) "✓" else "",
+
+            style = MaterialTheme.typography.bodyMedium,
+
+            color = MaterialTheme.colorScheme.primary,
+
+            modifier = Modifier.width(16.dp)
+        )
+
+        Text(
+            text = label,
+
+            style = MaterialTheme.typography.bodyMedium,
+
+            color = MaterialTheme.colorScheme.onSurface,
+
+            maxLines = 1,
+
+            overflow = TextOverflow.Ellipsis,
+
+            modifier = Modifier.weight(1f)
+        )
+
+        if (trailing != null) {
+
+            Text(
+                text = trailing,
+
+                style = MaterialTheme.typography.bodyMedium,
+
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+/**
+ * 查看展开后的一个目标。
+ *
+ * 这一版**故意什么都不做**：六个页面还没全部写好，先让菜单能把选项列出来；
+ * 以后在这里接 UIService.setActivePage，或直接改本页的选中硬件。
+ */
+@Composable
+private fun ChartMenuTarget(
+    label: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+
+    Row(
+        modifier = modifier
+            .clickable(onClick = onClick)
+            .padding(start = 20.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+
+        Text(
+            text = label,
+
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurface,
+
+            maxLines = 1,
+
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/**
+ * 把菜单里的占位文本写进系统剪贴板。
+ *
+ * 用系统剪贴板服务而不是 Compose 的剪贴板管理器：浮窗里没有 Activity 令牌，
+ * 但剪贴板是系统服务，服务的 Context 一样能写。
+ */
+private fun copyChartMenuText(context: Context, text: String) {
+
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+
+    if (clipboard == null) {
+        return
+    }
+
+    clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
 }

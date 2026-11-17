@@ -53,6 +53,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 import com.android.taskmanager.ApphistoryScreen
+import com.android.taskmanager.ChartSummaryView
 import com.android.taskmanager.DebugScreen
 import com.android.taskmanager.DetailsScreen
 import com.android.taskmanager.PerformanceScreen
@@ -114,7 +115,11 @@ internal fun OverlayPageFrame(
 
                 Column(Modifier.fillMaxSize()) {
 
+                    // 性能页进摘要视图时，本浮窗只留标题栏与图表（开关在主界面与浮窗之间共享）
+                    val chartSummary = ChartSummaryView.active.value && pageName == "性能"
+
                     // ---------- 标题栏：唯一拖动区 ----------
+                    // 摘要视图里不隐藏：这一条是浮窗唯一能拖的地方，藏了窗口就挪不动。
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -147,37 +152,41 @@ internal fun OverlayPageFrame(
 
                     HorizontalDivider()
 
-                    // ---------- 页面切换（不弹菜单：浮窗里弹窗有风险，用横排按钮） ----------
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OVERLAY_PAGES.forEach { name ->
-                            val selected = name == pageName
+                    // ---------- 页面切换：摘要视图里让位 ----------
+                    // 图表上方不摆一排可点页签，否则全屏图表又多一行按钮。
+                    if (!chartSummary) {
 
-                            TextButton(
-                                onClick = { onPageSelected(name) },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    text = name,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (selected) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    },
-                                    maxLines = 1
-                                )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OVERLAY_PAGES.forEach { name ->
+                                val selected = name == pageName
+
+                                TextButton(
+                                    onClick = { onPageSelected(name) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text(
+                                        text = name,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (selected) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        maxLines = 1
+                                    )
+                                }
                             }
                         }
-                    }
 
-                    HorizontalDivider()
+                        HorizontalDivider()
+                    }
 
                     // ---------- 页面本体：直接复用 ui/ 下现有的 Composable ----------
                     Box(Modifier.weight(1f).fillMaxWidth()) {

@@ -3594,14 +3594,6 @@ static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
     return count;
 }
 
- /**
-  * 按类型枚举设备位置：这是采集前唯一的入口。
-  *
-  * @param kind     设备分类
-  * @param out      位置数组（由调用方提供，容量由 capacity 指定）
-  * @param capacity 最多写多少条
-  * @return 条数；0 = 这台机器没有这一类设备（或读不到 sysfs）
-  */
 /**
  * 枚举全部设备实例，填进这张表。
  *
@@ -3657,12 +3649,6 @@ static void registry_refresh(TmDeviceRegistry *registry)
 // 三个函数都返回 TmQueryStatus：TM_QUERY_OK 才代表"我有准确值"，
 // 其它状态表示没有，客户端显示占位，不会当成 0 或空串。
 // 要补实现时直接改函数体，不要改返回值的含义。
-// ============================================================
-// ============================================================
-// 留给外部实现的三个位置
-//
-// 现在都返回 false / -1，客户端把对应字段显示成占位内容，不会当成 0 或空串。
-// 要补实现时直接改函数体（不要改返回值语义）：返回 true 就是"我有准确值"。
 // ============================================================
 
 /**
@@ -4309,11 +4295,11 @@ static void emit_device_block(const TmOutDevice *device)
   * 发包头 -> 逐块发。条数必须先定：客户端按 count 收满才算完整包。
   *
   * 包内容（有实例才发，没有的类型一条 D 行都不发）：
-  *   CPU     : 每个插槽一块，含利用率 / 频率 / 拓扑 / 缓存
-  *   MEMORY  : 每个内存设备一块，含总量与可用量
-  *   DISK    : 每块磁盘一块，先只带名字与 sysfs 位置
-  *   NETWORK : 每个网卡一块，先只带名字与 sysfs 位置
-  *   GPU     : 每个图形设备一块，先只带名字与 sysfs 位置
+  *   CPU     : 每个插槽一块，含利用率 / 频率 / 拓扑 / 缓存 / 逐核利用率
+  *   MEMORY  : 每个内存设备一块，这一版只有名称
+  *   DISK    : 每块磁盘一块，这一版只有块名
+  *   NETWORK : 每个网卡一块，这一版只有接口名
+  *   GPU     : 每个图形设备一块，这一版只有节点名
   *   SYSTEM  : 进程 / 线程 / 句柄 / 开机时长
   */
 static bool handle_device_snapshot(unsigned long long seq, int type)
