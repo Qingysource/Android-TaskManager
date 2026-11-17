@@ -107,6 +107,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -122,6 +123,9 @@ import androidx.compose.ui.unit.sp
 import com.android.taskmanager.data.CpuUsagePoint
 import com.android.taskmanager.data.PerformanceSnapshot
 import com.android.taskmanager.service.UIService
+import java.io.File
+import java.util.concurrent.Executors
+import org.json.JSONObject
 
 /** 页面实现状态：改成 IMPLEMENTED 后，MainActivity 的 PageContent() 才会渲染本页。 */
 val PerformancePageState: PageState = PageState.IMPLEMENTED
@@ -139,7 +143,13 @@ private val PERFORMANCE_WIDE_MIN_WIDTH = 520.dp
  */
 private const val PERFORMANCE_CHART_POINTS = 60
 
-/** 图表菜单里复制进剪贴板的文本：这一版是占位内容。 */
+/**
+ * 图表菜单"复制"的兜底文本：只有 CPU 已经有真实内容（见 [cpuClipboardText]），
+ * 内存 / 磁盘 / 网络 / GPU 的复制块等各自的数据齐了再补，现在统一回落到这里。
+ *
+ * 保留这段占位是为了让菜单项在任何硬件页上都可点、可验证剪贴板通路；
+ * 新设备接入时不要改它，而是像 CPU 一样在 [clipboardTextFor] 里加分支。
+ */
 private const val CHART_MENU_COPY_TEXT = "测试内容"
 
 /** 内核图形口径：整颗处理器的总利用率 / 逐个逻辑处理器。 */
@@ -251,6 +261,84 @@ private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, Str
 )
 
 /**
+ * 图表菜单"复制"到底往剪贴板写什么：按当前硬件分发。
+ *
+ * 现在只有 CPU 有真实内容。其它四种设备照菜单结构也应该有各自的一整块文本，
+ * 但它们连采集字段都还没接完，先回落到 [CHART_MENU_COPY_TEXT]。
+ *
+ * 接入新设备时在这里加分支即可，菜单与剪贴板调用处都不用动。
+ */
+private fun clipboardTextFor(
+    kind: HardwareKind,
+    snapshot: PerformanceSnapshot,
+    usageDecimals: Int
+): String = when (kind) {
+
+    HardwareKind.CPU -> cpuClipboardText(snapshot, usageDecimals)
+
+    // TODO 内存 / 磁盘 / WLAN / GPU 的复制文本：等各自的实例数据能进快照后逐块补上
+    else -> CHART_MENU_COPY_TEXT
+}
+
+/**
+ * CPU 视图"复制"写进剪贴板的文本。
+ *
+ * 形状照 Windows 任务管理器复制出来的那一份（用户会把它粘到记事本或工单里，
+ * 空行与缩进都属于格式的一部分，改动前先对照一遍）：
+ *
+ * CPU                      设备名，顶格
+ * （空行）
+ * \t处理器商品名            例：11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz
+ * （空行）
+ * \t基准速度:\t2.69 GHz     规格块：字段名后面带冒号，字段名与值之间是 Tab
+ * \t插槽:\t1
+ * ...
+ * （空行）
+ * \t利用率\t9%              实时块：字段名后面不带冒号
+ * ...
+ * （末尾空行）
+ *
+ * 每个值都从当前这一帧 [snapshot] 取，换算规则与页面显示完全一致（同一套 xxxText()）；
+ * 读不到的字段照页面一样写破折号，不编造 0。
+ *
+ * @param usageDecimals 利用率保留几位小数，跟页面当前精度走（默认 0，即 9%）
+ */
+private fun cpuClipboardText(snapshot: PerformanceSnapshot, usageDecimals: Int): String {
+
+    // 商品名还没拿到时用占位名：比留一行空白更像"这里有东西，只是没读到"
+    val name = snapshot.cpuName?.takeIf { it.isNotBlank() } ?: TEST_HARDWARE_NAME
+
+    return buildString {
+
+        append("CPU")
+
+        append("\n\n\t").append(name)
+
+        // 规格块：静态信息，开机之后基本不变
+        append("\n\n\t基准速度:\t").append(snapshot.cpuBaseText())
+        append("\n\t插槽:\t").append(snapshot.socketsText())
+        append("\n\t内核:\t").append(snapshot.coresText())
+        append("\n\t逻辑处理器:\t").append(snapshot.logicalCpusText())
+        append("\n\t虚拟化:\t").append(snapshot.virtualizationText())
+        append("\n\tL1 缓存:\t").append(snapshot.l1Text())
+        append("\n\tL2 缓存:\t").append(snapshot.l2Text())
+        append("\n\tL3 缓存:\t").append(snapshot.l3Text())
+
+        // 实时块：每秒都在变，粘出去就是"复制那一刻"的值
+        append("\n\n\t利用率\t").append(snapshot.cpuUsageText(usageDecimals))
+        append("\n\t速度\t").append(snapshot.cpuSpeedText())
+        append("\n\t正常运行时间\t").append(snapshot.uptimeText())
+        append("\n\t进程\t").append(snapshot.processCountText())
+        append("\n\t线程\t").append(snapshot.threadCountText())
+
+        // 与页面统计区同名：这一项在 Linux 上是文件描述符，不套用任务管理器的"句柄"
+        append("\n\t文件描述符\t").append(snapshot.fdCountText())
+
+        append("\n\n")
+    }
+}
+
+/**
  * 性能页面入口。
  *
  * @param hostedInOverlay 是否被浮窗承载：影响对话框的实现方式（浮窗没有 Activity 令牌，
@@ -298,10 +386,20 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     // 长按图表弹出的菜单
     var chartDialogVisible by remember { mutableStateOf(false) }
 
-    // 菜单里的两项选择：内核图形口径、是否显示内核时间。
-    // 现在只做到"选得中、关掉菜单再打开还留着"；画法要等逐核数据接到 UI 才真正生效。
-    var kernelGraphMode by rememberSaveable { mutableStateOf(CPU_KERNEL_GRAPH_TOTAL) }
-    var showKernelTime by rememberSaveable { mutableStateOf(false) }
+    // 菜单里的两项画图偏好（图表口径、是否显示内核时间）**不放在本页内部**：
+    // 只在页面里存，竖屏 / 横屏 / 悬浮窗三个宿主各有一份，图形摘要视图又是另一个
+    // 宿主渲染的，结果就是"换一个地方就得重新点一遍"。统一走 ChartViewState，
+    // 三处宿主与摘要视图读同一份值，改动立刻互相可见，并且落盘。
+    val context = LocalContext.current
+
+    // 首次进本页把落盘值读进来；已读过就是空操作（不再产生 IO）
+    remember(context) {
+        ChartViewState.ensureLoaded(context.applicationContext)
+    }
+
+    // 图表口径（true = 逻辑处理器，false = 总体利用率）与内核时间开关
+    val logicalGraph = ChartViewState.logicalGraph
+    val showKernelTime = ChartViewState.showKernelTime
 
     // 双击图表切进摘要视图。
     // 只认 CPU：其余四个硬件现在没有真实曲线，在它们上面双击会弹出一张 CPU 图，容易误解。
@@ -357,6 +455,12 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 onChartLongPress = {},
 
                 onChartDoubleTap = { ChartSummaryView.active.value = false },
+
+                // 摘要沿用进入前选定的两项：图还是那张图，只是铺满整页。
+                // 值是进程级共享的，所以从浮窗双击进来也是逐核 / 带内核时间的那一版。
+                showKernelTime = showKernelTime,
+
+                logicalGraph = logicalGraph,
 
                 summary = true,
 
@@ -441,6 +545,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         onChartDoubleTap = enterChartSummary,
 
+                        showKernelTime = showKernelTime,
+
+                        logicalGraph = logicalGraph,
+
                         modifier = Modifier.weight(4f)
                             .fillMaxHeight()
                     )
@@ -472,6 +580,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         onChartDoubleTap = enterChartSummary,
 
+                        showKernelTime = showKernelTime,
+
+                        logicalGraph = logicalGraph,
+
                         modifier = Modifier.weight(1f)
                             .fillMaxWidth()
                     )
@@ -495,19 +607,27 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         PerformanceChartDialog(
             hostedInOverlay = hostedInOverlay,
 
-            kernelGraphMode = kernelGraphMode,
+            // 菜单读的是全应用唯一那份画图偏好，改一处三处宿主与摘要视图同时变色
+            kernelGraphMode = if (logicalGraph) CPU_KERNEL_GRAPH_LOGICAL else CPU_KERNEL_GRAPH_TOTAL,
 
             showKernelTime = showKernelTime,
 
-            onKernelGraphModeChange = { kernelGraphMode = it },
+            onKernelGraphModeChange = { mode ->
+                ChartViewState.setLogicalGraph(context, mode == CPU_KERNEL_GRAPH_LOGICAL)
+            },
 
-            onShowKernelTimeChange = { showKernelTime = it },
+            onShowKernelTimeChange = { enabled ->
+                ChartViewState.setShowKernelTime(context, enabled)
+            },
 
             onEnterSummary = {
                 chartDialogVisible = false
 
                 ChartSummaryView.active.value = true
             },
+
+            // 复制内容按当前选中的硬件现算：CPU 是那份完整文本，其余四种暂时还是占位
+            copyText = clipboardTextFor(kind = selected, snapshot = snapshot, usageDecimals = usageDecimals),
 
             onDismiss = { chartDialogVisible = false }
         )
@@ -643,6 +763,10 @@ private fun HardwareTab(
  * 纵向同样是 0..100% 固定比例，所以同一点在两张图里的高低位置比例一致。
  *
  * 视觉上仍与小图原有外观一致：圆角底衬、无网格、细线；差别只在取值范围统一了。
+ *
+ * 这里只画总利用率一条线，不跟大图的内核时间 / 逻辑处理器口径走：小图 34dp 宽，
+ * 再叠内核色带或拆成每核一格就什么都看不清了。它要表达的是"和大图看的是同一段
+ * 时间里的同一条总量曲线"，细节留给大图。
  */
 @Composable
 private fun MiniSparkline(
@@ -765,6 +889,8 @@ private fun HardwareDetail(
     usageDecimals: Int,
     onChartLongPress: () -> Unit,
     onChartDoubleTap: () -> Unit,
+    showKernelTime: Boolean = false,
+    logicalGraph: Boolean = false,
     summary: Boolean = false,
     modifier: Modifier = Modifier
 ) {
@@ -864,6 +990,12 @@ private fun HardwareDetail(
             points = history,
 
             fallbackFraction = if (isCpu) usageFraction(snapshot) else 0f,
+
+            // 菜单两项直接决定画法：没勾"显示内核时间"就一行都不多画；
+            // 图形口径选了"逻辑处理器"才切成逐核网格，两种口径共用同一份历史。
+            showKernelTime = showKernelTime,
+
+            logicalGraph = logicalGraph,
 
             onLongPress = onChartLongPress,
 
@@ -1220,7 +1352,14 @@ private fun HardwareCompactBar(
  * 老点从左挤出去，换更新速度既不清数据也不换槽位，图的宽度和点数永远不变。
  * 相邻点之间一律连线，不做断点判断 —— 采样漏一轮也不会把线断开。
  *
- * 只有一个点时不铺线，贴着右边缘点一个小圆点；一点都没有时用当前帧的利用率占位。
+ * 两种图形口径（菜单第一项）：
+ * - 总体利用率（[logicalGraph] = false）：一张整机曲线；
+ * - 逻辑处理器（[logicalGraph] = true）：每个逻辑核一格小图。横向槽位与整机图
+ *   共用同一套，所以切图形只换画法，统计区间不变、历史也不清。
+ *
+ * 内核时间（[showKernelTime]）只有菜单里勾上才画：在曲线下方再画一条更暗的曲线，
+ * 并把它与底边之间的区域填色，就是任务管理器里那层"内核"色带。
+ * 没勾就一行都不多画，保持原来的纯线条外观。
  *
  * 长按这里弹出图表菜单（[PerformanceChartDialog]）；快速双击则在图形摘要视图与原版式之间切换。
  */
@@ -1228,15 +1367,12 @@ private fun HardwareCompactBar(
 private fun DetailChartPlaceholder(
     points: List<CpuUsagePoint>,
     fallbackFraction: Float,
+    showKernelTime: Boolean,
+    logicalGraph: Boolean,
     onLongPress: () -> Unit,
     onDoubleTap: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-
-    val gridColor = MaterialTheme.colorScheme.outlineVariant
-    val topLineColor = MaterialTheme.colorScheme.outline
-    val lineColor = MaterialTheme.colorScheme.primary
-    val background = MaterialTheme.colorScheme.surfaceVariant
 
     // 手势：长按弹菜单、快速双击进 / 出图形摘要视图。
     //
@@ -1250,7 +1386,121 @@ private fun DetailChartPlaceholder(
         )
     }
 
-    Canvas(modifier = modifier.then(gestureModifier)) {
+    Box(modifier = modifier.then(gestureModifier)) {
+
+        if (logicalGraph) {
+
+            LogicalCoresChart(
+                points = points,
+                showKernelTime = showKernelTime,
+                modifier = Modifier.fillMaxSize()
+            )
+
+        } else {
+
+            TotalUsageChart(
+                points = points,
+                fallbackFraction = fallbackFraction,
+                showKernelTime = showKernelTime,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+/**
+ * 内核时间色带：从底边到内核曲线的区域填一层暗色，再描一条细线。
+ *
+ * 每个槽的值 -1 表示"这一槽没有内核时间"，按 0 画 —— 宁可贴底也不断开，
+ * 与"两点之间必须连起来"同一条规矩。
+ *
+ * @param percents  每个槽的内核占比；-1 = 没值
+ * @param startSlot 第一个点落在第几个槽（点数不满时左侧留空）
+ * @param slotWidth 槽宽
+ * @param left      这块画布的左边（逻辑处理器模式是某一格的左边）
+ * @param bottom    这块画布的底边纵坐标
+ * @param yOf       百分比 -> 这块画布内的纵坐标
+ */
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawKernelBand(
+    percents: List<Float>,
+    startSlot: Int,
+    slotWidth: Float,
+    left: Float,
+    bottom: Float,
+    yOf: (Float) -> Float,
+    fill: Color,
+    stroke: Color
+) {
+    if (percents.size < 2) {
+        return
+    }
+
+    val path = Path()
+
+    var any = false
+
+    percents.forEachIndexed { index, value ->
+
+        if (value >= 0f) {
+            any = true
+        }
+
+        val x = left + (startSlot + index) * slotWidth
+
+        val y = yOf(if (value < 0f) 0f else value)
+
+        if (index == 0) {
+            path.moveTo(x, y)
+        } else {
+            path.lineTo(x, y)
+        }
+    }
+
+    if (!any) {
+        return
+    }
+
+    val fillPath = Path()
+
+    fillPath.addPath(path)
+
+    fillPath.lineTo(left + (startSlot + percents.size - 1) * slotWidth, bottom)
+
+    fillPath.lineTo(left + startSlot * slotWidth, bottom)
+
+    fillPath.close()
+
+    drawPath(fillPath, color = fill)
+
+    drawPath(
+        path = path,
+
+        color = stroke,
+
+        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx())
+    )
+}
+
+/** 总体利用率图：一张图、60 个槽，勾了内核时间就在曲线下方叠一层内核色带。 */
+/*
+ * 序列的第一个点由 UIService 垫成 0 利用率（真实数据从第二个点开始），
+ * 所以这里不要自作主张替首点补值、也不要丢掉"看起来不该有"的首点：
+ * 那是曲线从底边起步的唯一来源。
+ */
+@Composable
+private fun TotalUsageChart(
+    points: List<CpuUsagePoint>,
+    fallbackFraction: Float,
+    showKernelTime: Boolean,
+    modifier: Modifier = Modifier
+) {
+
+    val gridColor = MaterialTheme.colorScheme.outlineVariant
+    val topLineColor = MaterialTheme.colorScheme.outline
+    val lineColor = MaterialTheme.colorScheme.primary
+    val background = MaterialTheme.colorScheme.surfaceVariant
+
+    Canvas(modifier = modifier) {
 
         drawRoundRect(
             color = background.copy(alpha = 0.35f),
@@ -1285,8 +1535,9 @@ private fun DetailChartPlaceholder(
         val usable = size.height - inset * 2
 
         /** 百分比 -> 画布纵坐标：0% 贴底，100% 贴顶。 */
-        fun yOf(percent: Float): Float =
+        val yOf: (Float) -> Float = { percent ->
             size.height - inset - usable * (percent.coerceIn(0f, 100f) / 100f)
+        }
 
         // 一屏只画最后固定个数的点：服务端缓存比这个长，这里兜一层
         val visible = if (points.size > PERFORMANCE_CHART_POINTS) {
@@ -1311,12 +1562,55 @@ private fun DetailChartPlaceholder(
                 center = Offset(size.width - 2.dp.toPx(), yOf(fraction.coerceIn(0f, 1f) * 100f))
             )
 
+            // 内核时间也得有个点，否则勾了菜单看不出任何变化
+            val kernel = visible.lastOrNull()?.kernelPercent
+
+            if (showKernelTime && kernel != null) {
+                drawCircle(
+                    color = lineColor.copy(alpha = 0.75f),
+
+                    radius = 1.5.dp.toPx(),
+
+                    center = Offset(size.width - 2.dp.toPx(), yOf(kernel))
+                )
+            }
+
             return@Canvas
         }
 
         // 点数不满时，最老的这一个点落在第 (总数 - 点数) 个槽上：
         // 左边那些槽空着，曲线只占右边一段，随时间推移逐步向左长满。
         val startSlot = PERFORMANCE_CHART_POINTS - visible.size
+
+        // 先画内核（下层），再画总曲线（上层）：总曲线不会被色带盖住
+        if (showKernelTime) {
+
+            val kernels = visible.map { point ->
+
+                val kernel = point.kernelPercent ?: return@map -1f
+
+                // 内核不会超过总利用率：协议两边口径相同，这里再夹一次，防脏数据画出穿模
+                kernel.coerceIn(0f, point.percent.coerceIn(0f, 100f))
+            }
+
+            drawKernelBand(
+                percents = kernels,
+
+                startSlot = startSlot,
+
+                slotWidth = slotWidth,
+
+                left = 0f,
+
+                bottom = size.height - inset,
+
+                yOf = yOf,
+
+                fill = lineColor.copy(alpha = 0.28f),
+
+                stroke = lineColor.copy(alpha = 0.75f)
+            )
+        }
 
         val path = Path()
 
@@ -1344,6 +1638,181 @@ private fun DetailChartPlaceholder(
         )
     }
 }
+
+/**
+ * 逻辑处理器图：每个逻辑核一格小图，网格最多 4 列。
+ *
+ * 每一格的横向槽位与整机图完全一致（同样是 [PERFORMANCE_CHART_POINTS] 个槽），
+ * 所以"总体利用率"与"逻辑处理器"两种口径说的是同一段时间，只是拆细了。
+ *
+ * 核数取最新一帧的长度：热插拔（核数变了）才换网格排布，不会因为历史里老点少一核就重排。
+ *
+ * @param showKernelTime 勾了才画每个核自己的内核色带
+ */
+@Composable
+private fun LogicalCoresChart(
+    points: List<CpuUsagePoint>,
+    showKernelTime: Boolean,
+    modifier: Modifier = Modifier
+) {
+
+    val gridColor = MaterialTheme.colorScheme.outlineVariant
+    val topLineColor = MaterialTheme.colorScheme.outline
+    val lineColor = MaterialTheme.colorScheme.primary
+    val track = MaterialTheme.colorScheme.surfaceVariant
+
+    Canvas(modifier = modifier) {
+
+        val coreCount = points.lastOrNull { it.corePercents.isNotEmpty() }?.corePercents?.size ?: 0
+
+        // 逐核数据还没到（首帧、老后端）：给一块空底，不要画成"0% 的一条直线"
+        if (coreCount <= 0) {
+
+            drawRoundRect(
+                color = track.copy(alpha = 0.35f),
+
+                cornerRadius = CornerRadius(8.dp.toPx(), 8.dp.toPx())
+            )
+
+            return@Canvas
+        }
+
+        val columns = if (coreCount <= 4) coreCount else 4
+
+        val rows = (coreCount + columns - 1) / columns
+
+        val gap = 3.dp.toPx()
+
+        val cellWidth = (size.width - gap * (columns - 1)) / columns
+
+        val cellHeight = (size.height - gap * (rows - 1)) / rows
+
+        val visible = if (points.size > PERFORMANCE_CHART_POINTS) {
+            points.takeLast(PERFORMANCE_CHART_POINTS)
+        } else {
+            points
+        }
+
+        val startSlot = PERFORMANCE_CHART_POINTS - visible.size
+
+        for (core in 0 until coreCount) {
+
+            val column = core % columns
+
+            val row = core / columns
+
+            val left = column * (cellWidth + gap)
+
+            val top = row * (cellHeight + gap)
+
+            drawRoundRect(
+                color = track.copy(alpha = 0.35f),
+
+                topLeft = Offset(left, top),
+
+                size = Size(cellWidth, cellHeight),
+
+                cornerRadius = CornerRadius(4.dp.toPx(), 4.dp.toPx())
+            )
+
+            // 每格自己一条 100% 顶线（不是刻度，只是"满格"的位置）
+            drawLine(
+                color = topLineColor,
+
+                start = Offset(left, top),
+
+                end = Offset(left + cellWidth, top),
+
+                strokeWidth = 1.dp.toPx(),
+
+                cap = StrokeCap.Butt
+            )
+
+            val slotWidth = cellWidth / (PERFORMANCE_CHART_POINTS - 1).toFloat()
+
+            /** 这一格内：0% 贴格底，100% 贴格顶。 */
+            val yOf: (Float) -> Float = { percent ->
+                top + cellHeight - cellHeight * (percent.coerceIn(0f, 100f) / 100f)
+            }
+
+            // 这一核的利用率：-1（没值）与缺失都按 0 画，保证不断线也不串位
+            val percents = visible.map { point ->
+                point.corePercents.getOrNull(core)?.takeIf { it >= 0f } ?: 0f
+            }
+
+            if (showKernelTime) {
+
+                val kernels = visible.map { point ->
+
+                    val kernel = point.coreKernels.getOrNull(core) ?: -1f
+
+                    if (kernel < 0f) {
+                        -1f
+                    } else {
+                        // 这一核的内核时间不会超过这一核自己的利用率
+                        kernel.coerceIn(0f, point.corePercents.getOrNull(core)?.coerceIn(0f, 100f) ?: 0f)
+                    }
+                }
+
+                drawKernelBand(
+                    percents = kernels,
+
+                    startSlot = startSlot,
+
+                    slotWidth = slotWidth,
+
+                    left = left,
+
+                    bottom = top + cellHeight,
+
+                    yOf = yOf,
+
+                    fill = lineColor.copy(alpha = 0.28f),
+
+                    stroke = lineColor.copy(alpha = 0.75f)
+                )
+            }
+
+            if (visible.size < 2) {
+
+                drawCircle(
+                    color = lineColor,
+
+                    radius = 1.2.dp.toPx(),
+
+                    center = Offset(left + cellWidth - 1.5.dp.toPx(), yOf(percents.lastOrNull() ?: 0f))
+                )
+
+                continue
+            }
+
+            val path = Path()
+
+            percents.forEachIndexed { index, value ->
+
+                val x = left + (startSlot + index) * slotWidth
+
+                val y = yOf(value)
+
+                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+
+            drawPath(
+                path = path,
+
+                color = lineColor,
+
+                style = androidx.compose.ui.graphics.drawscope.Stroke(
+                    width = 1.dp.toPx(),
+
+                    cap = StrokeCap.Round,
+
+                    join = androidx.compose.ui.graphics.StrokeJoin.Round
+                )
+            )
+        }
+    }
+}
 /**
  * 长按图表弹出的菜单。
  *
@@ -1359,7 +1828,8 @@ private fun DetailChartPlaceholder(
  * 2) 显示内核时间：状态留着，画法待定（内核时间还没采集）；
  * 3) 图形摘要视图：整页只剩图表，长按图表退出；
  * 4) 查看：只列出六个目标，点哪个都先关菜单什么也不做 —— 切页接口还没接；
- * 5) 复制：把占位文本 [CHART_MENU_COPY_TEXT] 写进系统剪贴板。
+ * 5) 复制：把当前硬件的复制文本写进系统剪贴板。CPU 走 [cpuClipboardText]（与任务管理器
+ *    粘贴出来的一致），其余设备暂时是占位文本，等各自数据齐了再补。
  */
 @Composable
 private fun PerformanceChartDialog(
@@ -1369,6 +1839,7 @@ private fun PerformanceChartDialog(
     onKernelGraphModeChange: (String) -> Unit,
     onShowKernelTimeChange: (Boolean) -> Unit,
     onEnterSummary: () -> Unit,
+    copyText: String,
     onDismiss: () -> Unit
 ) {
 
@@ -1458,7 +1929,7 @@ private fun PerformanceChartDialog(
             ChartMenuRow(
                 label = "复制(C)"
             ) {
-                copyChartMenuText(context, CHART_MENU_COPY_TEXT)
+                copyChartMenuText(context, copyText)
 
                 onDismiss()
             }
@@ -1637,7 +2108,7 @@ private fun ChartMenuTarget(
 }
 
 /**
- * 把菜单里的占位文本写进系统剪贴板。
+ * 把菜单算好的文本写进系统剪贴板。
  *
  * 用系统剪贴板服务而不是 Compose 的剪贴板管理器：浮窗里没有 Activity 令牌，
  * 但剪贴板是系统服务，服务的 Context 一样能写。
@@ -1652,3 +2123,204 @@ private fun copyChartMenuText(context: Context, text: String) {
 
     clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
 }
+
+// ============================================================
+// 性能页图表的画图偏好：一份全应用共享的状态 + 一份落盘
+// ============================================================
+//
+// 这两项只决定"怎么画"：不动采样、不动历史、不动槽位，所以来回切既不丢数据，
+// 也不改变图覆盖的时间范围。
+//
+// 为什么状态必须提到进程级：同一份性能页会在三个地方各实例化一次——主界面竖屏、
+// 主界面宽屏（横屏）、悬浮窗，Composable 实例彼此独立；图形摘要视图又是另一个宿主
+// 渲染的。状态若只放在页面内部，在浮窗里把口径改成逻辑处理器、回到主界面就又是
+// 总体利用率，用户感知就是每个宿主都得重新点一遍。
+
+/**
+ * 图表画图偏好的落盘（files/config/chart_view.json）。
+ *
+ * 存两项：
+ * - logical_graph     图表口径：true = 逻辑处理器（每核一格），false = 总体利用率；
+ * - show_kernel_time  是否在曲线下方叠内核时间色带。
+ *
+ * 为什么单独一个文件而不是塞进 settings.json：
+ * 1. 这是页面的视图状态，不是设置项：设置页不显示、不管理，重置所有设置也不该抹掉它；
+ * 2. settings.json 有严格字段表（SettingKey / diagnose 缺项校验），为两项画图偏好
+ *    改整条设置管线不划算；
+ * 3. 这份文件坏了只影响图表默认画法，不牵连设置本身的启动与修复流程。
+ *
+ * 写入方式与 settings.json 一致（.tmp -> rename），失败只返回 false，绝不抛异常。
+ */
+object ChartViewStore {
+
+    private const val CONFIG_DIR = "config"
+
+    private const val FILE_NAME = "chart_view.json"
+
+    private const val TMP_SUFFIX = ".tmp"
+
+    /** 存档字段：图表口径（true = 逻辑处理器）。 */
+    private const val KEY_LOGICAL_GRAPH = "logical_graph"
+
+    /** 存档字段：是否显示内核时间。 */
+    private const val KEY_SHOW_KERNEL_TIME = "show_kernel_time"
+
+    /** 一次读出来的两项画图偏好。 */
+    class Preferences(
+
+        /** 图表口径：true = 逻辑处理器，false = 总体利用率。 */
+        val logicalGraph: Boolean,
+
+        /** 是否叠内核时间色带。 */
+        val showKernelTime: Boolean
+    )
+
+    fun filePath(context: Context): File = File(File(context.filesDir, CONFIG_DIR), FILE_NAME)
+
+    /**
+     * 读两项画图偏好。
+     *
+     * 承诺：永远给出一份可用的值。没有存档 / 文件损坏 / 字段类型不对，一律退回默认
+     * （总体利用率、不画内核时间）——图表默认长什么样，不能因为存档坏了就变个样。
+     */
+    fun load(context: Context): Preferences {
+
+        val json = try {
+            val file = filePath(context)
+
+            if (file.exists()) JSONObject(file.readText(Charsets.UTF_8)) else null
+        } catch (e: Exception) {
+            null
+        }
+
+        return Preferences(
+            logicalGraph = json?.optBoolean(KEY_LOGICAL_GRAPH, false) ?: false,
+            showKernelTime = json?.optBoolean(KEY_SHOW_KERNEL_TIME, false) ?: false
+        )
+    }
+
+    /**
+     * 写两项画图偏好。
+     *
+     * 调用方负责线程：这是几十字节的写盘，但仍然是一次 IO，不放 UI 线程上。
+     * 失败只返回 false（磁盘满 / 目录不可写），不抛异常——偏好丢了不该让页面崩。
+     */
+    fun save(
+        context: Context,
+        logicalGraph: Boolean,
+        showKernelTime: Boolean
+    ): Boolean {
+
+        val target = filePath(context)
+
+        val dir = target.parentFile ?: return false
+
+        return try {
+
+            if (!dir.exists() && !dir.mkdirs()) return false
+
+            val json = JSONObject()
+                .put(KEY_LOGICAL_GRAPH, logicalGraph)
+                .put(KEY_SHOW_KERNEL_TIME, showKernelTime)
+
+            val tmp = File(dir, FILE_NAME + TMP_SUFFIX)
+
+            tmp.writeText(json.toString(2), Charsets.UTF_8)
+
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+
+                tmp.delete()
+            }
+
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
+
+/**
+ * 图表画图偏好：全应用唯一一份。
+ *
+ * 三处宿主、菜单、图形摘要视图都读同一个 object，任何一处改动会立刻在其余几处生效。
+ * 进程重启后第一次进性能页调用 [ensureLoaded] 读回来；之后只动内存，异步写盘。
+ */
+object ChartViewState {
+
+    /** 图表口径：true = 逻辑处理器（每核一格），false = 总体利用率（默认）。 */
+    var logicalGraph by mutableStateOf(false)
+        private set
+
+    /** 是否在曲线下方叠内核时间色带；默认不画，菜单里勾了才画。 */
+    var showKernelTime by mutableStateOf(false)
+        private set
+
+    /** 是否已从磁盘读过一次。 */
+    @Volatile
+    private var loaded = false
+
+    /** 写盘线程：连续点几下也只排队，不一次点出一个线程。 */
+    private val writer = Executors.newSingleThreadExecutor()
+
+    /**
+     * 首次读取落盘值（幂等）。
+     *
+     * 为什么读了就直接改状态、而不是先给默认再异步替换：两项都是布尔，读盘只有
+     * 几十字节，同步读一次最省事，也不会出现第一帧画总体利用率、下一帧跳成逐核的闪动。
+     * 三处宿主谁先组合谁触发，后到的直接命中 [loaded]。
+     */
+    @Synchronized
+    fun ensureLoaded(context: Context) {
+
+        if (loaded) return
+
+        val preferences = ChartViewStore.load(context.applicationContext)
+
+        logicalGraph = preferences.logicalGraph
+
+        showKernelTime = preferences.showKernelTime
+
+        loaded = true
+    }
+
+    /** 改图表口径：内存先改（界面这一帧就重画），再异步写盘。 */
+    fun setLogicalGraph(context: Context, value: Boolean) {
+
+        if (logicalGraph == value) return
+
+        logicalGraph = value
+
+        persist(context)
+    }
+
+    /** 改显示内核时间：同上。 */
+    fun setShowKernelTime(context: Context, value: Boolean) {
+
+        if (showKernelTime == value) return
+
+        showKernelTime = value
+
+        persist(context)
+    }
+
+    /**
+     * 落盘。
+     *
+     * 取快照而不是在子线程里读属性：连续两次点击时，让写下的值就是最后一次的值，
+     * 也避免读写跨线程的歧义。
+     */
+    private fun persist(context: Context) {
+
+        val appContext = context.applicationContext
+
+        val logical = logicalGraph
+
+        val kernel = showKernelTime
+
+        writer.execute {
+            ChartViewStore.save(appContext, logical, kernel)
+        }
+    }
+}
+

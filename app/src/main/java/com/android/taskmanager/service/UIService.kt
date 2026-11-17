@@ -1796,11 +1796,55 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         val percent = snapshot.cpuUsagePercent ?: return
 
-        cpuUsageHistory.addLast(CpuUsagePoint(atMs, percent))
+        // 队列为空 = 一段历史刚刚开始（服务刚起、进程被回收后重建）。
+        // 先垫一个利用率 0 的起点，真实数据从第二个点开始：曲线的第一笔永远从底边起步，
+        // 不会直接从中段（比如 30%）拉出来。绘制层一行都不用改，大小图 / 内核色带 /
+        // 逐核网格读的都是这份历史，自然一起跟着变。
+        // 攒满 60 点之后种子点会被挤出窗口，留下的全是真实历史。
+        if (cpuUsageHistory.isEmpty()) {
+            appendHistorySeedPoint(snapshot, atMs)
+        }
+
+        // 内核时间与逐核两列跟着同一个点一起入队：图上的内核区域必须和总曲线
+        // 来自同一帧，分开存会出现"总利用率是这一秒、内核时间是下一秒"的错位。
+        cpuUsageHistory.addLast(
+            CpuUsagePoint(
+                timeMs = atMs,
+                percent = percent,
+                kernelPercent = snapshot.cpuKernelPercent,
+                corePercents = snapshot.logicalUsage,
+                coreKernels = snapshot.logicalKernel
+            )
+        )
 
         while (cpuUsageHistory.size > CPU_HISTORY_MAX_POINTS) {
             cpuUsageHistory.removeFirst()
         }
+    }
+
+    /**
+     * 往历史里垫一个"图表起点"：利用率 0 的假点。
+     *
+     * 三条要求，少一条曲线就会自相矛盾：
+     * 1) 总利用率是 0 —— 这是这个点存在的唯一目的；
+     * 2) 内核时间：首帧报得上就垫 0，报不上就保持 null（绘制层按"这一槽没值"处理，
+     *    不会伪造一条内核色带）；
+     * 3) 逐核数组照首帧的核数铺同样多的 0 —— 逻辑处理器网格的列数从第一屏就是对的，
+     *    不会因为种子点少一核而重排网格。
+     *
+     * 以后内存 / 磁盘 / 网络 / GPU 各自的曲线接入时，用同样的规则给它们自己的队列垫起点。
+     */
+    private fun appendHistorySeedPoint(snapshot: PerformanceSnapshot, atMs: Long) {
+
+        cpuUsageHistory.addLast(
+            CpuUsagePoint(
+                timeMs = atMs,
+                percent = 0f,
+                kernelPercent = snapshot.cpuKernelPercent?.let { 0f },
+                corePercents = snapshot.logicalUsage.map { 0f },
+                coreKernels = snapshot.logicalKernel.map { 0f }
+            )
+        )
     }
 
     /**

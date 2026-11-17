@@ -23,6 +23,7 @@
 package com.android.taskmanager
 
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.provider.Settings
@@ -63,6 +64,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.launch
 
 import com.android.taskmanager.service.SettingsStore
@@ -151,6 +155,43 @@ class MainActivity : ComponentActivity() {
         isResumed = true
 
         UIService.instanceOrNull()?.setAppForeground(true)
+
+        // 从后台 / 锁屏回来时再对齐一次：系统可能已经把那两条栏恢复出来了
+        applyLandscapeImmersive()
+    }
+
+    /**
+     * 横屏时把状态栏、导航栏一起藏起来（沉浸式），竖屏时恢复。
+     *
+     * 为什么放在 Activity 里而不是 Compose 里：
+     * - 旋转会重建 Activity，这里在 onCreate 里、setContent 之前就执行，
+     *   系统栏在新界面的第一帧之前就已经隐藏，不会出现“先亮一下再消失”的闪动；
+     * - 从后台或锁屏回来时 onResume 再来一遍，防止系统把栏恢复后一直留在屏幕上。
+     *
+     * 为什么用 BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE：栏不是被锁死的，
+     * 用户从屏幕上边缘或手势条往里滑，栏临时出现，松手几秒后自动收回。
+     * 看图表的页面平时只剩下内容，需要时还能摸到通知栏与返回手势。
+     *
+     * 全程静默：不弹提示、不申请权限、不弹任何确认对话框。
+     */
+    private fun applyLandscapeImmersive() {
+
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+
+        if (landscape) {
+
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+            // 状态栏与导航栏一起藏（systemBars 就是这两条）
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+
+            // 竖屏：栏是正常版式的一部分，一直藏着会让页面上下各少一处可读边距
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
     }
 
     override fun onPause() {
@@ -289,6 +330,12 @@ class MainActivity : ComponentActivity() {
         //    其下承载 MainPage()，内部自行分发各页面。
         //    主题状态是进程级共享的（ThemeState），设置页改主题时这里会自动重组，
         //    不需要重启应用，浮窗那侧也同步变色。
+        //
+        // 在这之前先按当前方向摆好系统栏：本 Activity 没声明 configChanges，
+        // 旋转会重建它，所以这条在 onCreate 里执行一次就覆盖了每次进横屏的场景，
+        // 而且早于 setContent，栏在首帧前已经藏好。
+        applyLandscapeImmersive()
+
         setContent {
             TaskManagerTheme {
                 Surface(

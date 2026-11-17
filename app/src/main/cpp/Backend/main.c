@@ -2262,10 +2262,20 @@ static long long monotonic_ms(void)
 /** 一台芯片最多记多少个逻辑核：8~16 核常见，留 64 够用。 */
 #define TM_OUT_LOGICAL_MAX 64
 
-/** 一次 /proc/stat 采样里一行的时间账。 */
+/**
+ * 一次 /proc/stat 采样里一行的时间账。
+ *
+ * total  8 列之和（user nice system idle iowait irq softirq steal）
+ * idle   idle + iowait：第 4、5 列
+ * kernel system + irq + softirq：在内核态消耗的时间，任务管理器管它叫"内核时间"
+ *
+ * 内核时间不是独立的一段时间，它本来就包含在 total 里；图表上把它从总利用率里
+ * 叠出来用，所以 kernel 必然 <= total - idle。
+ */
 typedef struct {
     long long total;
     long long idle;
+    long long kernel;
 } TmCpuTimes;
 
 /** /proc/stat 的一整轮快照：summary 是 cpu 汇总行，cpu[] 按逻辑 CPU 号存放。 */
@@ -2288,6 +2298,7 @@ static bool parse_cpu_times(const char *cursor, TmCpuTimes *out)
 {
     long long total = 0;
     long long idle = 0;
+    long long kernel = 0;
 
     for (int slot = 0; slot < 8; slot++) {
 
@@ -2308,8 +2319,14 @@ static bool parse_cpu_times(const char *cursor, TmCpuTimes *out)
 
         total += value;
 
+        // 第 4、5 列（idle / iowait）算空闲
         if (slot == 3 || slot == 4) {
             idle += value;
+        }
+
+        // 第 3、6、7 列（system / irq / softirq）算内核时间
+        if (slot == 2 || slot == 5 || slot == 6) {
+            kernel += value;
         }
 
         cursor = end;
@@ -2321,6 +2338,7 @@ static bool parse_cpu_times(const char *cursor, TmCpuTimes *out)
 
     out->total = total;
     out->idle = idle;
+    out->kernel = kernel;
 
     return true;
 }
@@ -2426,11 +2444,53 @@ static double cpu_percent_between(const TmCpuTimes *later, const TmCpuTimes *bef
     return percent;
 }
 
-/** 一帧的 CPU 利用率：整机一份，每个逻辑核各一份（后者给以后按芯片画核心用）。 */
+/**
+ * 两个采样点之间算内核时间占比（%）。
+ *
+ * 分母与利用率用同一个 delta_total，所以内核时间永远 <= 总利用率，图表上那条
+ * 内核曲线不会冲出总曲线。
+ *
+ * @return -1 = 这一帧算不出内核时间（增量不成立或计数器回退）
+ */
+static double cpu_kernel_percent_between(const TmCpuTimes *later, const TmCpuTimes *before)
+{
+    if (later->total <= before->total) {
+        return -1.0;
+    }
+
+    long long delta_total = later->total - before->total;
+    long long delta_kernel = later->kernel - before->kernel;
+
+    // 计数器回退（热插拔、虚拟机迁移）就当这一帧没有值，不拿 0 顶上
+    if (delta_kernel < 0) {
+        return -1.0;
+    }
+
+    if (delta_kernel > delta_total) {
+        delta_kernel = delta_total;
+    }
+
+    double percent = (double) delta_kernel * 100.0 / (double) delta_total;
+
+    if (percent > 100.0) {
+        percent = 100.0;
+    }
+
+    return percent;
+}
+
+/**
+ * 一帧的 CPU 数据：整机一份，每个逻辑核各一份。
+ *
+ * percent 是利用率，kernel_percent 是其中在内核态消耗的比例：
+ * 两者口径相同（同一个 delta_total 做分母），画在同一张图上时内核那段被叠在底下。
+ */
 typedef struct {
-    double total_percent;                        /* -1 = 这一轮还没有基准 */
-    double logical_percent[TM_OUT_LOGICAL_MAX];  /* 按逻辑 CPU 号索引，-1 = 没值 */
-    int logical_max;                             /* 见到的最大逻辑 CPU 号 + 1 */
+    double total_percent;                          /* -1 = 这一轮还没有基准 */
+    double total_kernel_percent;                   /* -1 = 这一帧没有内核时间 */
+    double logical_percent[TM_OUT_LOGICAL_MAX];    /* 按逻辑 CPU 号索引，-1 = 没值 */
+    double logical_kernel_percent[TM_OUT_LOGICAL_MAX]; /* 同上，逐核内核时间 */
+    int logical_max;                               /* 见到的最大逻辑 CPU 号 + 1 */
 } TmCpuUsage;
 
 /**
@@ -2450,10 +2510,12 @@ static bool read_cpu_usage(TmCpuUsage *out)
     memset(out, 0, sizeof(*out));
 
     out->total_percent = -1.0;
+    out->total_kernel_percent = -1.0;
     out->logical_max = 0;
 
     for (int i = 0; i < TM_OUT_LOGICAL_MAX; i++) {
         out->logical_percent[i] = -1.0;
+        out->logical_kernel_percent[i] = -1.0;
     }
 
     TmCpuStatTable now;
@@ -2485,6 +2547,9 @@ static bool read_cpu_usage(TmCpuUsage *out)
 
     out->total_percent = cpu_percent_between(&later.summary, &prev.summary);
 
+    // 整机内核时间与整机利用率同一对采样点
+    out->total_kernel_percent = cpu_kernel_percent_between(&later.summary, &prev.summary);
+
     int limit = later.max_logical;
 
     if (limit > TM_OUT_LOGICAL_MAX) {
@@ -2502,6 +2567,9 @@ static bool read_cpu_usage(TmCpuUsage *out)
 
         out->logical_percent[logical] = cpu_percent_between(&later.cpu[logical],
                                                             &prev.cpu[logical]);
+
+        out->logical_kernel_percent[logical] = cpu_kernel_percent_between(&later.cpu[logical],
+                                                                         &prev.cpu[logical]);
     }
 
     prev = later;
@@ -2990,6 +3058,7 @@ static long long read_uptime_seconds(void)
 //   D id=cpu0 type=CPU
 //   F cpu_id=0
 //   F usage_percent=12.34
+//   F kernel_percent=3.80
 //   F speed_mhz=1804
 //
 // 约定：
@@ -3001,15 +3070,17 @@ static long long read_uptime_seconds(void)
 // 4. 字段没有数值时输出 F key=!状态，状态取值与进程行同一套；
 // 5. 字段值按百分号编码，与进程行同一套规则。
 //
-// 采集口径沿用原来那一套：利用率按 /proc/stat 两轮差值算，频率读 cpu0 的 cpufreq，
-// 缓存扫每台实例自己的 cache/index*，进程线程句柄数扫 /proc。
+// 采集口径沿用原来那一套：利用率与内核时间都按 /proc/stat 两轮差值算（同一个
+// delta_total 做分母），频率读 cpu0 的 cpufreq，缓存扫每台实例自己的 cache/index*，
+// 进程线程句柄数扫 /proc。
 //
 // 字段取值的统一约定（整份文件都遵守，不再有第二种表达方式）：
 // 1. 每个字段只有两种形态：有值，或者 F key=!状态；
 // 2. 状态取值见 TmQueryStatus：UNSUPPORTED / READ_FAILED / ACCESS_DENIED /
 //    NOT_AVAILABLE / NO_BASELINE / TRUNCATED，都是"没有值"，不是 0，也不是空串；
 // 3. 处理器商品名 / 虚拟化方案 / 缓存容量三个接口先自己探测一份，再调外部实现，
-//    外部返回 TM_QUERY_OK 才覆盖，不是 OK 就用自己的；两边都没有才发状态。// 处理器商品名 / 虚拟化方案 / 缓存容量三个位置留给外部实现，见下面的 query_*_external。
+//    外部返回 TM_QUERY_OK 才覆盖，不是 OK 就用自己的；两边都没有才发状态。
+//    三个外部实现的位置见下面的 query_*_external。
 // ============================================================
 
 /** 设备类型（字符串直接进协议，客户端按同一批常量匹配）。 */
@@ -3980,18 +4051,21 @@ static bool format_logical_ids(const int *ids, int count, char *out, int capacit
 }
 
 /**
- * 把逐核利用率拼成协议里的 logical_usage（逗号分隔，两位小数）。
+ * 把逐核百分比拼成协议里的一列（logical_usage / logical_kernel 共用）。
  *
- * 顺序与 cpu_ids 严格一一对应：这个列表的第 n 个数就是 cpu_ids 第 n 个核的利用率。
+ * 顺序与 cpu_ids 严格一一对应：这个列表的第 n 个数就是 cpu_ids 第 n 个核的值。
  * 某一核这一帧没有值（刚热插拔、计数器回退）写 -1.00，占住位置不让后面错位。
  *
- * @param ids   逻辑核号数组（与 cpu_ids 同一份，同一顺序）
- * @param count ids 的条数
+ * @param values     按逻辑 CPU 号索引的百分比数组（-1 = 没值）
+ * @param max_index  这个数组的有效长度（见到的最大逻辑号 + 1）
+ * @param ids        逻辑核号数组（与 cpu_ids 同一份，同一顺序）
+ * @param count      ids 的条数
  * @return TM_QUERY_OK = 有值；NOT_AVAILABLE = 一个都没算出来；TRUNCATED = 太长装不下
  */
-static TmQueryValue format_logical_usage(const int *ids, int count, const TmCpuUsage *usage)
+static TmQueryValue format_logical_percents(const double *values, int max_index,
+                                            const int *ids, int count)
 {
-    if (ids == NULL || count <= 0 || usage == NULL) {
+    if (values == NULL || ids == NULL || count <= 0) {
         return query_value_none(TM_QUERY_NOT_AVAILABLE);
     }
 
@@ -4008,10 +4082,8 @@ static TmQueryValue format_logical_usage(const int *ids, int count, const TmCpuU
 
         double percent = -1.0;
 
-        if (logical >= 0 && logical < usage->logical_max
-            && logical < TM_OUT_LOGICAL_MAX) {
-
-            percent = usage->logical_percent[logical];
+        if (logical >= 0 && logical < max_index && logical < TM_OUT_LOGICAL_MAX) {
+            percent = values[logical];
         }
 
         char item[32];
@@ -4053,6 +4125,7 @@ static TmQueryValue format_logical_usage(const int *ids, int count, const TmCpuU
   *
   * 合并规则逐字段不同，不要按同一套想：
   *   usage_percent   整机汇总行，本来就是各处理器一起算的，直接用
+  *   kernel_percent  内核时间占这一帧的比例，与 usage_percent 同一口径
   *   speed_mhz       不相加：多颗处理器通常同频，取 cpu0 那一份
   *   base_mhz        同上
   *   name            全部同名只写一个；不同名按 "名1 名2" 拼，缺名的写 NAME
@@ -4062,7 +4135,8 @@ static TmQueryValue format_logical_usage(const int *ids, int count, const TmCpuU
   *   logical_cpus    合并后的逻辑核总数
   *   l1/l2/l3_cache  各芯片相加（两颗各 1 KB → 2 KB）
   *   cpu_ids         按内核顺序拼：第 0 颗的核在前、第 1 颗的在后，不打乱
-  *   logical_usage   与 cpu_ids 一一对应，同一个顺序
+  *   logical_usage   逐核利用率，与 cpu_ids 一一对应，同一个顺序
+  *   logical_kernel  逐核内核时间，与 cpu_ids 一一对应，同一个顺序
   *
   * 名字 / 虚拟化 / 缓存仍是"自己探测优先，外部返回 OK 才覆盖"，多颗时逐颗问一遍。
   *
@@ -4105,6 +4179,12 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
     device_put_value(&out[0], "usage_percent",
                      query_value_float(usage->total_percent >= 0.0,
                                        usage->total_percent, 2,
+                                       TM_QUERY_NO_BASELINE));
+
+    // 内核时间：与利用率同一口径（system + irq + softirq 占这一帧的比例）
+    device_put_value(&out[0], "kernel_percent",
+                     query_value_float(usage->total_kernel_percent >= 0.0,
+                                       usage->total_kernel_percent, 2,
                                        TM_QUERY_NO_BASELINE));
 
     // 频率取第一颗处理器（cpu0 的 cpufreq）；多颗通常同频，不相加
@@ -4329,7 +4409,13 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
 
     // 逐核利用率：顺序与 cpu_ids 一一对应
     device_put_value(&out[0], "logical_usage",
-                     format_logical_usage(merged_ids, merged_count, usage));
+                     format_logical_percents(usage->logical_percent, usage->logical_max,
+                                             merged_ids, merged_count));
+
+    // 逐核内核时间：与 logical_usage 同一份核号、同一个顺序
+    device_put_value(&out[0], "logical_kernel",
+                     format_logical_percents(usage->logical_kernel_percent,
+                                             usage->logical_max, merged_ids, merged_count));
 
     return 1;
 }

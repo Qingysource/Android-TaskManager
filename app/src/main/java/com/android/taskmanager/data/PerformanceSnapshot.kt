@@ -23,6 +23,23 @@ data class PerformanceSnapshot(
     /** 整机 CPU 利用率（0..100）。 */
     val cpuUsagePercent: Float? = null,
 
+    /**
+     * 内核时间占比（0..100）：总利用率里在内核态（system + irq + softirq）消耗的那部分。
+     *
+     * 它与 [cpuUsagePercent] 用同一个采样区间做分母，所以永远 <= 利用率；
+     * null = 这一帧算不出来（首帧没有基准、计数器回退），图表不上叠内核那段。
+     */
+    val cpuKernelPercent: Float? = null,
+
+    /** 逐核利用率（0..100），顺序与 [cpuIds] 一一对应；空 = 后端没报。 */
+    val logicalUsage: List<Float> = emptyList(),
+
+    /** 逐核内核时间（0..100），与 [logicalUsage] 同一个顺序。 */
+    val logicalKernel: List<Float> = emptyList(),
+
+    /** 逻辑核号，例如 [0,1,2,3]；上面两列就是按这个顺序排的。 */
+    val cpuIds: List<Int> = emptyList(),
+
     /** 当前运行频率（MHz）。 */
     val cpuSpeedMhz: Int? = null,
 
@@ -163,6 +180,14 @@ data class PerformanceSnapshot(
                 cpuUsagePercent = cpuFields.floatOf("usage_percent")
                     ?: cpuFields.floatOf("cpu_usage_percent"),
 
+                cpuKernelPercent = cpuFields.floatOf("kernel_percent"),
+
+                logicalUsage = cpuFields.floatListOf("logical_usage"),
+
+                logicalKernel = cpuFields.floatListOf("logical_kernel"),
+
+                cpuIds = cpuFields.textValueOf("cpu_ids")?.toIntList() ?: emptyList(),
+
                 cpuSpeedMhz = cpuFields.intOf("speed_mhz") ?: cpuFields.intOf("cpu_speed_mhz"),
 
                 cpuBaseMhz = cpuFields.intOf("base_mhz") ?: cpuFields.intOf("cpu_base_mhz"),
@@ -208,6 +233,24 @@ data class PerformanceSnapshot(
 
         private fun Map<String, String>.intOf(key: String): Int? = valueOf(key)?.toIntOrNull()
 
+        /**
+         * `0,1,2,3` -> [0,1,2,3]；解析不了的项直接跳过 —— 核号缺失只影响那一格的名字，
+         * 不影响其它核的对应关系（值列表按位置对齐，不按核号查找）。
+         */
+        private fun String.toIntList(): List<Int> =
+            split(',').mapNotNull { it.trim().toIntOrNull() }
+
+        /**
+         * `12.34,8.20,-1.00` -> [12.34, 8.20, -1.0]。
+         *
+         * 位置必须保持：-1 是"这一核没值"的哨兵，不能被过滤掉，否则后面每一核都会错位。
+         * 整列缺失（后端回 `!状态`）时返回空列表，表示"这一列没报"。
+         */
+        private fun Map<String, String>.floatListOf(key: String): List<Float> =
+            valueOf(key)?.split(',')
+                ?.map { it.trim().toFloatOrNull() ?: -1f }
+                ?: emptyList()
+
         private fun Map<String, String>.longOf(key: String): Long? = valueOf(key)?.toLongOrNull()
 
         private fun Map<String, String>.textValueOf(key: String): String? =
@@ -216,16 +259,25 @@ data class PerformanceSnapshot(
 }
 
 /**
- * 一个 CPU 利用率采样点。
+ * 一个 CPU 采样点。
  *
  * 时间用进程内的相对时钟（elapsedRealtime），只用于"点与点之间的间隔"，
  * 不落盘、不跨进程、不做绝对日期——所以精度够用，也不受时区/校时影响。
  *
- * @param timeMs  采样时刻（毫秒）
- * @param percent 利用率，0..100
+ * 逐核两列是"同一帧的同一批核"，索引一一对应；某个核这一帧没值写 -1f 占位，
+ * 位置不能丢，否则整条曲线会串到别的核上。
+ *
+ * @param timeMs       采样时刻（毫秒）
+ * @param percent      整机利用率，0..100
+ * @param kernelPercent 内核时间占比，0..100；null = 这一帧算不出（首帧 / 计数器回退）
+ * @param corePercents 逐核利用率；空 = 后端没报逐核
+ * @param coreKernels  逐核内核时间；与 corePercents 同序
  */
 data class CpuUsagePoint(
     val timeMs: Long,
-    val percent: Float
+    val percent: Float,
+    val kernelPercent: Float? = null,
+    val corePercents: List<Float> = emptyList(),
+    val coreKernels: List<Float> = emptyList()
 )
 
