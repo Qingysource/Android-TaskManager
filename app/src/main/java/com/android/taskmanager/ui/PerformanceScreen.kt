@@ -7,7 +7,7 @@
  *   宽屏（横屏 / 宽浮窗，>= 520.dp）
  *   ┌──────────┬─────────────────────────────────────┐
  *   │ ▁▁ CPU   │  CPU                          NAME │
- *   │ 0% 0GHz  │  60 秒以内的利用率%          100%  │
+ *   │ 0% 0GHz  │  60 秒内的利用率 %          100%  │
  *   ├──────────┤  ┌───────────────────────────────┐  │
  *   │ ▁▁ 内存  │  │ 历史折线（大图表）             │  │
  *   ├──────────┤  └───────────────────────────────┘  │
@@ -125,13 +125,14 @@ val PerformancePageState: PageState = PageState.IMPLEMENTED
 private val PERFORMANCE_WIDE_MIN_WIDTH = 520.dp
 
 /**
- * 趋势图的固定槽位数（横向格子数）。
+ * 图表一屏有多少个横向槽位（照 Windows 任务管理器那张 CPU 图，取 60 个：
+ * 以常规速度 1 秒一个点算，刚好覆盖 60 秒）。
  *
- * 三种更新速度下都对得上：高 0.5 秒 × 60 = 30 秒、常规 1 秒 × 60 = 60 秒、
- * 低 4 秒 × 60 = 240 秒。所以不论速度怎么变，横轴始终是"当前窗口内的采样槽"，
- * 新点从右边进来、老点从左边挤出去，点数不够 60 个时曲线靠右、左边留空。
+ * 槽位数是**固定的**：三个更新档位共用同一组槽位，点数不满时曲线贴右边生长，
+ * 满了之后新点从右进、老点从左出。换档位只改变新点进来的快慢，
+ * 图的宽度、槽位数、已经采到的曲线都不变。缓存上限在服务侧（CPU_HISTORY_MAX_POINTS）。
  */
-private const val PERFORMANCE_CHART_SLOTS = 60
+private const val PERFORMANCE_CHART_POINTS = 60
 
 /** 窄屏底部硬件条的单项高度：一行文字，按压目标够大就行。 */
 private val PERFORMANCE_COMPACT_TAB_HEIGHT = 38.dp
@@ -194,10 +195,13 @@ private data class CpuStat(
  *
  * 某一格没数据时，对应文案是破折号 —— 不要用 0 冒充，0% 与 读不到 是两件事。
  */
-private fun cpuSummaryRows(snapshot: PerformanceSnapshot): List<List<CpuStat>> = listOf(
+private fun cpuSummaryRows(
+    snapshot: PerformanceSnapshot,
+    usageDecimals: Int = 0
+): List<List<CpuStat>> = listOf(
     listOf(
         CpuStat(
-            "利用率", snapshot.cpuUsageText(), emphasis = true,
+            "利用率", snapshot.cpuUsageText(usageDecimals), emphasis = true,
             wideWidth = 66.dp, narrowWidth = 54.dp
         ),
         CpuStat(
@@ -256,11 +260,21 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
     // 图表窗口文案：只在切进本页时取一次。用户改"实时更新速度"必须先回设置页，
     // 再切回来时这次读取自然拿到新值 —— 不需要每帧都去问设置。
-    var windowLabel by remember { mutableStateOf("$TEST_CHART_WINDOW_SECONDS 秒以内的利用率%") }
+    // 只有这段文字跟着档位变；图本身（点数、宽度、布局）三个档位完全相同。
+    var windowLabel by remember { mutableStateOf("$TEST_CHART_WINDOW_SECONDS 秒内的利用率 %") }
+
+    // 利用率显示位数：读设置页的"利用率精确度"（默认 0 位 / 一位 1 位 / 两位 2 位）。
+    // 同样在切进本页时取一次 —— 要改它必须先回设置页，回来自然读到新值。
+    // 它只影响这几个字怎么画，不影响采集精度，也不影响图表曲线（曲线一直按浮点值画）。
+    var usageDecimals by remember { mutableStateOf(0) }
 
     LaunchedEffect(Unit) {
 
         windowLabel = service?.performanceChartWindowLabel() ?: windowLabel
+
+        usageDecimals = SettingsCatalog.cpuUsageDecimals(
+            service?.settings()?.cpuUsagePrecision ?: SettingsDefaults.cpuUsagePrecision
+        )
 
         // 立刻补采一帧：后台可能刚采过，但"切进来的第一屏"不该等一个周期
         service?.refreshPerformanceNow()
@@ -306,12 +320,16 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                             HardwareTab(
                                 kind = kind,
 
-                                percentText = if (isCpu) snapshot.cpuUsageText() else kind.testPercent,
+                                percentText = if (isCpu) {
+                                    snapshot.cpuUsageText(usageDecimals)
+                                } else {
+                                    kind.testPercent
+                                },
 
                                 detailText = if (isCpu) snapshot.cpuSpeedText() else kind.testDetail,
 
                                 // 迷你图取的是同一份历史点的尾部，只是画得小
-                                points = if (isCpu) history.map { it.percent } else emptyList(),
+                                history = if (isCpu) history else emptyList(),
 
                                 selected = kind == selected,
 
@@ -336,6 +354,8 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                         wide = true,
 
                         hostedInOverlay = hostedInOverlay,
+
+                        usageDecimals = usageDecimals,
 
                         onChartLongPress = { chartDialogVisible = true },
 
@@ -363,6 +383,8 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                         wide = false,
 
                         hostedInOverlay = hostedInOverlay,
+
+                        usageDecimals = usageDecimals,
 
                         onChartLongPress = { chartDialogVisible = true },
 
@@ -393,7 +415,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
             windowLabel = windowLabel,
 
-            currentText = snapshot.cpuUsageText(),
+            currentText = snapshot.cpuUsageText(usageDecimals),
 
             onDismiss = { chartDialogVisible = false }
         )
@@ -424,7 +446,7 @@ private fun HardwareTab(
     kind: HardwareKind,
     percentText: String,
     detailText: String,
-    points: List<Float>,
+    history: List<CpuUsagePoint>,
     selected: Boolean,
     onClick: () -> Unit
 ) {
@@ -468,7 +490,7 @@ private fun HardwareTab(
             MiniSparkline(
                 selected = selected,
 
-                points = points,
+                history = history,
 
                 modifier = Modifier.size(width = 34.dp, height = 22.dp)
             )
@@ -521,12 +543,15 @@ private fun HardwareTab(
  * 和大图表是同一个数据源（[PerformanceScreen] 里那份 history），
  * 区别只有三处：取点数、尺寸、以及这里不画网格。
  *
- * 纵向比例固定 0..100%：迷你图不标刻度，比例和大图一致才不会"看着像"。
+ * 横向同样按固定槽位、点数不足时贴右边生长（和大图一个规矩），
+ * 所以刚进页面只看到右边一小段线，不会一上来就连满小图。
+ *
+ * 纵向比例固定 0..100%：迷你图不标刻度，比例和大图一致才不会看着不像。
  */
 @Composable
 private fun MiniSparkline(
     selected: Boolean,
-    points: List<Float>,
+    history: List<CpuUsagePoint>,
     modifier: Modifier = Modifier
 ) {
 
@@ -543,7 +568,7 @@ private fun MiniSparkline(
     }
 
     // 尾部 12 个点就够看出起伏；再多在这个尺寸下也挤成一团
-    val tail = remember(points) { points.takeLast(MINI_SPARKLINE_POINTS) }
+    val tail = remember(history) { history.takeLast(MINI_SPARKLINE_POINTS) }
 
     Canvas(modifier = modifier) {
 
@@ -555,8 +580,8 @@ private fun MiniSparkline(
 
         if (tail.size < 2) {
 
-            // 还没攒够点：在最后一槽上点一个点，不要拉一条横贯全宽的线
-            val fraction = (tail.lastOrNull() ?: 0f).coerceIn(0f, 100f) / 100f
+            // 还没攒够点：贴右边缘点一个点，不拉横贯全宽的线
+            val fraction = (tail.lastOrNull()?.percent ?: 0f).coerceIn(0f, 100f) / 100f
 
             val y = size.height - 3.dp.toPx() - (size.height - 6.dp.toPx()) * fraction
 
@@ -575,18 +600,17 @@ private fun MiniSparkline(
 
         val usable = size.height - inset * 2
 
-        // 和大图表同一套规矩：固定槽位、靠右生长，点数不满时左边留空
-        val stepX = (size.width - 4.dp.toPx()) / (MINI_SPARKLINE_POINTS - 1).toFloat()
+        val slotWidth = (size.width - 4.dp.toPx()) / (MINI_SPARKLINE_POINTS - 1).toFloat()
 
         val startSlot = MINI_SPARKLINE_POINTS - tail.size
 
         val path = Path()
 
-        tail.forEachIndexed { index, percent ->
+        tail.forEachIndexed { index, point ->
 
-            val x = 2.dp.toPx() + (startSlot + index) * stepX
+            val x = 2.dp.toPx() + (startSlot + index) * slotWidth
 
-            val y = size.height - inset - usable * (percent.coerceIn(0f, 100f) / 100f)
+            val y = size.height - inset - usable * (point.percent.coerceIn(0f, 100f) / 100f)
 
             if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
@@ -612,7 +636,7 @@ private fun MiniSparkline(
  *
  * 版面从上到下：
  * 1) 一行：硬件名大字（CPU）在左，硬件名称（现在填占位 NAME）右对齐贴在本区右边缘；
- * 2) 图表标签行：左「60 秒以内的利用率%」，右「100%」——右上的 100% 对应图表最上面那条线；
+ * 2) 图表标签行：左「60 秒内的利用率 %」，右「100%」——右上的 100% 对应图表最上面那条线；
  * 3) 趋势图（weight(1f) 吃掉剩余高度，窗口拉高拉矮自己伸缩）；
  * 4) 图表下面再分三块：左统计块（利用率/速度、进程/线程/文件描述符、正常运行时间）、
  *    中明细列表（基准速度、插槽、内核、逻辑处理器、虚拟化、L1~L3）、右空白预留区。
@@ -632,6 +656,7 @@ private fun HardwareDetail(
     windowLabel: String,
     wide: Boolean,
     hostedInOverlay: Boolean,
+    usageDecimals: Int,
     onChartLongPress: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -649,7 +674,7 @@ private fun HardwareDetail(
     val nameText = if (isCpu) (snapshot.cpuName ?: TEST_HARDWARE_NAME) else kind.testName
 
     // 窗口文案：CPU 跟着实时更新速度走，其余硬件先把测试文案摆着
-    val chartLabel = if (isCpu) windowLabel else "$TEST_CHART_WINDOW_SECONDS 秒以内的利用率%"
+    val chartLabel = if (isCpu) windowLabel else "$TEST_CHART_WINDOW_SECONDS 秒内的利用率 %"
 
     Column(
         modifier = modifier
@@ -724,8 +749,8 @@ private fun HardwareDetail(
             modifier = Modifier.height(4.dp)
         )
 
-        // 3) 趋势图（同一份历史点画折线；点数不够时退回当前值水平线）
-        //    宽度决定它吃多少高度：宽屏 1 份、竖屏 4 份（留 1 份给底部空白）、浮窗吃满
+        // 3) 趋势图（固定点数铺满全宽，换更新速度不换图）
+        //    宽度决定它吃多少高度：宽屏 1 份、竖屏 3 份（留 1 份给底部空白）、浮窗吃满
         DetailChartPlaceholder(
             points = history,
 
@@ -756,7 +781,7 @@ private fun HardwareDetail(
                 // 统计块与明细块都按内容取宽：明细紧挨在统计块右边，
                 // 谁也不会把对方推远，剩下的宽度全部给末尾的空白预留区
                 CpuSummaryBlock(
-                    rows = if (isCpu) cpuSummaryRows(snapshot) else emptyCpuSummaryRows(),
+                    rows = if (isCpu) cpuSummaryRows(snapshot, usageDecimals) else emptyCpuSummaryRows(),
 
                     wide = true
                 )
@@ -785,7 +810,7 @@ private fun HardwareDetail(
                 DataPanel {
 
                     CpuSummaryBlock(
-                        rows = if (isCpu) cpuSummaryRows(snapshot) else emptyCpuSummaryRows(),
+                        rows = if (isCpu) cpuSummaryRows(snapshot, usageDecimals) else emptyCpuSummaryRows(),
 
                         wide = false
                     )
@@ -1069,12 +1094,16 @@ private fun HardwareCompactBar(
  * 画横向网格 + 按历史点连成的折线。网格不是刻度，**最上面那条线就是 100%**：
  * 所以它比其它网格线深一档、也粗一点，和图表上方标签行右端的「100%」是同一个位置。
  *
- * 横轴是**固定 60 个槽位**（见 PERFORMANCE_CHART_SLOTS）：新点从最右进来，老点从最左挤出去。
- * 采样间隔跟着实时更新速度变，但槽位数不变，所以三种速度下横轴的含义都正好是
- * 一个完整窗口（30 / 60 / 240 秒）。点数不足 60 个时曲线靠右生长，左边留空，
- * 不会出现"只有两个点却拉成一条横贯全宽的长线"那种假象。
+ * 横轴是**固定槽位**，做法照 Windows 任务管理器的那张 CPU 图：
+ *   共 [PERFORMANCE_CHART_POINTS] 个槽，第 59 个槽贴右边缘、第 0 个槽贴左边缘；
+ *   采到的点从右往左排，点数不满时左侧留空、曲线贴着右边生长。
+ * 这样刚进页面只有一两个点，就只画出右边一小段，不会一上来就拉一条横贯全宽的假线。
  *
- * 只有一帧时在最后一槽上点一个小圆点 —— 表示"现在"，而不是铺一条水平线冒充历史。
+ * 点数只看采样攒了多少，不看时间：满 [PERFORMANCE_CHART_POINTS] 个之后新点从右进、
+ * 老点从左挤出去，换更新速度既不清数据也不换槽位，图的宽度和点数永远不变。
+ * 相邻点之间一律连线，不做断点判断 —— 采样漏一轮也不会把线断开。
+ *
+ * 只有一个点时不铺线，贴着右边缘点一个小圆点；一点都没有时用当前帧的利用率占位。
  *
  * 长按这里会弹一个测试对话框（[PerformanceChartDialog]）。
  */
@@ -1135,46 +1164,41 @@ private fun DetailChartPlaceholder(
         fun yOf(percent: Float): Float =
             size.height - inset - usable * (percent.coerceIn(0f, 100f) / 100f)
 
-        // 横向是**固定槽位**，不是"有多少点就拉多宽"：
-        // 第 0 个槽在最左、第 59 个槽在最右，新点从右边进来，老点从左边挤出去。
-        // 点数不够 60 个时整段曲线靠右，左侧留空 —— 而不是把两三个点硬拉成一条横跨全宽的线。
-        val stepX = size.width / (PERFORMANCE_CHART_SLOTS - 1).toFloat()
-
-        val visible = if (points.size > PERFORMANCE_CHART_SLOTS) {
-            points.takeLast(PERFORMANCE_CHART_SLOTS)
+        // 一屏只画最后固定个数的点：服务端缓存比这个长，这里兜一层
+        val visible = if (points.size > PERFORMANCE_CHART_POINTS) {
+            points.takeLast(PERFORMANCE_CHART_POINTS)
         } else {
             points
         }
 
-        val startSlot = PERFORMANCE_CHART_SLOTS - visible.size
+        // 槽宽：59 段正好把宽度分完（0 号贴左、59 号贴右）
+        val slotWidth = size.width / (PERFORMANCE_CHART_POINTS - 1).toFloat()
 
         if (visible.size < 2) {
 
-            // 只有一帧（或一帧都没有）：在它该在的那个槽上画一个点，不铺线
-            val fraction = if (visible.isEmpty()) {
-                fallbackFraction
-            } else {
-                visible.last().percent / 100f
-            }
-
-            val x = (PERFORMANCE_CHART_SLOTS - 1) * stepX - 2.dp.toPx()
+            // 单点：贴着右边缘点一下；空数据：拿当前帧利用率占位，不铺一条假线
+            val fraction = if (visible.isEmpty()) fallbackFraction else visible.last().percent / 100f
 
             drawCircle(
                 color = lineColor,
 
                 radius = 2.dp.toPx(),
 
-                center = Offset(x, yOf(fraction.coerceIn(0f, 1f) * 100f))
+                center = Offset(size.width - 2.dp.toPx(), yOf(fraction.coerceIn(0f, 1f) * 100f))
             )
 
             return@Canvas
         }
 
+        // 点数不满时，最老的这一个点落在第 (总数 - 点数) 个槽上：
+        // 左边那些槽空着，曲线只占右边一段，随时间推移逐步向左长满。
+        val startSlot = PERFORMANCE_CHART_POINTS - visible.size
+
         val path = Path()
 
         visible.forEachIndexed { index, point ->
 
-            val x = (startSlot + index) * stepX
+            val x = (startSlot + index) * slotWidth
 
             val y = yOf(point.percent)
 

@@ -1804,29 +1804,16 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     }
 
     /**
-     * 按当前窗口裁剪历史点。
+     * 交给界面的历史点：**不按时间裁**，整段缓存直接给出去。
      *
-     * 已暂停（窗口 0）时**不裁**：暂停只是不再采新的，用户切回来仍该看到暂停前那段曲线；
-     * 裁成空的等于把数据藏起来，没有必要。
+     * 为什么不裁：一屏画多少个点由界面定死（以常规速度为准的那个点数），
+     * 三个更新档位共用同一份缓存。要是这里按当前档位的秒数裁，
+     * 从高档切到低档就会瞬间把大半历史点裁掉 —— 那正好就是"换了一张图、数据被清了"。
+     * 更新速度只决定新点多久进来一个，不决定能留多少。
+     *
+     * 只受缓存上限（CPU_HISTORY_MAX_POINTS）约束，超了从最老的开始丢。
      */
-    private fun trimmedCpuHistory(): List<CpuUsagePoint> {
-
-        val points = cpuUsageHistory.toList()
-
-        if (points.isEmpty()) return points
-
-        val windowMs = chartWindowSeconds(settingsSnapshot.updateSpeed) * 1000L
-
-        if (windowMs <= 0L) return points
-
-        val newest = points.last().timeMs
-
-        val cutoff = newest - windowMs
-
-        val start = points.indexOfFirst { it.timeMs >= cutoff }
-
-        return if (start <= 0) points else points.subList(start, points.size)
-    }
+    private fun trimmedCpuHistory(): List<CpuUsagePoint> = cpuUsageHistory.toList()
 
     /**
      * 把一帧推到界面。
@@ -1852,33 +1839,23 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         isUiRefreshAllowed() && effectiveActivePage() == PAGE_PERFORMANCE
 
     /**
-     * 实时更新速度 -> 图表窗口秒数。
-     *
-     *   高 30 秒 / 常规 60 秒 / 低 4 分钟（240 秒）/ 已暂停 0
-     *
-     * 未知文案按"常规"处理：配置被手改过时也不至于把窗口算成 0。
-     */
-    internal fun chartWindowSeconds(speed: String): Int = when (speed) {
-        "高" -> 30
-        "常规" -> 60
-        "低" -> 240
-        "已暂停" -> 0
-        else -> 60
-    }
-
-    /**
      * 实时更新速度 -> 图表标签行文案。
      *
-     * 暂停时整段换成"利用率 % (已暂停)"：这时候没有窗口可言，写成 0 秒以内的利用率
-     * 反而像"窗口是 0"，容易读错。
+     *   高 30 秒内的利用率 % / 常规 60 秒内的利用率 % / 低 4 分钟内的利用率 %
+     *
+     * 暂停时整段换成 利用率 % (已暂停)：这时候没有窗口可言，写成 0 秒的利用率反而像窗口是 0。
+     *
+     * 注意 60 秒这一档**不折成 1 分钟**：秒和分钟的写法是按人眼读起来最顺来的，
+     * 不是按数学换算来的，所以这里用固定的几个文案，而不是从秒数算。
+     *
+     * 这行字是**换档位时唯一变化的东西**：图本身（点数、宽度、布局）三个档位完全一样，
+     * 为什么写着 30 秒 / 60 秒 / 4 分钟，那是三种采样间隔 × 固定点数算出来的实际覆盖时长。
      */
-    internal fun performanceChartWindowLabel(speed: String): String {
-
-        val seconds = chartWindowSeconds(speed)
-
-        if (seconds <= 0) return "利用率 % (已暂停)"
-
-        return "$seconds 秒以内的利用率%"
+    internal fun performanceChartWindowLabel(speed: String): String = when (speed) {
+        "已暂停" -> "利用率 % (已暂停)"
+        "高" -> "30 秒内的利用率 %"
+        "低" -> "4 分钟内的利用率 %"
+        else -> "60 秒内的利用率 %"
     }
 
     override fun performanceSnapshot(): PerformanceSnapshot = performanceSnapshotState.value
@@ -2482,6 +2459,19 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         val linux = LinuxService.instanceOrNull() ?: return null
 
         return linux.capabilities(linuxRequestTimeoutMs)
+    }
+
+    /**
+     * 设备快照的原始包（调试页用）。
+     *
+     * 与 performanceSnapshot() 的分工：那个只回填 UI 要用的帧，这个把整包交出去，
+     * 好让调试页看清设备实例、字段与字段级状态分别是什么。
+     */
+    override fun linuxDeviceSnapshot(): LinuxPacket? {
+
+        val linux = LinuxService.instanceOrNull() ?: return null
+
+        return linux.deviceSnapshotPacket(linuxRequestTimeoutMs)
     }
 
     /**

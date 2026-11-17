@@ -2,7 +2,6 @@ package com.android.taskmanager.data
 
 import java.util.Locale
 
-import kotlin.math.roundToInt
 
 /**
  * 性能页的一帧数据（当前只有 CPU 页要的那一组）。
@@ -72,8 +71,14 @@ data class PerformanceSnapshot(
 
     // ---------- 显示文案 ----------
 
-    /** 利用率：整数百分比。 */
-    fun cpuUsageText(): String = cpuUsagePercent?.let { "${it.roundToInt()}%" } ?: "—"
+    /**
+     * 利用率文案。
+     *
+     * @param decimals 保留几位小数：0（默认，整数）/ 1 / 2，取值来自设置页的"利用率精确度"。
+     *        底层数据本身有 0.01% 的精度，这里只决定画几位；不传就是旧行为（整数百分比）。
+     */
+    fun cpuUsageText(decimals: Int = 0): String =
+        cpuUsagePercent?.let { String.format(Locale.US, "%.${decimals.coerceIn(0, 2)}f%%", it) } ?: "—"
 
     /** 当前频率：MHz 换成 GHz，两位小数。 */
     fun cpuSpeedText(): String = speedText(cpuSpeedMhz)
@@ -138,7 +143,9 @@ data class PerformanceSnapshot(
          * 只认"完整且成功"的包：半包或 UNSUPPORTED 一律返回 null，
          * 页面拿到 null 就保持上一帧，不会因为一次失败把数字清零。
          *
-         * 值以 `!` 开头（如 `!UNSUPPORTED`）表示这一格没有数值，解析成 null。
+         * 新协议（v3）按设备集合发送：CPU 那台设备带处理器字段，SYSTEM 那台带
+         * 进程 / 线程 / 句柄 / 开机时长。这里取各自设备里的字段；
+         * 老后端（平铺 I 行）没有 devices，就退回读 info，两种格式都能出数据。
          */
         fun from(packet: LinuxPacket?): PerformanceSnapshot? {
 
@@ -146,24 +153,43 @@ data class PerformanceSnapshot(
 
             if (packet.typeCode != LinuxRequestType.DEVICE_SNAPSHOT) return null
 
-            val info = packet.info
+            val cpuFields = packet.deviceOf(LinuxProtocol.DEVICE_TYPE_CPU)?.fields ?: packet.info
+
+            val systemFields = packet.deviceOf(LinuxProtocol.DEVICE_TYPE_SYSTEM)?.fields
+                ?: packet.info
 
             return PerformanceSnapshot(
-                cpuUsagePercent = info.floatOf("cpu_usage_percent"),
-                cpuSpeedMhz = info.intOf("cpu_speed_mhz"),
-                cpuBaseMhz = info.intOf("cpu_base_mhz"),
-                cpuName = info.textValueOf("cpu_name"),
-                virtualization = info.textValueOf("virtualization"),
-                processCount = info.intOf("process_count"),
-                threadCount = info.intOf("thread_count"),
-                fdCount = info.intOf("fd_count"),
-                uptimeSeconds = info.longOf("uptime_seconds"),
-                sockets = info.intOf("sockets"),
-                cores = info.intOf("cores"),
-                logicalCpus = info.intOf("logical_cpus"),
-                l1CacheKb = info.intOf("l1_cache_kb"),
-                l2CacheKb = info.intOf("l2_cache_kb"),
-                l3CacheKb = info.intOf("l3_cache_kb")
+                // 设备内字段用了短名（speed_mhz），旧格式是 cpu_speed_mhz，两种都认
+                cpuUsagePercent = cpuFields.floatOf("usage_percent")
+                    ?: cpuFields.floatOf("cpu_usage_percent"),
+
+                cpuSpeedMhz = cpuFields.intOf("speed_mhz") ?: cpuFields.intOf("cpu_speed_mhz"),
+
+                cpuBaseMhz = cpuFields.intOf("base_mhz") ?: cpuFields.intOf("cpu_base_mhz"),
+
+                cpuName = cpuFields.textValueOf("name") ?: cpuFields.textValueOf("cpu_name"),
+
+                virtualization = cpuFields.textValueOf("virtualization"),
+
+                processCount = systemFields.intOf("process_count"),
+
+                threadCount = systemFields.intOf("thread_count"),
+
+                fdCount = systemFields.intOf("fd_count"),
+
+                uptimeSeconds = systemFields.longOf("uptime_seconds"),
+
+                sockets = cpuFields.intOf("sockets"),
+
+                cores = cpuFields.intOf("cores"),
+
+                logicalCpus = cpuFields.intOf("logical_cpus"),
+
+                l1CacheKb = cpuFields.intOf("l1_cache_kb"),
+
+                l2CacheKb = cpuFields.intOf("l2_cache_kb"),
+
+                l3CacheKb = cpuFields.intOf("l3_cache_kb")
             )
         }
 

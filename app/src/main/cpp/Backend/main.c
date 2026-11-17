@@ -179,9 +179,10 @@
  * KILL 仍然只做身份校验（pid + start_ticks 都在最近一次快照里才 ACCEPTED），
  * 不真发信号：测试阶段误杀系统进程代价太大。
  *
- * 设备快照（typeCode=5）已实现 CPU 那一组（利用率 / 频率 / 进程线程句柄数 / 开机时长 /
- * 插槽内核逻辑处理器 / 三级缓存）；处理器商品名与虚拟化方案由 ELF 侧后续补，
- * 现在这两格回 UNSUPPORTED。
+ * 设备快照（typeCode=5）按设备集合发送：每个设备一行 D 头（id + type），
+ * 后面跟若干行 F 字段。当前实现 CPU（每个插槽一块：利用率 / 频率 / 拓扑 / 三级缓存）、
+ * MEMORY（总量与可用量）、DISK / NETWORK / GPU（位置与名字）、SYSTEM（进程线程句柄与开机时长）。
+ * 处理器商品名、虚拟化方案、外部缓存容量三个位置留在 query_*_external，现在回 UNSUPPORTED。
  */
 
 #include <ctype.h>
@@ -211,8 +212,13 @@
 // encoding，客户端据此核对两侧是不是同一版协议、同一套字段表。
 // ============================================================
 
-/** 协议版本。 */
-#define TM_PROTO_VERSION 2
+/**
+ * 协议版本。
+ *
+ * 3：typeCode=5 改为设备集合（D 行 + F 行）。旧版是平铺的 I 行，
+ *    客户端两种都能解析，但新版后端只发集合格式。
+ */
+#define TM_PROTO_VERSION 3
 
 /** 请求类型（LinuxRequestType）。 */
 #define TM_REQ_QUERY_PROCESS 1
@@ -221,10 +227,11 @@
 #define TM_REQ_PING 4
 
 /**
- * 设备快照：一次抓齐性能页要显示的整机数据（当前只做 CPU 页那一组）。
+ * 设备快照：一次抓齐整机各硬件的当前状态，按设备集合发送。
  *
- * 请求 `REQ <seq> 5 0x0`，无附加参数；应答里没有 P 行，全是 I 行，
- * 所以包头的 count = 随后的 I 行条数（不是 0）——客户端按 count 收满才算完整包。
+ * 请求 `REQ <seq> 5 0x0`，无附加参数；应答由 D 行（设备头）与 F 行（设备字段）组成，
+ * 所以包头的 count = 随后的 D 行与 F 行总条数（不是 0）——客户端按 count 收满才算完整包。
+ * 没有某类设备就不发它的 D 行，客户端据此知道这一类型没有实例。
  */
 #define TM_REQ_DEVICE_SNAPSHOT 5
 
@@ -252,6 +259,91 @@
 #define TM_FIELD_STATUS_READ_FAILED "READ_FAILED"
 #define TM_FIELD_STATUS_NO_BASELINE "NO_BASELINE"
 #define TM_FIELD_STATUS_TRUNCATED "TRUNCATED"
+
+/**
+ * 一次查询的结果状态（**整份 main.c 统一用这一套**）。
+ *
+ * 为什么单独立一个：sysfs 读不到、/proc 读不到、外部实现没做、这台机器根本没有，
+ * 是四种不同的情况。以前用 -1 / false 混着表达，界面上只能显示一个占位符，
+ * 排查时分不清是没权限还是没实现。现在每个字段只有两种输出：有值，或者这里的状态。
+ *
+ * 协议里的字段状态串见 query_status_text()：状态写成 F key=!状态。
+ */
+typedef enum {
+    /** 查到了，值在回填缓冲里有效 */
+    TM_QUERY_OK = 0,
+    /** 平台或本版后端不支持这项（例如没有 perf_event，或这个接口还没实现） */
+    TM_QUERY_UNSUPPORTED,
+    /** 去查了但失败：节点打不开、内容解析不出 */
+    TM_QUERY_READ_FAILED,
+    /** 有这项信息，但当前身份没有权限读（SELinux 或权限不足） */
+    TM_QUERY_ACCESS_DENIED,
+    /** 这台机器没有这项硬件信息（例如没有 L3 缓存） */
+    TM_QUERY_NOT_AVAILABLE,
+    /** 需要两轮采样的指标这一轮还没有基准（例如首帧利用率） */
+    TM_QUERY_NO_BASELINE,
+    /** 值超出缓冲长度，尾部被截断 */
+    TM_QUERY_TRUNCATED
+} TmQueryStatus;
+
+/** 状态转协议里的字段状态串；TM_QUERY_OK 没有状态串，返回 NULL。 */
+static const char *query_status_text(TmQueryStatus status)
+{
+    switch (status) {
+        case TM_QUERY_OK:
+            return NULL;
+
+        case TM_QUERY_UNSUPPORTED:
+            return TM_FIELD_STATUS_UNSUPPORTED;
+
+        case TM_QUERY_READ_FAILED:
+            return TM_FIELD_STATUS_READ_FAILED;
+
+        case TM_QUERY_ACCESS_DENIED:
+            return TM_FIELD_STATUS_ACCESS_DENIED;
+
+        case TM_QUERY_NOT_AVAILABLE:
+            return TM_FIELD_STATUS_NOT_AVAILABLE;
+
+        case TM_QUERY_NO_BASELINE:
+            return TM_FIELD_STATUS_NO_BASELINE;
+
+        case TM_QUERY_TRUNCATED:
+            return TM_FIELD_STATUS_TRUNCATED;
+    }
+
+    return TM_FIELD_STATUS_NOT_AVAILABLE;
+}
+
+/** 状态串转回枚举：老调用点按状态串传参，内部统一成枚举再落地。 */
+static TmQueryStatus query_status_of(const char *status)
+{
+    if (status == NULL) {
+        return TM_QUERY_UNSUPPORTED;
+    }
+
+    if (strcmp(status, TM_FIELD_STATUS_UNSUPPORTED) == 0) {
+        return TM_QUERY_UNSUPPORTED;
+    }
+
+    if (strcmp(status, TM_FIELD_STATUS_ACCESS_DENIED) == 0) {
+        return TM_QUERY_ACCESS_DENIED;
+    }
+
+    if (strcmp(status, TM_FIELD_STATUS_NOT_AVAILABLE) == 0) {
+        return TM_QUERY_NOT_AVAILABLE;
+    }
+
+    if (strcmp(status, TM_FIELD_STATUS_NO_BASELINE) == 0) {
+        return TM_QUERY_NO_BASELINE;
+    }
+
+    if (strcmp(status, TM_FIELD_STATUS_TRUNCATED) == 0) {
+        return TM_QUERY_TRUNCATED;
+    }
+
+    return TM_QUERY_READ_FAILED;
+}
 
 /**
  * 字段掩码：一位一个统计项，位表见头部注释第五节。
@@ -1611,7 +1703,8 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
             return NULL;
         }
 
-        snprintf(buffer, capacity, "%.1f", cur->cpu_usage_percent);
+        // 两位小数：0.01% 的精度，客户端按设置页的"利用率精确度"决定显示几位
+        snprintf(buffer, capacity, "%.2f", cur->cpu_usage_percent);
 
         return text_result(out_status, buffer);
     }
@@ -2163,32 +2256,38 @@ static long long monotonic_ms(void)
     return (long long) now.tv_sec * 1000LL + (long long) now.tv_nsec / 1000000LL;
 }
 
+/** 逻辑 CPU 号上限：/proc/stat 与 sysfs 都按 cpuN 编号，256 足够。 */
+#define TM_STAT_CPU_MAX 256
+
+/** 一台芯片最多记多少个逻辑核：8~16 核常见，留 64 够用。 */
+#define TM_OUT_LOGICAL_MAX 64
+
+/** 一次 /proc/stat 采样里一行的时间账。 */
+typedef struct {
+    long long total;
+    long long idle;
+} TmCpuTimes;
+
+/** /proc/stat 的一整轮快照：summary 是 cpu 汇总行，cpu[] 按逻辑 CPU 号存放。 */
+typedef struct {
+    TmCpuTimes summary;
+    TmCpuTimes cpu[TM_STAT_CPU_MAX];
+    bool seen[TM_STAT_CPU_MAX];
+    int max_logical;              /* 见到的最大逻辑 CPU 号 + 1 */
+} TmCpuStatTable;
+
 /**
- * 读 /proc/stat 的 cpu 汇总行，得到总 jiffies 与空闲 jiffies（idle + iowait）。
+ * 解析一行 cpu 后面的 8 列时间。
  *
- * @return false = 读不到，或格式不认识
+ * 第 4 列 idle、第 5 列 iowait 都算空闲；其余列（user nice system irq softirq steal）
+ * 都算在干活。guest 那两列是 user 的子集，不能重复加。
+ *
+ * @return false = 一行里一个数字都没读到
  */
-static bool read_cpu_stat_pair(long long *total_out, long long *idle_out)
+static bool parse_cpu_times(const char *cursor, TmCpuTimes *out)
 {
-    FILE *file = fopen("/proc/stat", "r");
-
-    if (file == NULL) {
-        return false;
-    }
-
-    char line[512];
-
-    bool read_ok = fgets(line, (int) sizeof(line), file) != NULL;
-
-    fclose(file);
-
-    if (!read_ok || strncmp(line, "cpu", 3) != 0) {
-        return false;
-    }
-
     long long total = 0;
     long long idle = 0;
-    const char *cursor = line + 3;
 
     for (int slot = 0; slot < 8; slot++) {
 
@@ -2209,7 +2308,6 @@ static bool read_cpu_stat_pair(long long *total_out, long long *idle_out)
 
         total += value;
 
-        // 第 4 个是 idle、第 5 个是 iowait：两个都算没在干活
         if (slot == 3 || slot == 4) {
             idle += value;
         }
@@ -2221,66 +2319,98 @@ static bool read_cpu_stat_pair(long long *total_out, long long *idle_out)
         return false;
     }
 
-    *total_out = total;
-    *idle_out = idle;
+    out->total = total;
+    out->idle = idle;
 
     return true;
 }
 
 /**
- * 整机 CPU 利用率（%）。
+ * 读一整轮 /proc/stat。
  *
- * 单看某一瞬间的累计值算不出百分比，必须两轮相减。采样点做缓存：
- * 距上次采样已经够了就只用差值，不够才睡一小会儿补足 —— 刷新间隔本来就有 0.5~4 秒，
- * 正常节奏下一次都不用睡。
+ * 为什么要把 cpuN 行也收下来：性能页以后要按芯片画每个逻辑核的利用率，
+ * 只读汇总行拿不到。一次读全表，差分时再分别对账。
  *
- * @return -1 = 还没有对比点（第一次调用），或 /proc/stat 读不到
+ * @return false = 文件打不开，或一行都没解析出来
  */
-static double read_cpu_usage_percent(void)
+static bool read_cpu_stat_table(TmCpuStatTable *out)
 {
-    static long long prev_total = -1;
-    static long long prev_idle = -1;
-    static long long prev_ms = 0;
+    memset(out, 0, sizeof(*out));
 
-    long long total_now = 0;
-    long long idle_now = 0;
+    FILE *file = fopen("/proc/stat", "r");
 
-    if (!read_cpu_stat_pair(&total_now, &idle_now)) {
+    if (file == NULL) {
+        return false;
+    }
+
+    char line[512];
+    bool any = false;
+
+    while (fgets(line, (int) sizeof(line), file) != NULL) {
+
+        if (strncmp(line, "cpu", 3) != 0) {
+            continue;
+        }
+
+        TmCpuTimes times;
+
+        // 第 4 个字符是空格 = 汇总行（cpu  123 ...）；否则是 cpuN
+        if (line[3] == ' ') {
+
+            if (parse_cpu_times(line + 3, &times)) {
+
+                out->summary = times;
+                any = true;
+            }
+
+            continue;
+        }
+
+        char *end = NULL;
+        long logical = strtol(line + 3, &end, 10);
+
+        if (end == line + 3 || logical < 0 || logical >= TM_STAT_CPU_MAX) {
+            continue;
+        }
+
+        if (!parse_cpu_times(end, &times)) {
+            continue;
+        }
+
+        out->cpu[logical] = times;
+        out->seen[logical] = true;
+
+        if ((int) logical + 1 > out->max_logical) {
+            out->max_logical = (int) logical + 1;
+        }
+
+        any = true;
+    }
+
+    fclose(file);
+
+    return any;
+}
+
+/**
+ * 两个采样点之间算利用率（%）。
+ * @return -1 = 增量不成立（计数器回退、这一核不在两轮里）
+ */
+static double cpu_percent_between(const TmCpuTimes *later, const TmCpuTimes *before)
+{
+    if (later->total <= before->total) {
         return -1.0;
     }
 
-    // 第一次调用只记基准：这时候睡 200ms 也算不出百分比，纯属白等
-    if (prev_total < 0) {
-
-        prev_total = total_now;
-        prev_idle = idle_now;
-        prev_ms = monotonic_ms();
-
-        return -1.0;
-    }
-
-    long long elapsed = monotonic_ms() - prev_ms;
-
-    if (elapsed < TM_DEVICE_CPU_SAMPLE_MS) {
-        usleep((useconds_t) ((TM_DEVICE_CPU_SAMPLE_MS - elapsed) * 1000));
-    }
-
-    long long total_later = 0;
-    long long idle_later = 0;
-
-    if (!read_cpu_stat_pair(&total_later, &idle_later)) {
-        return -1.0;
-    }
-
-    if (total_later <= prev_total) {
-        return -1.0;
-    }
-
-    long long delta_total = total_later - prev_total;
-    long long delta_idle = idle_later - prev_idle;
+    long long delta_total = later->total - before->total;
+    long long delta_idle = later->idle - before->idle;
 
     if (delta_idle < 0) {
         delta_idle = 0;
+    }
+
+    if (delta_idle > delta_total) {
+        delta_idle = delta_total;
     }
 
     double percent = (double) (delta_total - delta_idle) * 100.0 / (double) delta_total;
@@ -2293,11 +2423,91 @@ static double read_cpu_usage_percent(void)
         percent = 100.0;
     }
 
-    prev_total = total_later;
-    prev_idle = idle_later;
+    return percent;
+}
+
+/** 一帧的 CPU 利用率：整机一份，每个逻辑核各一份（后者给以后按芯片画核心用）。 */
+typedef struct {
+    double total_percent;                        /* -1 = 这一轮还没有基准 */
+    double logical_percent[TM_OUT_LOGICAL_MAX];  /* 按逻辑 CPU 号索引，-1 = 没值 */
+    int logical_max;                             /* 见到的最大逻辑 CPU 号 + 1 */
+} TmCpuUsage;
+
+/**
+ * 采一帧 CPU 利用率：整机与每个逻辑核**共用同一对采样点**，不重复睡。
+ *
+ * 采样点缓存：距上次采样不够 TM_DEVICE_CPU_SAMPLE_MS 才补睡一会儿。
+ * 刷新间隔本来就有 0.5~4 秒，正常节奏下一次都不用睡。
+ *
+ * @return false = 第一次调用（只记了基准，没有对比点），或 /proc/stat 读不到
+ */
+static bool read_cpu_usage(TmCpuUsage *out)
+{
+    static TmCpuStatTable prev;
+    static bool has_prev = false;
+    static long long prev_ms = 0;
+
+    memset(out, 0, sizeof(*out));
+
+    out->total_percent = -1.0;
+    out->logical_max = 0;
+
+    for (int i = 0; i < TM_OUT_LOGICAL_MAX; i++) {
+        out->logical_percent[i] = -1.0;
+    }
+
+    TmCpuStatTable now;
+
+    if (!read_cpu_stat_table(&now)) {
+        return false;
+    }
+
+    if (!has_prev) {
+
+        prev = now;
+        has_prev = true;
+        prev_ms = monotonic_ms();
+
+        return false;
+    }
+
+    long long elapsed = monotonic_ms() - prev_ms;
+
+    if (elapsed < TM_DEVICE_CPU_SAMPLE_MS) {
+        usleep((useconds_t) ((TM_DEVICE_CPU_SAMPLE_MS - elapsed) * 1000));
+    }
+
+    TmCpuStatTable later;
+
+    if (!read_cpu_stat_table(&later)) {
+        return false;
+    }
+
+    out->total_percent = cpu_percent_between(&later.summary, &prev.summary);
+
+    int limit = later.max_logical;
+
+    if (limit > TM_OUT_LOGICAL_MAX) {
+        limit = TM_OUT_LOGICAL_MAX;
+    }
+
+    out->logical_max = limit;
+
+    for (int logical = 0; logical < limit; logical++) {
+
+        // 两轮里都要有这一核：热插拔刚起来的核这一帧先不算
+        if (!later.seen[logical] || !prev.seen[logical]) {
+            continue;
+        }
+
+        out->logical_percent[logical] = cpu_percent_between(&later.cpu[logical],
+                                                            &prev.cpu[logical]);
+    }
+
+    prev = later;
     prev_ms = monotonic_ms();
 
-    return percent;
+    return true;
 }
 
 /** 读一个只放数字的文件（kHz / 秒 / 个数）。false = 打不开，或开头不是数字。 */
@@ -2526,53 +2736,66 @@ static int parse_size_kb(const char *text)
 }
 
 /**
- * CPU 缓存的数据来源接口（**由 ELF 这一侧实现，本文件不再自己取**）。
+ * 【外部实现接口】查某一级缓存的容量。返回值只表示状态，容量从 out_kb 带回。
  *
- * 为什么留成接口：sysfs 的 /sys/devices/system/cpu/cpu0/cache/ 在部分 OEM 内核上
- * 被裁掉或被 SELinux 拦，读出来是空的；真机上唯一可靠的来源往往只有厂商属性、
- * SoC 型号映射表或别的私有节点，这些只有这一侧能拿到。
+ * 入参（调用方保证）：
+ *   cpu_id      设备序号，和协议里 D 行 id=cpuN 的 N 完全一致，从 0 开始。
+ *               一颗芯片（一个插槽）一个序号；单芯片手机永远是 0；双路设备是 0 和 1。
+ *   device_path 该实例的采集位置，形如 /sys/devices/system/cpu/cpu0
+ *               （拓扑读不到时退化成 cpu0 的目录）。串归调用方所有，只读，别保存指针。
+ *   level       1 / 2 / 3，分别对应 L1 / L2 / L3，不会传 0 或负数。
  *
- * 约定（三条，照着填就行）：
- * 1. level 取 1 / 2 / 3，分别对应 L1 / L2 / L3；
- * 2. 返回该级缓存的总量，**单位 KB**（L1 若分指令与数据两条，返回两者之和）；
- * 3. 返回 -1 表示"这台设备确实没有这一级"（例如没有 L3），客户端会显示 不支持。
+ * 出参（你来填）：
+ *   out_kb      该级缓存的总量，单位 KB。L1 若分数据与指令两条，请返回两者之和
+ *               （页面上的 L1 缓存是总量口径）。只有返回 TM_QUERY_OK 时这个值才被读取。
  *
- * 优先级：本函数返回 >= 0 的级，采集侧**不再去碰 sysfs**，以你的值为准；
- * 只有你返回 -1 的级，才会退回去尝试 sysfs（ways × sets × line_size 推算）。
- * 所以这里填了值就一定生效，不会被 sysfs 的探测结果覆盖。
+ * 返回状态（取值含义见 TmQueryStatus）：
+ *   TM_QUERY_OK              查到了，用 out_kb；
+ *   TM_QUERY_NOT_AVAILABLE   这台机器确实没有这一级（例如没有 L3），页面显示不支持；
+ *   TM_QUERY_UNSUPPORTED     这一版没实现，或平台不提供这项信息；
+ *   TM_QUERY_READ_FAILED     去查了但失败（节点打不开、解析不出）；
+ *   TM_QUERY_ACCESS_DENIED   有这项信息但当前身份没权限。
  *
- * 参数说明：level 从 1 开始，不会是 0 或负数；调用频率与性能页采样一致（最快 0.5 秒一次），
- * 如果来源是一次性读取（属性/映射表），建议在函数内部做一次静态缓存，别每次重复查。
+ * 调用方约定：先扫这台实例的 cache/index* 算出自己的一份，再调本函数；
+ * 本函数返回 OK 才覆盖自己的值，不是 OK 就保留自己的值；
+ * 两边都没有，就把本函数的状态发出去（客户端显示占位，不是 0）。
+ *
+ * 调用频率：与性能页采样一致（最快 0.5 秒一次，每级各调一次）。
+ * 如果来源是一次性读取（属性、映射表），建议在函数内部做静态缓存，别每帧重查。
  */
-static int query_cache_kb_external(int level)
+static TmQueryStatus query_cache_kb_external(int cpu_id, const char *device_path, int level,
+                                             int *out_kb)
 {
+    (void) cpu_id;
+    (void) device_path;
     (void) level;
+    (void) out_kb;
 
-    // TODO(ELF 侧)：按 level 返回 L1 / L2 / L3 的 KB，没有这一级返回 -1
-    return -1;
+    // TODO(ELF 侧)：查到了返回 TM_QUERY_OK 并把 KB 写进 *out_kb；没有这一级返回 TM_QUERY_NOT_AVAILABLE
+    return TM_QUERY_UNSUPPORTED;
 }
 
 /**
- * 一次扫描 cpu0 的 cache/index*，把 L1 / L2 / L3 各自求和（KB）。
+ * 扫一台处理器实例的 cache/index*，把 L1 / L2 / L3 各自求和（KB）。
  *
- * 为什么一次扫完再分账：三级各扫一遍就是最多 48 次 open，
- * 每帧都做一遍没必要；一次遍历 16 个 index 就够。
+ * 为什么一次扫完再分账：三级各扫一遍就是最多 48 次 open，每帧都做一遍没必要，
+ * 一次遍历 16 个 index 就够。
  *
  * 三个细节：
- * 1. **index 编号按"读不到就跳过"处理，不 break**：绝大多数内核是 0..N 连续，
- *    但个别内核的编号有空洞，break 会把后面的级一起丢掉。
- * 2. size 读不到时用 ways × sets × line_size 推算 —— 这三个字段比 size 更常在，
- *    也更容易被 SELinux 放行。
- * 3. 同一级有多条（L1 分数据/指令）就相加：页面上的 "L1 缓存" 是总量。
+ * 1. index 编号读不到就跳过，不 break：多数内核是 0..N 连续，个别内核有空洞，
+ *    break 会把后面的级一起丢掉；
+ * 2. size 读不到时用 ways × sets × line_size 推算，这三个字段比 size 更常在，
+ *    也更容易被 SELinux 放行；
+ * 3. 同一级有多条（L1 分数据与指令）就相加，页面上的 L1 缓存是总量。
  *
- * @param out_kb 长度 3 的数组，分别接 L1 / L2 / L3；-1 = 这一级不存在
+ * @param cpu_dir 该实例的 sysfs 目录，例如 /sys/devices/system/cpu/cpu0
+ * @param out_kb  长度 3，分别接 L1 / L2 / L3；-1 = 这一级没扫到
  */
-static void probe_cpu_cache_kb(int out_kb[3])
+static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3])
 {
-    // 先问外部实现：它给了值的级就直接采用，不再碰 sysfs
-    for (int level = 1; level <= 3; level++) {
-        out_kb[level - 1] = query_cache_kb_external(level);
-    }
+    out_kb[0] = -1;
+    out_kb[1] = -1;
+    out_kb[2] = -1;
 
     int total[3] = { 0, 0, 0 };
 
@@ -2583,7 +2806,7 @@ static void probe_cpu_cache_kb(int out_kb[3])
         char path[TM_PATH_MAX];
         double level_value = 0.0;
 
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/level", index);
+        snprintf(path, sizeof(path), "%s/cache/index%d/level", cpu_dir, index);
 
         if (!read_first_number(path, &level_value)) {
             continue;
@@ -2595,16 +2818,11 @@ static void probe_cpu_cache_kb(int out_kb[3])
             continue;
         }
 
-        // 外部已经给了这一级：跳过，别让 sysfs 的值盖掉它
-        if (out_kb[level - 1] >= 0) {
-            continue;
-        }
-
         int size_kb = -1;
 
         char size_text[64];
 
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/size", index);
+        snprintf(path, sizeof(path), "%s/cache/index%d/size", cpu_dir, index);
 
         if (read_text_file(path, size_text, (int) sizeof(size_text)) >= 0) {
 
@@ -2613,25 +2831,21 @@ static void probe_cpu_cache_kb(int out_kb[3])
             size_kb = parse_size_kb(size_text);
         }
 
-        // size 没有（或读到 0）就按 ways × sets × line 推
         if (size_kb <= 0) {
 
             double ways = 0.0;
             double sets = 0.0;
             double line = 0.0;
 
-            snprintf(path, sizeof(path),
-                     "/sys/devices/system/cpu/cpu0/cache/index%d/ways_of_associativity", index);
+            snprintf(path, sizeof(path), "%s/cache/index%d/ways_of_associativity", cpu_dir, index);
 
             bool has_ways = read_first_number(path, &ways);
 
-            snprintf(path, sizeof(path),
-                     "/sys/devices/system/cpu/cpu0/cache/index%d/number_of_sets", index);
+            snprintf(path, sizeof(path), "%s/cache/index%d/number_of_sets", cpu_dir, index);
 
             bool has_sets = read_first_number(path, &sets);
 
-            snprintf(path, sizeof(path),
-                     "/sys/devices/system/cpu/cpu0/cache/index%d/coherency_line_size", index);
+            snprintf(path, sizeof(path), "%s/cache/index%d/coherency_line_size", cpu_dir, index);
 
             bool has_line = read_first_number(path, &line);
 
@@ -2650,11 +2864,6 @@ static void probe_cpu_cache_kb(int out_kb[3])
     }
 
     for (int level = 1; level <= 3; level++) {
-
-        // 外部值优先；外部没给才用 sysfs 的结果；都没有就 -1（页面显示 不支持）
-        if (out_kb[level - 1] >= 0) {
-            continue;
-        }
 
         out_kb[level - 1] = found[level - 1] ? total[level - 1] : -1;
     }
@@ -2772,143 +2981,1398 @@ static long long read_uptime_seconds(void)
     return (long long) value;
 }
 
-/** 发一条文本字段：I key=值（值百分号编码，和进程行同一套规则）。 */
-static void emit_device_text(const char *key, const char *value)
+// ============================================================
+// 设备集合模型（typeCode=5）
+//
+// 旧结构把 CPU / 内存 / 磁盘当成整机唯一的一份平铺字段发送，一台机器两块磁盘、
+// 双路处理器就没法表达。现在改成设备集合：每个设备一行头，后面跟着它的字段：
+//
+//   D id=cpu0 type=CPU
+//   F cpu_id=0
+//   F usage_percent=12.34
+//   F speed_mhz=1804
+//
+// 约定：
+// 1. 包头 count = 之后 D 行与 F 行的总条数，客户端按行数收满才算完整包；
+// 2. 设备 id 是稳定标识，同类型多个实例靠它区分（cpu0 cpu1 / memory0 / disk0 /
+//    network0 / gpu0），序号从 0 开始，一次快照内不变；
+// 3. 没有某类设备就不发它的 D 行，客户端看到某类型一条 D 行都没有，
+//    就知道这台机器没有该类型的实例（比发 present=false 省一半流量）；
+// 4. 字段没有数值时输出 F key=!状态，状态取值与进程行同一套；
+// 5. 字段值按百分号编码，与进程行同一套规则。
+//
+// 采集口径沿用原来那一套：利用率按 /proc/stat 两轮差值算，频率读 cpu0 的 cpufreq，
+// 缓存扫每台实例自己的 cache/index*，进程线程句柄数扫 /proc。
+//
+// 字段取值的统一约定（整份文件都遵守，不再有第二种表达方式）：
+// 1. 每个字段只有两种形态：有值，或者 F key=!状态；
+// 2. 状态取值见 TmQueryStatus：UNSUPPORTED / READ_FAILED / ACCESS_DENIED /
+//    NOT_AVAILABLE / NO_BASELINE / TRUNCATED，都是"没有值"，不是 0，也不是空串；
+// 3. 处理器商品名 / 虚拟化方案 / 缓存容量三个接口先自己探测一份，再调外部实现，
+//    外部返回 TM_QUERY_OK 才覆盖，不是 OK 就用自己的；两边都没有才发状态。// 处理器商品名 / 虚拟化方案 / 缓存容量三个位置留给外部实现，见下面的 query_*_external。
+// ============================================================
+
+/** 设备类型（字符串直接进协议，客户端按同一批常量匹配）。 */
+#define TM_DEV_TYPE_CPU "CPU"
+#define TM_DEV_TYPE_MEMORY "MEMORY"
+#define TM_DEV_TYPE_DISK "DISK"
+#define TM_DEV_TYPE_NETWORK "NETWORK"
+#define TM_DEV_TYPE_GPU "GPU"
+#define TM_DEV_TYPE_SYSTEM "SYSTEM"
+
+/**
+ * 一次快照的设备上限与各类限流。
+ *
+ * 为什么是 64：Android 的 /sys/class/net 能列出十几个到二十几个接口（rmnet_ 一大家子），
+ * 块设备也有若干。上限只给 32 时，磁盘与网卡会把名额吃光，排在最后的 SYSTEM 设备
+ * 就整块发不出去，客户端拿不到进程 / 线程 / 句柄 —— 表面症状就是这三项显示占位符。
+ * 现在上限抬到 64，磁盘 / 网卡 / GPU 各自限流，SYSTEM 又提前填，三重保证它一定在包里。
+ */
+#define TM_OUT_DEVICE_MAX 64
+#define TM_OUT_FIELD_MAX 20
+#define TM_OUT_ID_MAX 32
+#define TM_OUT_KEY_MAX 40
+#define TM_OUT_VALUE_MAX 128
+
+/** 磁盘 / 网卡 / GPU 各自最多发多少台：再多对页面没有意义，还会挤掉别的设备。 */
+#define TM_OUT_DISK_MAX 16
+#define TM_OUT_NETWORK_MAX 16
+#define TM_OUT_GPU_MAX 4
+
+/** 内存实例上限：/proc/meminfo 只有全局一份，留几个位置给以后的多个内存控制器。 */
+#define TM_OUT_MEMORY_MAX 4
+
+/** 设备枚举的分类：只用于找位置，不是协议里的类型字符串。 */
+typedef enum {
+    TM_DEV_KIND_CPU = 0,
+    TM_DEV_KIND_MEMORY,
+    TM_DEV_KIND_DISK,
+    TM_DEV_KIND_NETWORK,
+    TM_DEV_KIND_GPU,
+    TM_DEV_KIND_COUNT
+} TmDeviceKind;
+
+ /**
+  * 一台设备的位置。
+  *
+  * id   : 发给客户端的设备标识（cpu0 / disk1 ...），一次快照内稳定；
+  * path : 采集时读的位置（sysfs 目录或 procfs 文件）；
+  * name : 内核里的名字（块名 / 网卡名）；CPU 与内存留空。
+  */
+typedef struct {
+    char id[TM_OUT_ID_MAX];
+    char path[TM_PATH_MAX];
+    char name[64];
+} TmDeviceRef;
+
+/**
+ * 一台 CPU 设备实例 = 一颗芯片（一个插槽）。
+ *
+ * 不按核心拆、也不按逻辑处理器拆：任务管理器页面上的一台 CPU 就是一颗芯片，
+ * 核心与逻辑处理器是它内部的数据（logical_ids），不是独立设备。
+ *
+ * id          协议里的设备标识，cpu0 / cpu1
+ * device_id   同类型实例序号，与 id 尾巴上的数字一致；采集函数靠它定位
+ * package_id  sysfs 的 physical_package_id（读不到时按 0 处理）
+ * path        该芯片第一个 cpuN 的 sysfs 目录，缓存 / 频率都从它往下拼
+ * logical_ids 这颗芯片包含的逻辑 CPU 号，例如 0,1,2,3
+ */
+typedef struct {
+    char id[TM_OUT_ID_MAX];
+    int device_id;
+    int package_id;
+    char path[TM_PATH_MAX];
+    int logical_ids[TM_OUT_LOGICAL_MAX];
+    int logical_count;
+} TmCpuDevice;
+
+/** 内存 / 磁盘 / 网卡 / GPU 共用的实例结构：这一版只存位置与名字。 */
+typedef TmDeviceRef TmPlainDevice;
+
+/**
+ * 一次请求用的设备实例表：先枚举，再采集，采集期间不再重枚举。
+ *
+ * 为什么要这张表：采集函数要能明确"报的是哪一台"。光有一个 cpu_id 数字还不够，
+ * 每个函数还得自己再猜一遍它对应哪颗芯片；先把实例枚举成数组，采集函数直接拿
+ * 数组元素，里面已经存好 path / package_id / 逻辑核列表，不用重复定位。
+ *
+ * 这一版只有 CPU 与 SYSTEM 进包；其余四类只建表，等字段补齐再发。
+ */
+typedef struct {
+    TmCpuDevice cpu[TM_OUT_DEVICE_MAX];
+    int cpu_count;
+
+    TmPlainDevice memory[TM_OUT_MEMORY_MAX];
+    int memory_count;
+
+    TmPlainDevice disk[TM_OUT_DISK_MAX];
+    int disk_count;
+
+    TmPlainDevice network[TM_OUT_NETWORK_MAX];
+    int network_count;
+
+    TmPlainDevice gpu[TM_OUT_GPU_MAX];
+    int gpu_count;
+
+    unsigned int generation;      /* 拓扑版本：实例集合变了才 +1 */
+} TmDeviceRegistry;
+
+/** 一条待发出的字段：值已经格式化好，以感叹号开头表示状态而不是数值。 */
+typedef struct {
+    char key[TM_OUT_KEY_MAX];
+    char value[TM_OUT_VALUE_MAX];
+} TmOutField;
+
+/** 一个待发出的设备：一行 D 头 + 若干 F 行。 */
+typedef struct {
+    char id[TM_OUT_ID_MAX];
+    const char *type;
+    int field_count;
+    TmOutField fields[TM_OUT_FIELD_MAX];
+} TmOutDevice;
+
+/** 开一个设备：清掉旧字段，记下 id 与类型。 */
+static void device_begin(TmOutDevice *device, const char *id, const char *type)
 {
-    printf("I %s=", key);
+    memset(device, 0, sizeof(*device));
 
-    print_escaped_value(value);
+    snprintf(device->id, sizeof(device->id), "%s", id);
 
-    printf("\n");
-}
-
-/** 发一条整数字段；没有值就发 I key=!状态。 */
-static void emit_device_int(const char *key, long long value, const char *status)
-{
-    if (value < 0) {
-
-        printf("I %s=!%s\n", key, status);
-
-        return;
-    }
-
-    printf("I %s=%lld\n", key, value);
-}
-
-/** 发一条浮点字段（固定小数位）；没有值就发 I key=!状态。 */
-static void emit_device_float(const char *key, bool has_value, double value, int digits,
-                              const char *status)
-{
-    if (!has_value) {
-
-        printf("I %s=!%s\n", key, status);
-
-        return;
-    }
-
-    char text[64];
-
-    snprintf(text, sizeof(text), "%.*f", digits, value);
-
-    emit_device_text(key, text);
+    device->type = type;
+    device->field_count = 0;
 }
 
 /**
- * 处理 typeCode=5：抓一次设备快照（当前只有性能页 CPU 页要的那一组）。
- *
- * 顺序：先全部采齐 -> 数清 I 行条数 -> 发包头 -> 逐行发。
- * 条数必须先定：客户端就是按 count 判断包收满没有。
+ * 一次查询的结果：要么有值，要么是一个状态。
+ * text 只在 status == TM_QUERY_OK 时有意义。
  */
-static bool handle_device_snapshot(unsigned long long seq, int type)
-{
-    // 整机利用率（%）
-    double usage_percent = read_cpu_usage_percent();
+typedef struct {
+    TmQueryStatus status;
+    char text[TM_OUT_VALUE_MAX];
+} TmQueryValue;
 
-    // 频率：kHz -> MHz（客户端再换算成 GHz 显示）
+/** 造一个只有状态的结果（这一项没有值）。 */
+static TmQueryValue query_value_none(TmQueryStatus status)
+{
+    TmQueryValue value;
+
+    memset(&value, 0, sizeof(value));
+
+    value.status = status;
+
+    return value;
+}
+
+/** 造一个有文本值的结果；文本为空按 UNSUPPORTED 处理，不发空字段。 */
+static TmQueryValue query_value_text(TmQueryStatus status, const char *text)
+{
+    if (status != TM_QUERY_OK || text == NULL || text[0] == '\0') {
+        return query_value_none(status == TM_QUERY_OK ? TM_QUERY_UNSUPPORTED : status);
+    }
+
+    TmQueryValue value;
+
+    memset(&value, 0, sizeof(value));
+
+    value.status = TM_QUERY_OK;
+
+    snprintf(value.text, sizeof(value.text), "%s", text);
+
+    return value;
+}
+
+/** 造一个整数值的结果：负数按没有值处理（采集函数统一用 -1 表示读不到）。 */
+static TmQueryValue query_value_int(long long value, TmQueryStatus missing)
+{
+    if (value < 0) {
+        return query_value_none(missing);
+    }
+
+    TmQueryValue result;
+
+    memset(&result, 0, sizeof(result));
+
+    result.status = TM_QUERY_OK;
+
+    snprintf(result.text, sizeof(result.text), "%lld", value);
+
+    return result;
+}
+
+/** 造一个浮点值的结果：固定小数位，负数按没有值处理。 */
+static TmQueryValue query_value_float(bool has_value, double value, int digits,
+                                     TmQueryStatus missing)
+{
+    if (!has_value) {
+        return query_value_none(missing);
+    }
+
+    TmQueryValue result;
+
+    memset(&result, 0, sizeof(result));
+
+    result.status = TM_QUERY_OK;
+
+    snprintf(result.text, sizeof(result.text), "%.*f", digits, value);
+
+    return result;
+}
+
+/**
+ * 所有字段落地的唯一出口：状态在这里转成感叹号标记，有值才写数值。
+ *
+ * 为什么收成一个出口：字段有十几种来源（sysfs、/proc、外部实现、算法差值），
+ * 只要每个来源都能说清自己是 TM_QUERY_OK 还是某种失败，输出就永远只有两种形态。
+ * 超过字段上限直接丢，宁可少一格也不越界。
+ */
+static void device_put_value(TmOutDevice *device, const char *key, TmQueryValue value)
+{
+    if (device->field_count >= TM_OUT_FIELD_MAX) {
+        return;
+    }
+
+    TmOutField *field = &device->fields[device->field_count++];
+
+    snprintf(field->key, sizeof(field->key), "%s", key);
+
+    if (value.status != TM_QUERY_OK) {
+
+        const char *status = query_status_text(value.status);
+
+        snprintf(field->value, sizeof(field->value), "!%s",
+                 status != NULL ? status : TM_FIELD_STATUS_NOT_AVAILABLE);
+
+        return;
+    }
+
+    snprintf(field->value, sizeof(field->value), "%s", value.text);
+}
+
+/** 追加一条有值的文本字段。 */
+static void device_put(TmOutDevice *device, const char *key, const char *value)
+{
+    device_put_value(device, key, query_value_text(TM_QUERY_OK, value));
+}
+
+/** 整数字段：负数按没有值处理（采集函数统一用 -1 表示读不到）。 */
+static void device_put_int(TmOutDevice *device, const char *key, long long value,
+                           const char *status)
+{
+    device_put_value(device, key, query_value_int(value, query_status_of(status)));
+}
+
+// ============================================================
+// 位置枚举：先把每类设备"在哪"找出来，采集才有地方可读
+//
+// 每类一个函数，返回条数（0 = 这台机器没有这一类，或 sysfs 不允许读）。
+// 同一个函数只负责填 id / path / name，不读任何数据。
+// ============================================================
+
+/** 从路径里取最后一段名字：/sys/block/sda -> sda。 */
+static void name_from_path(const char *path, char *out, int capacity)
+{
+    const char *slash = strrchr(path, '/');
+    const char *name = (slash != NULL) ? (slash + 1) : path;
+
+    snprintf(out, (size_t) capacity, "%s", name);
+}
+
+/**
+ * 设备名兜底：这一版只有名称字段，抓不到具体名字时统一写 NAME。
+ *
+ * 为什么不用空串：空串在协议里是"这个字段有值，但值是空的"，客户端会显示成
+ * 一片空白，分不清是没名字还是解析丢了；写 NAME 能明确看出"这个名字没拿到"。
+ */
+static void ensure_device_name(char *name, int capacity)
+{
+    if (name[0] == '\0') {
+        snprintf(name, (size_t) capacity, "%s", "NAME");
+    }
+}
+
+/**
+ * 这几类接口是内核或厂商造的虚拟网卡，不是硬件，枚举实例时跳过。
+ *
+ * 为什么要过滤：Android 上 /sys/class/net 里 rmnet_data0 / rmnet_ipa0 这类
+ * 接口有十几个，不过滤会把 16 个实例名额占满，真实网卡反而枚举不到。
+ */
+static bool is_virtual_network_name(const char *name)
+{
+    static const char *const prefixes[] = {
+        "rmnet", "r_rmnet", "rev_rmnet", "dummy", "ifb", "veth", "sit",
+        "ip6", "tunl", "gre", "erspan", "p2p", "hwsim", "radio", "clat", "v4-"
+    };
+
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+
+        size_t length = strlen(prefixes[i]);
+
+        if (strncmp(name, prefixes[i], length) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/** 块设备里这几类是伪设备（回环 / 内存盘 / 加密映射 / 光驱），不当作真实磁盘。 */
+static bool is_pseudo_block_name(const char *name)
+{
+    static const char *const prefixes[] = { "loop", "ram", "zram", "dm-", "sr" };
+
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+
+        size_t length = strlen(prefixes[i]);
+
+        if (strncmp(name, prefixes[i], length) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+ /**
+  * 枚举处理器实例：一个 physical_package_id 算一颗芯片（插槽）。
+  *
+  * 为什么不是按 cpuN 枚举：sysfs 里的 cpuN 是逻辑处理器，几十个核会变成几十个设备，
+  * 而客户端要的是"这颗芯片的利用率 / 频率 / 拓扑 / 缓存"。同一颗芯片里的多个核
+  * 只记进 cpu_ids 成员列表，不拆成多个设备。
+  *
+  * @param cpu_ids_out 可选；第 i 个设备的成员逻辑核号列表，形如 0,1,2,3
+  * @return 设备条数；拓扑完全读不到时整台机器按一颗芯片处理
+  */
+ /**
+  * 枚举 CPU 设备：一颗芯片一台，同芯片的逻辑核收进 logical_ids。
+  *
+  * 为什么按 physical_package_id 去重：Android 手机的 8 个核同属一颗芯片，
+  * 按核心拆会变成 8 台 CPU 设备，还会把整机利用率重复报 8 次。去重以后
+  * 一台设备就是用户理解的一颗处理器；双路设备才有第 2 台。
+  *
+  * 拓扑读不到时退化：整机当一颗芯片，位置用 cpu0 的目录。
+  *
+  * @param out      实例数组，由本函数填 id / device_id / package_id / path / logical_ids
+  * @param capacity 数组长度
+  * @return 实例条数（0 = 这台机器一个核都没有）
+  */
+static int enumerate_cpu_devices(TmCpuDevice *out, int capacity)
+{
+    if (out == NULL || capacity <= 0) {
+        return 0;
+    }
+
+    memset(out, 0, sizeof(TmCpuDevice) * (size_t) capacity);
+
+    int logical = count_logical_cpus();
+
+    int package_ids[TM_OUT_DEVICE_MAX];
+    int package_count = 0;
+
+    if (logical > 0) {
+
+        for (int cpu = 0; cpu < logical && cpu < TM_STAT_CPU_MAX; cpu++) {
+
+            char path[TM_PATH_MAX];
+            double package = 0.0;
+
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+
+            if (!read_first_number(path, &package)) {
+                continue;
+            }
+
+            int package_id = (int) package;
+            int slot = -1;
+
+            for (int i = 0; i < package_count; i++) {
+
+                if (package_ids[i] == package_id) {
+                    slot = i;
+                    break;
+                }
+            }
+
+            if (slot < 0) {
+
+                if (package_count >= capacity) {
+                    break;
+                }
+
+                slot = package_count;
+
+                package_ids[slot] = package_id;
+                out[slot].package_id = package_id;
+
+                package_count++;
+            }
+
+            if (out[slot].logical_count < TM_OUT_LOGICAL_MAX) {
+                out[slot].logical_ids[out[slot].logical_count++] = cpu;
+            }
+
+            // 位置记这颗芯片第一个出现的 cpuN 目录
+            if (out[slot].path[0] == '\0') {
+
+                snprintf(out[slot].path, sizeof(out[slot].path),
+                         "/sys/devices/system/cpu/cpu%d", cpu);
+            }
+        }
+    }
+
+    // 拓扑读不到：整机当一颗芯片，位置退到 cpu0
+    if (package_count == 0) {
+
+        package_count = 1;
+
+        out[0].package_id = 0;
+    }
+
+    for (int i = 0; i < package_count; i++) {
+
+        out[i].device_id = i;
+
+        snprintf(out[i].id, sizeof(out[i].id), "cpu%d", i);
+
+        if (out[i].path[0] == '\0') {
+
+            snprintf(out[i].path, sizeof(out[i].path), "/sys/devices/system/cpu/cpu0");
+        }
+    }
+
+    return package_count;
+}
+
+/**
+ * 枚举内存设备：/proc/meminfo 是全局一份，所以固定一台。
+ *
+ * 名字这一版给 NAME：/proc/meminfo 只有容量与用量，没有型号或厂商字段，
+ * 硬编造一个商品名反而误导；等以后有更准的来源再补。
+ */
+static int enumerate_memory_devices(TmDeviceRef *out, int capacity)
+{
+    if (out == NULL || capacity <= 0) {
+        return 0;
+    }
+
+    memset(out, 0, sizeof(TmDeviceRef) * (size_t) capacity);
+
+    snprintf(out[0].id, sizeof(out[0].id), "memory0");
+    snprintf(out[0].path, sizeof(out[0].path), "/proc/meminfo");
+
+    out[0].name[0] = '\0';
+
+    ensure_device_name(out[0].name, (int) sizeof(out[0].name));
+
+    return 1;
+}
+
+/** 枚举块设备：扫 /sys/block，跳过伪设备；name 是块名（sda / sdf ...）。 */
+static int enumerate_disk_devices(TmDeviceRef *out, int capacity)
+{
+    DIR *dir = opendir("/sys/block");
+
+    if (dir == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        if (is_pseudo_block_name(entry->d_name)) {
+            continue;
+        }
+
+        if (count >= capacity) {
+            break;
+        }
+
+        snprintf(out[count].id, sizeof(out[count].id), "disk%d", count);
+
+        snprintf(out[count].path, sizeof(out[count].path),
+                 "/sys/block/%s", entry->d_name);
+
+        snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
+
+        ensure_device_name(out[count].name, (int) sizeof(out[count].name));
+
+        count++;
+    }
+
+    closedir(dir);
+
+    return count;
+}
+
+/** 枚举网卡：扫 /sys/class/net，回环与虚拟接口都不是硬件，跳过。 */
+static int enumerate_network_devices(TmDeviceRef *out, int capacity)
+{
+    DIR *dir = opendir("/sys/class/net");
+
+    if (dir == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        if (strcmp(entry->d_name, "lo") == 0) {
+            continue;
+        }
+
+        if (is_virtual_network_name(entry->d_name)) {
+            continue;
+        }
+
+        if (count >= capacity) {
+            break;
+        }
+
+        snprintf(out[count].id, sizeof(out[count].id), "network%d", count);
+
+        snprintf(out[count].path, sizeof(out[count].path),
+                 "/sys/class/net/%s", entry->d_name);
+
+        snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
+
+        ensure_device_name(out[count].name, (int) sizeof(out[count].name));
+
+        count++;
+    }
+
+    closedir(dir);
+
+    return count;
+}
+
+/** 枚举图形设备：按几个常见厂商的 sysfs 位置探测，找到哪个用哪个。 */
+static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
+{
+    static const char *const candidates[] = {
+        "/sys/class/kgsl/kgsl-3d0",   // 高通 Adreno
+        "/sys/class/misc/mali0",      // ARM Mali
+        "/sys/class/drm/card0",       // 通用 DRM 显卡节点
+    };
+
+    int count = 0;
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+
+        struct stat info;
+
+        if (stat(candidates[i], &info) != 0) {
+            continue;
+        }
+
+        if (count >= capacity) {
+            break;
+        }
+
+        snprintf(out[count].id, sizeof(out[count].id), "gpu%d", count);
+
+        snprintf(out[count].path, sizeof(out[count].path), "%s", candidates[i]);
+
+        name_from_path(candidates[i], out[count].name, (int) sizeof(out[count].name));
+
+        ensure_device_name(out[count].name, (int) sizeof(out[count].name));
+
+        count++;
+    }
+
+    return count;
+}
+
+ /**
+  * 按类型枚举设备位置：这是采集前唯一的入口。
+  *
+  * @param kind     设备分类
+  * @param out      位置数组（由调用方提供，容量由 capacity 指定）
+  * @param capacity 最多写多少条
+  * @return 条数；0 = 这台机器没有这一类设备（或读不到 sysfs）
+  */
+/**
+ * 枚举全部设备实例，填进这张表。
+ *
+ * 一次请求只调一次：决定一次采集周期里 DeviceId 与硬件的对应关系，
+ * 采集过程中不允许重枚举，否则第 0 台 CPU 可能中途变成另一颗芯片。
+ *
+ * 非 CPU 的几类这一版只报名称：总量、读写、流量、利用率这些统计字段还没定义，
+ * 等定了再从这张表里取值、在 build_named_devices 里补字段。
+ *
+ * @param registry 输出实例表（调用方一般给 static，避免占栈）
+ */
+static void registry_refresh(TmDeviceRegistry *registry)
+{
+    memset(registry, 0, sizeof(*registry));
+
+    registry->cpu_count = enumerate_cpu_devices(registry->cpu, TM_OUT_DEVICE_MAX);
+    registry->memory_count = enumerate_memory_devices(registry->memory, TM_OUT_MEMORY_MAX);
+    registry->disk_count = enumerate_disk_devices(registry->disk, TM_OUT_DISK_MAX);
+    registry->network_count = enumerate_network_devices(registry->network, TM_OUT_NETWORK_MAX);
+    registry->gpu_count = enumerate_gpu_devices(registry->gpu, TM_OUT_GPU_MAX);
+
+    // 拓扑版本：实例集合（芯片数、每颗芯片的逻辑核）变了才 +1，热插拔后客户端能察觉
+    static unsigned int generation = 0;
+    static unsigned int signature = 0;
+
+    unsigned int now_signature = 0;
+
+    now_signature = (unsigned int) registry->cpu_count * 131u
+                    + (unsigned int) registry->memory_count;
+
+    now_signature += (unsigned int) registry->disk_count * 17u
+                     + (unsigned int) registry->network_count * 7u
+                     + (unsigned int) registry->gpu_count * 3u;
+
+    for (int i = 0; i < registry->cpu_count; i++) {
+
+        now_signature = now_signature * 31u + (unsigned int) registry->cpu[i].package_id;
+        now_signature = now_signature * 31u + (unsigned int) registry->cpu[i].logical_count;
+    }
+
+    if (now_signature != signature) {
+
+        signature = now_signature;
+        generation++;
+    }
+
+    registry->generation = generation;
+}
+
+// ============================================================
+// 留给外部实现的三个位置
+//
+// 三个函数都返回 TmQueryStatus：TM_QUERY_OK 才代表"我有准确值"，
+// 其它状态表示没有，客户端显示占位，不会当成 0 或空串。
+// 要补实现时直接改函数体，不要改返回值的含义。
+// ============================================================
+// ============================================================
+// 留给外部实现的三个位置
+//
+// 现在都返回 false / -1，客户端把对应字段显示成占位内容，不会当成 0 或空串。
+// 要补实现时直接改函数体（不要改返回值语义）：返回 true 就是"我有准确值"。
+// ============================================================
+
+/**
+ * 【外部实现接口】处理器商品名。返回值只表示状态，名字从 out 带回。
+ *
+ * 入参（调用方保证）：
+ *   cpu_id      设备序号，和协议里 D 行 id=cpuN 的 N 完全一致，从 0 开始。
+ *               一颗芯片（一个插槽）一个序号；单芯片手机永远是 0；双路设备是 0 和 1。
+ *               协议里的 cpu_id 字段就是这个值，两边不会对不上。
+ *   device_path 该实例的采集位置，形如 /sys/devices/system/cpu/cpu0
+ *               （拓扑读不到时退化成 cpu0 的目录）。多芯片时它是这颗芯片第一个
+ *               cpuN 目录，可以拿它继续拼子路径，例如 cpu0/cpufreq、cpu0/topology。
+ *               串归调用方所有，只读，别改也别保存指针。
+ *
+ * 出参（你来填）：
+ *   out         写 UTF-8 名字的缓冲，要人看得懂的名字（骁龙 8 Gen 3 / Exynos 2400），
+ *               不要内核内部型号。
+ *   capacity    out 的字节数（含结尾 0）。写满就算截断，调用方按 TM_QUERY_OK 用。
+ *
+ * 返回状态（取值含义见 TmQueryStatus）：
+ *   TM_QUERY_OK              查到了，用 out 里的名字；
+ *   TM_QUERY_UNSUPPORTED     这一版没实现，或平台不提供这项信息；
+ *   TM_QUERY_READ_FAILED     去查了但失败（节点打不开、内容解析不出）；
+ *   TM_QUERY_ACCESS_DENIED   有这项信息但当前身份没权限；
+ *   TM_QUERY_NOT_AVAILABLE   这台机器没有这项信息。
+ *
+ * 调用方约定：先自己从 /proc/cpuinfo 探一份（Hardware / model name），再调本函数；
+ * 本函数返回 OK 才覆盖自己的值，不是 OK 就保留自己的值；
+ * 两边都没有才把本函数的状态发出去（客户端显示占位，不是空串）。
+ */
+static TmQueryStatus query_cpu_name_external(int cpu_id, const char *device_path,
+                                             char *out, int capacity)
+{
+    (void) cpu_id;
+    (void) device_path;
+    (void) out;
+    (void) capacity;
+
+    // TODO(ELF 侧)：查到了返回 TM_QUERY_OK 并把名字写进 out；否则返回对应状态
+    return TM_QUERY_UNSUPPORTED;
+}
+
+/**
+ * 【外部实现接口】虚拟化方案。返回值只表示状态，字符串从 out 带回。
+ *
+ * 入参（调用方保证）：
+ *   cpu_id      同上，设备序号（D 行 id=cpuN 的 N）。
+ *   device_path 同上，该实例的 sysfs 位置。
+ *   cpu_name    刚刚查到的处理器商品名，可能为空串（名字查不到时）。
+ *               需要按平台区分虚拟化方案时用它，例如同名 SoC 的衍生型号。
+ *               只读，别改，也别保存指针。
+ *
+ * 出参格式（由你拼好整串，调用方不做任何加工，直接当字段值发出去）：
+ *   第一段是基础状态，只能是这三个词之一：已启用 / 已禁用 / 不支持；
+ *   第二段是扩展状态，紧跟在基础状态后面、用半角括号括起，可以为空；
+ *   扩展状态为空时连括号都不要写，界面据此不显示括号。
+ *   例子：
+ *     已启用(AMD-V)
+ *     已启用(KVM)
+ *     已禁用(硬件支持，内核未启用)
+ *     不支持
+ *
+ * 返回状态含义与 query_cpu_name_external 完全一致，同一个 TmQueryStatus。
+ *
+ * 调用方约定：先自己看 /dev/kvm 与 cpuinfo 的 flags 探一份，再调本函数；
+ * 本函数返回 OK 才覆盖，不是 OK 就保留自己的；两边都没有才把状态发出去。
+ */
+static TmQueryStatus query_virtualization_external(int cpu_id, const char *device_path,
+                                                   const char *cpu_name,
+                                                   char *out, int capacity)
+{
+    (void) cpu_id;
+    (void) device_path;
+    (void) cpu_name;
+    (void) out;
+    (void) capacity;
+
+    // TODO(ELF 侧)：查到了返回 TM_QUERY_OK 并按上面的格式写 out；否则返回对应状态
+    return TM_QUERY_UNSUPPORTED;
+}
+
+// ============================================================
+// 采集：按设备填字段
+// ============================================================
+
+/**
+ * 取一行里冒号之后的部分，去掉首尾空白。
+ * @return false = 这一行没有冒号，或冒号后面是空的
+ */
+static bool value_after_colon(const char *line, char *out, int capacity)
+{
+    const char *colon = strchr(line, ':');
+
+    if (colon == NULL) {
+        return false;
+    }
+
+    const char *start = colon + 1;
+
+    while (*start == ' ' || *start == '\t') {
+        start++;
+    }
+
+    snprintf(out, (size_t) capacity, "%s", start);
+
+    int length = (int) strlen(out);
+
+    while (length > 0) {
+
+        char tail = out[length - 1];
+
+        if (tail == '\n' || tail == '\r' || tail == ' ' || tail == '\t') {
+
+            out[length - 1] = '\0';
+            length--;
+
+            continue;
+        }
+
+        break;
+    }
+
+    return length > 0;
+}
+
+/**
+ * 在 /proc/cpuinfo 的一行里按空白分隔找 token，用于判断 flags 里有没有 vmx / svm / virt。
+ * 必须卡边界：直接 strstr 会把 virtualization 里的 virt 也算成扩展支持。
+ */
+static bool flags_has_token(const char *line, const char *token)
+{
+    size_t length = strlen(token);
+
+    const char *cursor = line;
+
+    while ((cursor = strstr(cursor, token)) != NULL) {
+
+        bool left_ok = (cursor == line) || (cursor[-1] == ' ' || cursor[-1] == '\t');
+
+        char next = cursor[length];
+
+        bool right_ok = (next == '\0' || next == ' ' || next == '\t'
+                         || next == '\n' || next == '\r');
+
+        if (left_ok && right_ok) {
+            return true;
+        }
+
+        cursor += length;
+    }
+
+    return false;
+}
+
+/**
+ * 内部探测：从 /proc/cpuinfo 取处理器商品名（ARM 用 Hardware，x86 用 model name）。
+ *
+ * 只读一次并缓存：这个名字开机期间不会变，每帧读 /proc/cpuinfo 没必要。
+ * 读不到就返回 UNSUPPORTED，让外部实现去补；不要编造。
+ */
+static TmQueryValue probe_cpu_name_internal(void)
+{
+    static bool probed = false;
+    static TmQueryValue cached;
+
+    if (probed) {
+        return cached;
+    }
+
+    probed = true;
+
+    cached = query_value_none(TM_QUERY_UNSUPPORTED);
+
+    FILE *file = fopen("/proc/cpuinfo", "r");
+
+    if (file == NULL) {
+
+        cached = query_value_none(TM_QUERY_READ_FAILED);
+
+        return cached;
+    }
+
+    char hardware[TM_OUT_VALUE_MAX];
+    char model[TM_OUT_VALUE_MAX];
+
+    hardware[0] = '\0';
+    model[0] = '\0';
+
+    char line[256];
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+
+        char value[TM_OUT_VALUE_MAX];
+
+        if (hardware[0] == '\0' && strncmp(line, "Hardware", 8) == 0
+            && value_after_colon(line, value, (int) sizeof(value))) {
+
+            snprintf(hardware, sizeof(hardware), "%s", value);
+
+            continue;
+        }
+
+        if (model[0] == '\0' && strncmp(line, "model name", 10) == 0
+            && value_after_colon(line, value, (int) sizeof(value))) {
+
+            snprintf(model, sizeof(model), "%s", value);
+        }
+    }
+
+    fclose(file);
+
+    // ARM 的 Hardware 是 SoC 名，比 model name 更贴近处理器商品名
+    if (hardware[0] != '\0') {
+
+        cached = query_value_text(TM_QUERY_OK, hardware);
+
+    } else if (model[0] != '\0') {
+
+        cached = query_value_text(TM_QUERY_OK, model);
+    }
+
+    return cached;
+}
+
+/**
+ * 内部探测：虚拟化方案。
+ *
+ * 判断顺序：
+ * 1. /dev/kvm 存在 = 内核已经启用 KVM，报 已启用(KVM)；
+ * 2. cpuinfo 的 flags 里有 vmx / svm / virt = 硬件支持，但没看到 /dev/kvm，
+ *    报 已禁用(硬件支持，内核未启用)；
+ * 3. 都探不到就返回 UNSUPPORTED，交给外部实现判断 —— 不要武断说 不支持。
+ */
+static TmQueryValue probe_virtualization_internal(void)
+{
+    static bool probed = false;
+    static TmQueryValue cached;
+
+    if (probed) {
+        return cached;
+    }
+
+    probed = true;
+
+    cached = query_value_none(TM_QUERY_UNSUPPORTED);
+
+    if (access("/dev/kvm", F_OK) == 0) {
+
+        cached = query_value_text(TM_QUERY_OK, "已启用(KVM)");
+
+        return cached;
+    }
+
+    FILE *file = fopen("/proc/cpuinfo", "r");
+
+    if (file == NULL) {
+        return cached;
+    }
+
+    char line[256];
+
+    bool hardware_support = false;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+
+        if (strncmp(line, "flags", 5) != 0 && strncmp(line, "Features", 8) != 0) {
+            continue;
+        }
+
+        if (flags_has_token(line, "vmx") || flags_has_token(line, "svm")
+            || flags_has_token(line, "virt")) {
+
+            hardware_support = true;
+
+            break;
+        }
+    }
+
+    fclose(file);
+
+    if (hardware_support) {
+
+        cached = query_value_text(TM_QUERY_OK, "已禁用(硬件支持，内核未启用)");
+    }
+
+    return cached;
+}
+
+/**
+ * 把每颗芯片的逻辑核拼成协议里的 cpu_ids（逗号分隔）。
+ *
+ * @return false = 这颗芯片一个逻辑核都没记下来
+ */
+static bool format_logical_ids(const TmCpuDevice *device, char *out, int capacity)
+{
+    out[0] = '\0';
+
+    size_t used = 0;
+
+    for (int i = 0; i < device->logical_count; i++) {
+
+        char item[16];
+
+        if (i == 0) {
+            snprintf(item, sizeof(item), "%d", device->logical_ids[i]);
+        } else {
+            snprintf(item, sizeof(item), ",%d", device->logical_ids[i]);
+        }
+
+        size_t length = strlen(item);
+
+        if (used + length + 1 >= (size_t) capacity) {
+            return used > 0;
+        }
+
+        memcpy(out + used, item, length + 1);
+
+        used += length;
+    }
+
+    return used > 0;
+}
+
+/**
+ * 把每颗芯片的逐核利用率拼成协议里的 logical_usage（逗号分隔，两位小数）。
+ *
+ * 顺序与 cpu_ids 严格一一对应：这个列表的第 n 个数就是 cpu_ids 第 n 个核的利用率。
+ * 某一核这一帧没有值（刚热插拔、计数器回退）写 -1.00，占住位置不让后面错位。
+ *
+ * @return TM_QUERY_OK = 有值；NOT_AVAILABLE = 一个都没算出来；TRUNCATED = 太长装不下
+ */
+static TmQueryValue format_logical_usage(const TmCpuDevice *device, const TmCpuUsage *usage)
+{
+    char text[TM_OUT_VALUE_MAX];
+
+    text[0] = '\0';
+
+    size_t used = 0;
+    bool any = false;
+
+    for (int i = 0; i < device->logical_count; i++) {
+
+        int logical = device->logical_ids[i];
+
+        double percent = -1.0;
+
+        if (logical >= 0 && logical < usage->logical_max
+            && logical < TM_OUT_LOGICAL_MAX) {
+
+            percent = usage->logical_percent[logical];
+        }
+
+        char item[32];
+
+        if (i == 0) {
+            snprintf(item, sizeof(item), "%.2f", percent);
+        } else {
+            snprintf(item, sizeof(item), ",%.2f", percent);
+        }
+
+        size_t length = strlen(item);
+
+        if (used + length + 1 >= sizeof(text)) {
+            return query_value_none(TM_QUERY_TRUNCATED);
+        }
+
+        memcpy(text + used, item, length + 1);
+
+        used += length;
+
+        if (percent >= 0.0) {
+            any = true;
+        }
+    }
+
+    if (!any) {
+        return query_value_none(TM_QUERY_NOT_AVAILABLE);
+    }
+
+    return query_value_text(TM_QUERY_OK, text);
+}
+
+ /**
+  * 填 CPU 设备：按实例表逐台填，每台用自己存的 path 与逻辑核列表。
+  *
+  * 利用率与频率是整机口径（/proc/stat 汇总行与 cpu0 的 cpufreq），
+  * 多颗芯片时每颗设备共用同一份整机值 —— 汇总行没有按插槽拆的数据，
+  * 这里不假装能算出单颗芯片的利用率；单核利用率下面单独给。
+  *
+  * 名字 / 虚拟化 / 缓存三项按设备逐个查：先自己探测（sysfs、/proc/cpuinfo），
+  * 再调外部实现；外部返回 TM_QUERY_OK 才覆盖自己的值，不是 OK 就保留自己的，
+  * 两边都没有才把状态发出去。
+  *
+  * @param registry 已枚举好的实例表
+  * @param usage    这一帧的利用率（整机 + 每逻辑核）
+  * @return 填了几台设备
+  */
+static int build_cpu_devices(TmOutDevice *out, int capacity,
+                             const TmDeviceRegistry *registry, const TmCpuUsage *usage)
+{
+    if (out == NULL || registry == NULL || capacity <= 0 || registry->cpu_count <= 0) {
+        return 0;
+    }
+
+    int count = registry->cpu_count;
+
+    if (count > capacity) {
+        count = capacity;
+    }
+
     double cur_khz = 0.0;
+
     bool has_cur_khz = read_cpu_cur_freq_khz(&cur_khz);
 
     double max_khz = 0.0;
+
     bool has_max_khz = read_cpu_max_freq_khz(&max_khz);
-
-    int process_count = count_all_processes();
-    int thread_count = count_all_threads();
-    int fd_count = read_open_fd_count();
-
-    long long uptime_seconds = read_uptime_seconds();
-
-    int logical_cpus = count_logical_cpus();
 
     int sockets = -1;
     int cores = -1;
+
     count_sockets_and_cores(&sockets, &cores);
 
-    // 三级缓存：一次扫描 cpu0 的 cache/index*，L1 / L2 / L3 各自求和；
-    // 扫不到时 query_cache_kb_external 兜底（那个函数留给 ELF 这一侧补实现）
-    int cache_kb[3] = { -1, -1, -1 };
+    int logical_cpus = count_logical_cpus();
 
-    probe_cpu_cache_kb(cache_kb);
+    for (int i = 0; i < count; i++) {
 
-    int l1_kb = cache_kb[0];
-    int l2_kb = cache_kb[1];
-    int l3_kb = cache_kb[2];
+        const TmCpuDevice *device = &registry->cpu[i];
 
-    // ---- 下面两格留给 ELF 这一侧补实现 ----
-    //
-    // cpu_name：处理器商品名，要人看得懂（例如 骁龙 8 Gen 3），不要内核里的内部型号。
-    // virtualization：虚拟化方案，取值形如 已启用(方案名) / 已禁用 / 不支持。
-    //
-    // 现在固定回 UNSUPPORTED：客户端把这两格显示成占位内容，不会当成 0 或空串。
-    // 补实现时只在这两个变量里填字符串，下面的发包代码一行都不用改。
-    const char *cpu_name = NULL;
+        device_begin(&out[i], device->id, TM_DEV_TYPE_CPU);
 
-    const char *virtualization = NULL;
+        // 同类型设备序号：与 id 里的数字一致，客户端不用再拆字符串
+        char index_text[32];
 
-    // 固定 15 行：没值的项也发一行 !状态，条数好数、客户端好对
-    const int count = 15;
+        snprintf(index_text, sizeof(index_text), "%d", device->device_id);
 
-    reply_package_header(seq, type, 0ULL, TM_STATUS_OK, count);
+        device_put(&out[i], "cpu_id", index_text);
 
-    emit_device_float("cpu_usage_percent", usage_percent >= 0.0, usage_percent, 1,
-                      TM_FIELD_STATUS_NO_BASELINE);
+        // 两位小数：显示几位由客户端设置决定，协议不截断到整数
+        device_put_value(&out[i], "usage_percent",
+                         query_value_float(usage->total_percent >= 0.0,
+                                           usage->total_percent, 2,
+                                           TM_QUERY_NO_BASELINE));
 
-    emit_device_int("cpu_speed_mhz", has_cur_khz ? (long long) (cur_khz / 1000.0 + 0.5) : -1,
-                    TM_FIELD_STATUS_NOT_AVAILABLE);
+        device_put_int(&out[i], "speed_mhz",
+                       has_cur_khz ? (long long) (cur_khz / 1000.0 + 0.5) : -1,
+                       TM_FIELD_STATUS_NOT_AVAILABLE);
 
-    emit_device_int("cpu_base_mhz", has_max_khz ? (long long) (max_khz / 1000.0 + 0.5) : -1,
-                    TM_FIELD_STATUS_NOT_AVAILABLE);
+        device_put_int(&out[i], "base_mhz",
+                       has_max_khz ? (long long) (max_khz / 1000.0 + 0.5) : -1,
+                       TM_FIELD_STATUS_NOT_AVAILABLE);
 
-    if (cpu_name != NULL && cpu_name[0] != '\0') {
-        emit_device_text("cpu_name", cpu_name);
-    } else {
-        printf("I cpu_name=!%s\n", TM_FIELD_STATUS_UNSUPPORTED);
+        // 名字：先自己从 /proc/cpuinfo 探一份，外部返回 OK 再覆盖
+        TmQueryValue name_value = probe_cpu_name_internal();
+
+        char external_text[TM_OUT_VALUE_MAX];
+
+        external_text[0] = '\0';
+
+        TmQueryStatus name_status = query_cpu_name_external(device->device_id, device->path,
+                                                           external_text,
+                                                           (int) sizeof(external_text));
+
+        if (name_status == TM_QUERY_OK && external_text[0] != '\0') {
+
+            name_value = query_value_text(TM_QUERY_OK, external_text);
+
+        } else if (name_value.status != TM_QUERY_OK) {
+
+            name_value = query_value_none(name_status);
+        }
+
+        device_put_value(&out[i], "name", name_value);
+
+        // 虚拟化：把刚查到的名字一起传过去，外部实现可能要按平台区分方案
+        TmQueryValue virtualization_value = probe_virtualization_internal();
+
+        char external_virtualization[TM_OUT_VALUE_MAX];
+
+        external_virtualization[0] = '\0';
+
+        TmQueryStatus virtualization_status = query_virtualization_external(
+            device->device_id, device->path,
+            name_value.status == TM_QUERY_OK ? name_value.text : "",
+            external_virtualization, (int) sizeof(external_virtualization));
+
+        if (virtualization_status == TM_QUERY_OK && external_virtualization[0] != '\0') {
+
+            virtualization_value = query_value_text(TM_QUERY_OK, external_virtualization);
+
+        } else if (virtualization_value.status != TM_QUERY_OK) {
+
+            virtualization_value = query_value_none(virtualization_status);
+        }
+
+        device_put_value(&out[i], "virtualization", virtualization_value);
+
+        device_put_int(&out[i], "sockets", sockets, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+        device_put_int(&out[i], "cores", cores, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+        device_put_int(&out[i], "logical_cpus", logical_cpus, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+        // 缓存：先扫这台实例自己的 cache/index*，再问外部；外部 OK 才覆盖
+        int cache_kb[3] = { -1, -1, -1 };
+
+        TmQueryStatus cache_status[3] = {
+            TM_QUERY_NOT_AVAILABLE, TM_QUERY_NOT_AVAILABLE, TM_QUERY_NOT_AVAILABLE
+        };
+
+        probe_cpu_cache_from_sysfs(device->path, cache_kb);
+
+        for (int level = 1; level <= 3; level++) {
+
+            int external_kb = -1;
+
+            TmQueryStatus status = query_cache_kb_external(device->device_id, device->path,
+                                                           level, &external_kb);
+
+            if (status == TM_QUERY_OK && external_kb > 0) {
+
+                cache_kb[level - 1] = external_kb;
+                cache_status[level - 1] = TM_QUERY_OK;
+
+                continue;
+            }
+
+            cache_status[level - 1] = cache_kb[level - 1] >= 0 ? TM_QUERY_OK : status;
+        }
+
+        device_put_value(&out[i], "l1_cache_kb",
+                         query_value_int(cache_kb[0], cache_status[0]));
+
+        device_put_value(&out[i], "l2_cache_kb",
+                         query_value_int(cache_kb[1], cache_status[1]));
+
+        device_put_value(&out[i], "l3_cache_kb",
+                         query_value_int(cache_kb[2], cache_status[2]));
+
+        // 这颗芯片包含的逻辑处理器号，例如 0,1,2,3
+        char member_text[TM_OUT_VALUE_MAX];
+
+        if (format_logical_ids(device, member_text, (int) sizeof(member_text))) {
+            device_put(&out[i], "cpu_ids", member_text);
+        }
+
+        // 逐核利用率：顺序与 cpu_ids 一一对应，给以后按芯片画核心用
+        device_put_value(&out[i], "logical_usage",
+                         format_logical_usage(device, usage));
     }
 
-    if (virtualization != NULL && virtualization[0] != '\0') {
-        emit_device_text("virtualization", virtualization);
-    } else {
-        printf("I virtualization=!%s\n", TM_FIELD_STATUS_UNSUPPORTED);
+    return count;
+}
+
+/**
+ * 把一类"这一版只报名称"的设备实例填进包。
+ *
+ * 为什么只发 name：内存总量、磁盘读写、网卡流量、GPU 利用率这些统计口径
+ * 还没定，先发一个没有含义的 0 比不发更糟；先把实例与名称报出去，
+ * 上层就能先看到"这台机器有几块盘、几张网卡"，等统计字段定了一处补一列即可。
+ *
+ * @param devices 实例数组（registry 里的 memory / disk / network / gpu）
+ * @param count   实例条数
+ * @param type    协议里的设备类型串（MEMORY / DISK / NETWORK / GPU）
+ * @return 填了几台（受 capacity 限制）
+ */
+static int build_named_devices(TmOutDevice *out, int capacity,
+                               const TmDeviceRef *devices, int count, const char *type)
+{
+    if (out == NULL || devices == NULL || capacity <= 0 || count <= 0) {
+        return 0;
     }
 
-    emit_device_int("process_count", process_count, TM_FIELD_STATUS_READ_FAILED);
+    int limit = count;
 
-    emit_device_int("thread_count", thread_count, TM_FIELD_STATUS_READ_FAILED);
+    if (limit > capacity) {
+        limit = capacity;
+    }
 
-    emit_device_int("fd_count", fd_count, TM_FIELD_STATUS_READ_FAILED);
+    for (int i = 0; i < limit; i++) {
 
-    emit_device_int("uptime_seconds", uptime_seconds, TM_FIELD_STATUS_READ_FAILED);
+        device_begin(&out[i], devices[i].id, type);
 
-    emit_device_int("sockets", sockets, TM_FIELD_STATUS_NOT_AVAILABLE);
+        // 枚举阶段已经用 NAME 兜过底，这里一定有值
+        device_put(&out[i], "name", devices[i].name);
+    }
 
-    emit_device_int("cores", cores, TM_FIELD_STATUS_NOT_AVAILABLE);
+    return limit;
+}
 
-    emit_device_int("logical_cpus", logical_cpus, TM_FIELD_STATUS_NOT_AVAILABLE);
+/** 填系统信息：进程 / 线程 / 句柄 / 开机时长（不属于任何一类硬件）。 */
+static int build_system_device(TmOutDevice *out, int capacity)
+{
+    if (capacity <= 0) {
+        return 0;
+    }
 
-    emit_device_int("l1_cache_kb", l1_kb, TM_FIELD_STATUS_NOT_AVAILABLE);
+    device_begin(&out[0], "system", TM_DEV_TYPE_SYSTEM);
 
-    emit_device_int("l2_cache_kb", l2_kb, TM_FIELD_STATUS_NOT_AVAILABLE);
+    device_put_int(&out[0], "process_count", count_all_processes(),
+                   TM_FIELD_STATUS_READ_FAILED);
 
-    emit_device_int("l3_cache_kb", l3_kb, TM_FIELD_STATUS_UNSUPPORTED);
+    device_put_int(&out[0], "thread_count", count_all_threads(),
+                   TM_FIELD_STATUS_READ_FAILED);
+
+    device_put_int(&out[0], "fd_count", read_open_fd_count(),
+                   TM_FIELD_STATUS_READ_FAILED);
+
+    device_put_int(&out[0], "uptime_seconds", read_uptime_seconds(),
+                   TM_FIELD_STATUS_READ_FAILED);
+
+    return 1;
+}
+
+/** 发一个设备：一行 D 头 + 若干 F 行；字段值走同一套百分号编码。 */
+static void emit_device_block(const TmOutDevice *device)
+{
+    printf("D id=%s type=%s\n", device->id, device->type);
+
+    for (int i = 0; i < device->field_count; i++) {
+
+        const TmOutField *field = &device->fields[i];
+
+        // 感叹号开头是状态标记，原样发，不做编码
+        if (field->value[0] == '!') {
+
+            printf("F %s=%s\n", field->key, field->value);
+
+            continue;
+        }
+
+        printf("F %s=", field->key);
+
+        print_escaped_value(field->value);
+
+        printf("\n");
+    }
+}
+
+ /**
+  * 处理 typeCode=5：抓一次设备快照，按设备集合发出。
+  *
+  * 顺序：先把各类设备加系统信息全部填进缓冲 -> 数清 D 行与 F 行的总条数 ->
+  * 发包头 -> 逐块发。条数必须先定：客户端按 count 收满才算完整包。
+  *
+  * 包内容（有实例才发，没有的类型一条 D 行都不发）：
+  *   CPU     : 每个插槽一块，含利用率 / 频率 / 拓扑 / 缓存
+  *   MEMORY  : 每个内存设备一块，含总量与可用量
+  *   DISK    : 每块磁盘一块，先只带名字与 sysfs 位置
+  *   NETWORK : 每个网卡一块，先只带名字与 sysfs 位置
+  *   GPU     : 每个图形设备一块，先只带名字与 sysfs 位置
+  *   SYSTEM  : 进程 / 线程 / 句柄 / 开机时长
+  */
+static bool handle_device_snapshot(unsigned long long seq, int type)
+{
+    // 这条通道是单线程顺序处理，缓冲用 static：不占栈，也不用每次清整块
+    static TmOutDevice devices[TM_OUT_DEVICE_MAX];
+    static TmDeviceRegistry registry;
+    static TmCpuUsage usage;
+
+    // 先枚举实例，再采集：一次请求只枚举一次，采集期间 DeviceId 不会漂移
+    registry_refresh(&registry);
+
+    // 利用率整机与每逻辑核共用一对采样点；首帧没有对比点，字段会按 NO_BASELINE 发
+    read_cpu_usage(&usage);
+
+    int device_count = 0;
+
+    device_count += build_cpu_devices(devices + device_count,
+                                      TM_OUT_DEVICE_MAX - device_count,
+                                      &registry, &usage);
+
+    // 内存：这一版只报名称（总量 / 可用量等口径还没定）
+    device_count += build_named_devices(devices + device_count,
+                                        TM_OUT_DEVICE_MAX - device_count,
+                                        registry.memory, registry.memory_count,
+                                        TM_DEV_TYPE_MEMORY);
+
+    // 系统信息紧跟硬件之后：进程 / 线程 / 句柄三项都在这一台里
+    device_count += build_system_device(devices + device_count,
+                                        TM_OUT_DEVICE_MAX - device_count);
+
+    // 磁盘 / 网卡 / GPU：这一版只报名称
+    device_count += build_named_devices(devices + device_count,
+                                        TM_OUT_DEVICE_MAX - device_count,
+                                        registry.disk, registry.disk_count,
+                                        TM_DEV_TYPE_DISK);
+
+    device_count += build_named_devices(devices + device_count,
+                                        TM_OUT_DEVICE_MAX - device_count,
+                                        registry.network, registry.network_count,
+                                        TM_DEV_TYPE_NETWORK);
+
+    device_count += build_named_devices(devices + device_count,
+                                        TM_OUT_DEVICE_MAX - device_count,
+                                        registry.gpu, registry.gpu_count,
+                                        TM_DEV_TYPE_GPU);
+
+    // 包头要先知道后面有几行：D 头算一行，每个字段算一行
+    int line_count = 0;
+
+    for (int i = 0; i < device_count; i++) {
+        line_count += 1 + devices[i].field_count;
+    }
+
+    reply_package_header(seq, type, 0ULL, TM_STATUS_OK, line_count);
+
+    for (int i = 0; i < device_count; i++) {
+        emit_device_block(&devices[i]);
+    }
 
     return true;
 }

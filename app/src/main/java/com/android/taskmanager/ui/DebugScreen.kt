@@ -16,11 +16,14 @@
  *        -> 后端先打 READY，LinuxService 收到后才允许发正式请求
  *        -> 页面每 400ms 轮询 linuxBackendOutput()，把最近输出贴到结果区
  *   点"心跳" -> UIService.pingLinuxSvc() -> `REQ <seq> 4 0x0` -> 后端回 PKG(seq) + I pong=1
+ *   点"输出设备快照" -> UIService.linuxDeviceSnapshot() -> `REQ <seq> 5 0x0`
+ *        -> 后端回 v3 设备集合（D 行设备头 + F 行字段），页面按"设备 -> 字段 -> 状态"摊开
  *   点"停止" -> UIService.stopLinuxBackend() -> LinuxService 先发 SHUTDOWN 包再 destroy
  *
- * 两个输出框：
+ * 三个输出框：
  *   ① 测试结果：本页按钮驱动的交互结果（最近的后端往来）；
- *   ② 上游服务输出：AndroidService / LinuxService 自己的运行记录
+ *   ② 设备快照：按下按钮取回的那一帧，设备实例与字段逐条列出（看协议里到底有什么）；
+ *   ③ 上游服务输出：AndroidService / LinuxService 自己的运行记录
  *      （身份自检、READY/OK/DATA/ERR 应答），通过 UIService.upstreamOutput() 一次取两条。
  *
  * 预留实现接口：
@@ -139,6 +142,16 @@ fun DebugScreen() {
      */
     var packetOutput by remember {
         mutableStateOf("尚未发起 v2 请求（协议见 data/LinuxService.kt ① 段）")
+    }
+
+    /**
+     * 设备快照的输出。
+     *
+     * 与 [packetOutput] 分开存：进程快照与设备快照是两个不同的包，
+     * 放在同一个框里会互相覆盖，看不出哪一行属于哪一次请求。
+     */
+    var deviceOutput by remember {
+        mutableStateOf("尚未取过设备快照")
     }
 
     // 主线程 Handler：轮询线程不能直接改 Compose 状态，统一 post 回主线程
@@ -662,6 +675,143 @@ fun DebugScreen() {
 
             Text(
                 text = packetOutput,
+
+                modifier = Modifier.padding(12.dp),
+
+                style = MaterialTheme.typography.bodySmall,
+
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Spacer(
+            modifier = Modifier.height(16.dp)
+        )
+
+        // ====================================================
+        // 设备快照自检
+        //
+        // 为什么单独一块：设备快照是 typeCode=5，包里没有 P 行，
+        // 全是 D（设备头）与 F（字段）行；上面那些按钮只打印 P 行，
+        // 看不到设备实例，也看不到逐核利用率这类新字段。
+        // 这里按"设备 -> 字段 -> 无值状态"整包摊开，确认这一次到底拿到了什么。
+        // ====================================================
+
+        Text(
+            text = "设备快照",
+
+            style = MaterialTheme.typography.titleSmall,
+
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(
+            modifier = Modifier.height(4.dp)
+        )
+
+        Text(
+            text = "按一次让 Linux 服务采一帧设备快照，把解析后的设备实例、每台设备的字段与无值状态全部列出来。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(
+            modifier = Modifier.height(8.dp)
+        )
+
+        OutlinedButton(
+            onClick = {
+                scope.launch(Dispatchers.IO) {
+
+                    val service = UIService.instanceOrNull()
+
+                    val text = if (service == null) {
+                        "UIService 尚未就绪，请稍后重试"
+                    } else {
+
+                        // 拿原始包：解析后的帧在 PerformanceSnapshot 里，看不到 D/F 行的原样
+                        val packet = service.linuxDeviceSnapshot()
+
+                        if (packet == null) {
+                            "请求失败：后端未运行 / 发送失败 / 等待应答超时"
+                        } else buildString {
+
+                            appendLine("应答：${packet.summary()}")
+
+                            if (!packet.isOk) {
+                                appendLine(
+                                    "注意：${packet.failureReason ?: "包不可用"}，下面内容仅供参考"
+                                )
+                            }
+
+                            appendLine("原始行：${packet.raw.size} 行")
+
+                            // 老后端（平铺 I 行）没有设备集合，会落到这里
+                            if (packet.info.isNotEmpty()) {
+                                appendLine()
+                                appendLine("附加信息 ${packet.info.size} 条：")
+
+                                packet.info.entries.forEach { (key, value) ->
+                                    appendLine("  $key = $value")
+                                }
+                            }
+
+                            if (packet.devices.isEmpty()) {
+                                appendLine()
+                                appendLine("（包里没有 D 行设备，可能是后端未就绪或版本不支持）")
+                            } else {
+                                appendLine()
+                                appendLine("设备 ${packet.devices.size} 台：")
+
+                                packet.devices.forEach { device ->
+                                    appendLine()
+                                    appendLine(
+                                        "${device.id}  type=${device.type}  " +
+                                            "字段 ${device.fields.size} 个"
+                                    )
+
+                                    device.fields.entries.forEach { (key, value) ->
+                                        appendLine("  $key=$value")
+                                    }
+
+                                    // 有状态就说明这一格没有数值，与"值为 0"区分开
+                                    if (device.statuses.isNotEmpty()) {
+                                        appendLine(
+                                            "  无值字段：" +
+                                                device.statuses.entries.joinToString("  ") {
+                                                    "${it.key}=!${it.value}"
+                                                }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        deviceOutput = text
+                    }
+                }
+            },
+
+            enabled = serviceReady && isRunning
+        ) {
+            Text("输出设备快照")
+        }
+
+        Spacer(
+            modifier = Modifier.height(8.dp)
+        )
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+
+            color = MaterialTheme.colorScheme.surfaceVariant,
+
+            shape = MaterialTheme.shapes.medium
+        ) {
+            Text(
+                text = deviceOutput,
 
                 modifier = Modifier.padding(12.dp),
 

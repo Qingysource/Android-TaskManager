@@ -445,6 +445,31 @@ data class LinuxProcessRecord(
 }
 
 /**
+ * 一台设备在应答包里的样子（typeCode=5：一行 D 头 + 若干 F 字段）。
+ *
+ * 为什么要按设备建模：一台机器可能有多块磁盘、多个网卡、双路处理器，
+ * 平铺成全局字段就没法表达第几块。设备 id 是稳定标识（cpu0 / disk1 …），
+ * 同类型多实例靠它区分。
+ *
+ * @param id       设备标识（与 D 行里的 id 一致）
+ * @param type     设备类型（[LinuxProtocol.DEVICE_TYPE_CPU] 等）
+ * @param fields   字段键 -> 字段值（已解码，不含状态标记）
+ * @param statuses 字段键 -> 字段级状态；出现这个键就说明这一格没有数值
+ */
+data class LinuxDevice(
+    val id: String,
+    val type: String,
+    val fields: Map<String, String>,
+    val statuses: Map<String, String> = emptyMap()
+) {
+    /** 有数值才返回；null = 这一格没有值（不要拿 0 顶替）。 */
+    fun fieldOf(key: String): String? = fields[key]
+
+    /** 这一格为什么没值；null = 正常有值。 */
+    fun statusOf(key: String): String? = statuses[key]
+}
+
+/**
  * 一个完整应答包。
  *
  * @param seq       请求序号（与发出去的 REQ 对上）
@@ -467,6 +492,7 @@ data class LinuxPacket(
     val status: Int,
     val processes: List<LinuxProcessRecord> = emptyList(),
     val info: Map<String, String> = emptyMap(),
+    val devices: List<LinuxDevice> = emptyList(),
     val raw: List<String> = emptyList(),
     val complete: Boolean = true
 ) {
@@ -487,6 +513,17 @@ data class LinuxPacket(
 
     fun infoOf(key: String): String? = info[key]
 
+    /**
+     * 某一类型的全部设备。
+     *
+     * 空表就是这台机器没有该类型的实例（后端约定：没有的设备不发 D 行，
+     * 所以不会出现 present=false 的占位设备）。
+     */
+    fun devicesOf(type: String): List<LinuxDevice> = devices.filter { it.type == type }
+
+    /** 某一类型的第一台设备；UI 还没做多实例切换时先取它。没有返回 null。 */
+    fun deviceOf(type: String): LinuxDevice? = devices.firstOrNull { it.type == type }
+
     /** 一句话摘要（日志 / 调试页用）：`#3 QUERY_PROCESS ok P=1 mask=name|pid` */
     fun summary(): String {
         val statusText = if (status == LinuxPacketStatus.OK) "ok" else LinuxPacketStatus.nameOf(status)
@@ -494,7 +531,7 @@ data class LinuxPacket(
         val maskText = LinuxField.describe(mask)
 
         return "#$seq ${LinuxRequestType.nameOf(typeCode)} $statusText$completeText " +
-            "P=${processes.size} mask=$maskText"
+            "P=${processes.size} D=${devices.size} mask=$maskText"
     }
 }
 
@@ -512,13 +549,31 @@ data class LinuxPacket(
 object LinuxProtocol {
 
     /** 协议版本。 */
-    const val VERSION = 2
+    const val VERSION = 3
 
     /** 请求前缀 / 应答前缀（C 侧同名宏，见 main.c）。 */
     const val REQ_PREFIX = "REQ"
     const val PKG_PREFIX = "PKG"
     const val PROC_PREFIX = "P"
     const val INFO_PREFIX = "I"
+
+    /**
+     * 设备快照的行前缀（typeCode=5）。
+     *
+     * D 行开一台设备（`D id=cpu0 type=CPU`），随后每行 F 是该设备的一个字段
+     * （`F usage_percent=12.34`），直到下一个 D 行。包头的 count 记的是
+     * D 行与 F 行的总条数。
+     */
+    const val DEVICE_PREFIX = "D"
+    const val DEVICE_FIELD_PREFIX = "F"
+
+    /** 设备类型（与 C 侧 TM_DEV_TYPE_* 逐项一致）。 */
+    const val DEVICE_TYPE_CPU = "CPU"
+    const val DEVICE_TYPE_MEMORY = "MEMORY"
+    const val DEVICE_TYPE_DISK = "DISK"
+    const val DEVICE_TYPE_NETWORK = "NETWORK"
+    const val DEVICE_TYPE_GPU = "GPU"
+    const val DEVICE_TYPE_SYSTEM = "SYSTEM"
 
     /** 后端就绪通知（进程起来、可以收请求）。它不属于任何包，单独一行。 */
     const val READY_LINE = "READY"
@@ -693,6 +748,67 @@ object LinuxProtocol {
 
         val token = line.substring(INFO_PREFIX.length).trim().split(Regex("\\s+")).firstOrNull()
             ?: return null
+
+        val equals = token.indexOf('=')
+
+        if (equals <= 0) return null
+
+        val key = token.substring(0, equals)
+
+        if (!isValidKey(key)) return null
+
+        return key to unescapeValue(token.substring(equals + 1))
+    }
+
+    /**
+     * 解析设备头：`D id=cpu0 type=CPU`
+     *
+     * id 与 type 缺一不可：没有 id 就没法把后面的 F 行归到某台设备上，
+     * 没有 type 客户端就不知道该按哪套字段表读。
+     *
+     * @return id to type；格式不对返回 null（整行丢弃，不影响后续行）
+     */
+    fun parseDeviceLine(line: String): Pair<String, String>? {
+
+        if (!line.startsWith("$DEVICE_PREFIX ")) return null
+
+        var id: String? = null
+        var type: String? = null
+
+        for (token in line.substring(DEVICE_PREFIX.length).trim().split(Regex("\\s+"))) {
+
+            val equals = token.indexOf('=')
+
+            if (equals <= 0) continue
+
+            val key = token.substring(0, equals)
+
+            val value = unescapeValue(token.substring(equals + 1))
+
+            when (key) {
+                "id" -> id = value
+                "type" -> type = value
+            }
+        }
+
+        val deviceId = id?.takeIf { it.isNotBlank() } ?: return null
+        val deviceType = type?.takeIf { it.isNotBlank() } ?: return null
+
+        return deviceId to deviceType
+    }
+
+    /**
+     * 解析设备字段：`F <key>=<value>`
+     *
+     * 与信息行同一套取值规则；值可以带感叹号状态标记，由调用方把它们分流到
+     * 设备的 statuses（不要让感叹号状态混进数值里）。
+     */
+    fun parseDeviceFieldLine(line: String): Pair<String, String>? {
+
+        if (!line.startsWith("$DEVICE_FIELD_PREFIX ")) return null
+
+        val token = line.substring(DEVICE_FIELD_PREFIX.length).trim()
+            .split(Regex("\\s+")).firstOrNull() ?: return null
 
         val equals = token.indexOf('=')
 
@@ -957,8 +1073,19 @@ class LinuxService : Service(), ILinuxServiceApi {
     // 并登记到 pending；读线程收到带同一 seq 的 PKG 头时，才把结果交给等它的那个线程。
     // ============================================================
 
-    /** 一个在途请求的接收槽：头部一到就记下来，P/I 行往里追加，收满 count 后放行。 */
+    /** 一个在途请求的接收槽：头部一到就记下来，P/I/D/F 行往里追加，收满 count 后放行。 */
     private class PendingRequest {
+
+        /**
+         * 正在接收的设备：D 行开一台，后续 F 行填进它的字段表，
+         * 下一个 D 行到来时才把它提交进 [devices]（这样最后一段也能在收尾时补上）。
+         */
+        class DeviceBuilder(val id: String, val type: String) {
+            val fields = LinkedHashMap<String, String>()
+            val statuses = LinkedHashMap<String, String>()
+
+            fun build(): LinuxDevice = LinuxDevice(id, type, fields.toMap(), statuses.toMap())
+        }
 
         /** 头部还没到时占位用（也用于日志）。 */
         val typeCode: Int
@@ -982,6 +1109,21 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         val processes = ArrayList<LinuxProcessRecord>()
         val info = LinkedHashMap<String, String>()
+
+        /** 已提交的设备（不含正在接收的那一台）。 */
+        val devices = ArrayList<LinuxDevice>()
+
+        /** 正在接收的设备；null = 还没遇到 D 行（老后端的平铺格式）。 */
+        var currentDevice: DeviceBuilder? = null
+
+        /**
+         * 已收到的数据行条数：P / I / D / F 都算。
+         *
+         * 设备快照的包头 count 记的是"后面数据行的总条数"，只数 I 行会把
+         * 新格式的 D/F 行漏掉，导致包永远收不满（等满一个超时）。
+         */
+        var payloadLines = 0
+
         val raw = ArrayList<String>()
 
         constructor(typeCode: Int, mask: Long) {
@@ -1536,14 +1678,19 @@ class LinuxService : Service(), ILinuxServiceApi {
     // ---------- 友好接口：调用方（UIService）只用这一层，不碰协议细节 ----------
 
     /**
-     * 取一帧设备快照（性能页用；当前只有 CPU 那一组字段）。
+     * 取一帧设备快照的原始包（调试页用）。
      *
-     * 请求措辞：`REQ <seq> 5 0x0`，没有附加参数。应答全是 I 行，没有 P 行，
-     * 所以这里不需要掩码，也不做范围筛选。
+     * 请求措辞：`REQ <seq> 5 0x0`，没有附加参数。应答是 v3 设备集合：
+     * 每台设备一条 D 行（id + type），紧跟若干 F 行（`字段=值`，或 `字段=!状态`），
+     * 没有 P 行，所以这里不需要掩码，也不做范围筛选。
      *
-     * @return 帧数据；后端没就绪 / 超时 / 回 UNSUPPORTED（老版本后端）→ null
+     * 为什么要单独留这个入口：性能页只要解析后的那几个字段，
+     * 调试页要能看清"这次到底收到了哪些设备、每个设备有哪些字段"，
+     * 所以原包不能在里面被吃掉。
+     *
+     * @return 完整包；后端没就绪 / 超时 → null。半包照样返回，由调用方决定怎么显示
      */
-    fun deviceSnapshot(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): PerformanceSnapshot? {
+    fun deviceSnapshotPacket(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
 
         if (!isBackendReady) {
             append("设备快照推迟：后端尚未就绪（未收到 READY）")
@@ -1557,8 +1704,16 @@ class LinuxService : Service(), ILinuxServiceApi {
             append("设备快照未采用：${packet.failureReason ?: packet.summary()}")
         }
 
-        return PerformanceSnapshot.from(packet)
+        return packet
     }
+
+    /**
+     * 取一帧设备快照（性能页用：只留 UI 消费的那几个字段）。
+     *
+     * @return 帧数据；包不完整 / 后端回 UNSUPPORTED（老版本后端）→ null
+     */
+    fun deviceSnapshot(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): PerformanceSnapshot? =
+        PerformanceSnapshot.from(deviceSnapshotPacket(timeoutMs))
 
     /**
      * 取一次进程快照。
@@ -1767,7 +1922,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
                 append(
                     "上一个包未收满（seq=${interrupted.header?.seq} " +
-                        "已收 ${interrupted.processes.size}/${interrupted.header?.count}），按不完整收尾"
+                        "已收 ${interrupted.payloadLines}/${interrupted.header?.count}），按不完整收尾"
                 )
 
                 finishSlot(interrupted)
@@ -1811,10 +1966,11 @@ class LinuxService : Service(), ILinuxServiceApi {
             val reached = synchronized(requestLock) {
                 current.processes.add(record)
                 current.raw.add(line)
+                current.payloadLines++
 
                 val count = current.header?.count ?: 0
 
-                current.processes.size >= count
+                current.payloadLines >= count
             }
 
             if (reached) finishSlot(current)
@@ -1834,13 +1990,76 @@ class LinuxService : Service(), ILinuxServiceApi {
             synchronized(requestLock) {
                 current.info[pair.first] = pair.second
                 current.raw.add(line)
+                current.payloadLines++
 
                 val header = current.header
 
-                // 设备快照没有 P 行，靠"收满 count 条 I 行"判断收完
-                reached = header != null &&
-                    header.typeCode == LinuxRequestType.DEVICE_SNAPSHOT &&
-                    current.info.size >= header.count
+                // 设备快照没有 P 行，靠数据行收满 count 判断收完（老后端是 I 行，新后端是 D/F 行）
+                reached = header != null && current.payloadLines >= header.count
+            }
+
+            if (reached) finishSlot(current)
+
+            return
+        }
+
+        // ④ 设备头：`D id=cpu0 type=CPU`
+        if (line.startsWith("${LinuxProtocol.DEVICE_PREFIX} ")) {
+
+            val pair = LinuxProtocol.parseDeviceLine(line)
+
+            if (pair == null) {
+                append("设备头解析失败，已跳过：$line")
+
+                return
+            }
+
+            var reached = false
+
+            synchronized(requestLock) {
+                // 上一台设备到此结束，提交进列表；这台先挂成正在接收的那一台
+                current.currentDevice?.let { current.devices.add(it.build()) }
+
+                current.currentDevice = PendingRequest.DeviceBuilder(pair.first, pair.second)
+
+                current.raw.add(line)
+                current.payloadLines++
+
+                reached = current.header != null &&
+                    current.payloadLines >= (current.header?.count ?: 0)
+            }
+
+            if (reached) finishSlot(current)
+
+            return
+        }
+
+        // ⑤ 设备字段：`F key=value`
+        if (line.startsWith("${LinuxProtocol.DEVICE_FIELD_PREFIX} ")) {
+
+            val pair = LinuxProtocol.parseDeviceFieldLine(line)
+
+            if (pair == null) return
+
+            var reached = false
+
+            synchronized(requestLock) {
+                // 没有设备头的字段行无处可归：丢掉比塞给上一台设备更安全
+                val builder = current.currentDevice ?: return@synchronized
+
+                val value = pair.second
+
+                if (value.startsWith("!")) {
+                    builder.statuses[pair.first] = value.substring(1)
+                } else {
+                    builder.fields[pair.first] = value
+                }
+
+                current.raw.add(line)
+                current.payloadLines++
+
+                reached = current.header != null &&
+                    current.payloadLines >= (current.header?.count ?: 0)
             }
 
             if (reached) finishSlot(current)
@@ -1863,6 +2082,8 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         val processes: List<LinuxProcessRecord>
         val info: Map<String, String>
+        val devices: List<LinuxDevice>
+        val payloadLines: Int
         val raw: List<String>
 
         synchronized(requestLock) {
@@ -1873,28 +2094,25 @@ class LinuxService : Service(), ILinuxServiceApi {
 
             if (activePending === slot) activePending = null
 
+            // 最后一段设备还没被下一个 D 行提交（包结束在设备中间）：收尾时补上
+            slot.currentDevice?.let { slot.devices.add(it.build()) }
+
+            slot.currentDevice = null
+
             processes = slot.processes.toList()
             info = slot.info.toMap()
+            devices = slot.devices.toList()
+            payloadLines = slot.payloadLines
             raw = slot.raw.toList()
         }
 
-        // 完整判据：进程包看 P 行够不够 count；设备快照看 I 行够不够 count
-        val complete = if (header.typeCode == LinuxRequestType.DEVICE_SNAPSHOT) {
-            info.size >= header.count
-        } else {
-            processes.size == header.count
-        }
+        // 完整判据：数据行条数够 count 才算完整（P / I / D / F 都计入）
+        val complete = payloadLines >= header.count
 
         if (!complete) {
 
-            val gotCount = if (header.typeCode == LinuxRequestType.DEVICE_SNAPSHOT) {
-                info.size
-            } else {
-                processes.size
-            }
-
             append(
-                "包不完整（seq=${header.seq}）：收到 $gotCount 条，" +
+                "包不完整（seq=${header.seq}）：收到 $payloadLines 条数据行，" +
                     "包头声称 ${header.count} 条"
             )
         }
@@ -1907,6 +2125,7 @@ class LinuxService : Service(), ILinuxServiceApi {
             status = header.status,
             processes = processes,
             info = info,
+            devices = devices,
             raw = raw,
             complete = complete
         )

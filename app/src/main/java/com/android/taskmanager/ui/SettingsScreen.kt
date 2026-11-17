@@ -65,6 +65,7 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.Percent
 import androidx.compose.material.icons.outlined.Speed
 
 import androidx.compose.material3.AlertDialog
@@ -119,6 +120,14 @@ data class SettingsValues(
     val defaultStartPage: String,
     val updateSpeed: String,
 
+    /**
+     * CPU 利用率显示的小数位数：默认 / 一位 / 两位（见 SettingsCatalog.CPU_USAGE_PRECISIONS）。
+     *
+     * 只影响显示，不影响采集：底层利用率一直按 0.01% 的精度传上来，
+     * 这里决定某几页在屏幕上画几位。默认不保留小数。
+     */
+    val cpuUsagePrecision: String,
+
     // —— 窗口管理 ——
     val windowAlwaysOnTop: Boolean,
     val minimizeWhenInUse: Boolean,
@@ -162,6 +171,9 @@ val SettingsDefaults = SettingsValues(
     defaultStartPage = "进程",
     updateSpeed = "常规",
 
+    // 默认不保留小数：要看细节的用户自己去设置页改成一位 / 两位
+    cpuUsagePrecision = "默认",
+
     windowAlwaysOnTop = false,
     minimizeWhenInUse = true,
     hideWhenMinimized = false,
@@ -197,6 +209,7 @@ enum class SettingKey(val storageKey: String) {
     APP_THEME("app_theme"),
     DEFAULT_START_PAGE("default_start_page"),
     UPDATE_SPEED("update_speed"),
+    CPU_USAGE_PRECISION("cpu_usage_precision"),
 
     WINDOW_ALWAYS_ON_TOP("window_always_on_top"),
     MINIMIZE_WHEN_IN_USE("minimize_when_in_use"),
@@ -282,6 +295,8 @@ object SettingsApi : ISettingsApi {
             SettingKey.DEFAULT_START_PAGE -> d.defaultStartPage
             SettingKey.UPDATE_SPEED -> d.updateSpeed
 
+            SettingKey.CPU_USAGE_PRECISION -> d.cpuUsagePrecision
+
             SettingKey.WINDOW_ALWAYS_ON_TOP -> d.windowAlwaysOnTop
             SettingKey.MINIMIZE_WHEN_IN_USE -> d.minimizeWhenInUse
             SettingKey.HIDE_WHEN_MINIMIZED -> d.hideWhenMinimized
@@ -308,6 +323,8 @@ object SettingsApi : ISettingsApi {
         SettingKey.APP_THEME.storageKey to values.appTheme,
         SettingKey.DEFAULT_START_PAGE.storageKey to values.defaultStartPage,
         SettingKey.UPDATE_SPEED.storageKey to values.updateSpeed,
+
+        SettingKey.CPU_USAGE_PRECISION.storageKey to values.cpuUsagePrecision,
 
         SettingKey.WINDOW_ALWAYS_ON_TOP.storageKey to values.windowAlwaysOnTop,
         SettingKey.MINIMIZE_WHEN_IN_USE.storageKey to values.minimizeWhenInUse,
@@ -344,6 +361,8 @@ object SettingsApi : ISettingsApi {
             appTheme = readString(SettingKey.APP_THEME, d.appTheme),
             defaultStartPage = readString(SettingKey.DEFAULT_START_PAGE, d.defaultStartPage),
             updateSpeed = readString(SettingKey.UPDATE_SPEED, d.updateSpeed),
+
+            cpuUsagePrecision = readString(SettingKey.CPU_USAGE_PRECISION, d.cpuUsagePrecision),
 
             windowAlwaysOnTop = readBoolean(SettingKey.WINDOW_ALWAYS_ON_TOP, d.windowAlwaysOnTop),
             minimizeWhenInUse = readBoolean(SettingKey.MINIMIZE_WHEN_IN_USE, d.minimizeWhenInUse),
@@ -450,6 +469,10 @@ fun SettingsScreen(
 
     var updateSpeed by remember(layoutEpoch, initialValues) {
         mutableStateOf(initialValues.updateSpeed)
+    }
+
+    var cpuUsagePrecision by remember(layoutEpoch, initialValues) {
+        mutableStateOf(initialValues.cpuUsagePrecision)
     }
 
     // =====================================================
@@ -758,6 +781,7 @@ fun SettingsScreen(
         appTheme = appTheme,
         defaultStartPage = defaultStartPage,
         updateSpeed = updateSpeed,
+        cpuUsagePrecision = cpuUsagePrecision,
 
         windowAlwaysOnTop = windowAlwaysOnTop,
         minimizeWhenInUse = minimizeWhenInUse,
@@ -881,6 +905,21 @@ fun SettingsScreen(
         onSettingChanged(SettingKey.UPDATE_SPEED, value)
 
         // TODO(预留): 现在就能生效：UIService 会换算成轮询间隔
+    }
+
+    /**
+     * 改"利用率精确度"：只改显示的小数位数，不影响采集。
+     *
+     * 底层利用率一直是两位小数的精度传上来的（ELF 侧按 0.01% 上报），
+     * 这里只是选显示几位，所以改完立刻生效，不需要重启服务、也不需要清历史点。
+     */
+    fun updateCpuUsagePrecision(value: String) {
+        if (cpuUsagePrecision == value) return
+
+        cpuUsagePrecision = value
+
+        // 交给 UIService：落盘（页面不碰存储）
+        onSettingChanged(SettingKey.CPU_USAGE_PRECISION, value)
     }
 
     fun updateWindowAlwaysOnTop(value: Boolean) {
@@ -1029,6 +1068,8 @@ fun SettingsScreen(
         updateDefaultStartPage(SettingsDefaults.defaultStartPage)
         updateUpdateSpeed(SettingsDefaults.updateSpeed)
 
+        updateCpuUsagePrecision(SettingsDefaults.cpuUsagePrecision)
+
         updateWindowAlwaysOnTop(SettingsDefaults.windowAlwaysOnTop)
         updateMinimizeWhenInUse(SettingsDefaults.minimizeWhenInUse)
         updateHideWhenMinimized(SettingsDefaults.hideWhenMinimized)
@@ -1102,6 +1143,18 @@ fun SettingsScreen(
                 selected = updateSpeed,
                 options = SettingsCatalog.UPDATE_SPEEDS,
                 onSelected = ::updateUpdateSpeed,
+                hostedInOverlay = hostedInOverlay
+            )
+
+            // 利用率显示几位小数。只影响显示，采集精度固定是 0.01%，
+            // 所以改这个选项不会触发重新采样，也不会清掉图表上已经画出来的曲线。
+            SettingsDropdown(
+                icon = Icons.Outlined.Percent,
+                title = "利用率精确度",
+                description = "控制 CPU 利用率显示的小数位数：默认不保留小数，一位 / 两位依次增加",
+                selected = cpuUsagePrecision,
+                options = SettingsCatalog.CPU_USAGE_PRECISIONS,
+                onSelected = ::updateCpuUsagePrecision,
                 hostedInOverlay = hostedInOverlay
             )
 

@@ -416,6 +416,7 @@ object SettingsStore {
         SettingKey.APP_THEME -> SettingsCatalog.THEMES
         SettingKey.DEFAULT_START_PAGE -> SettingsCatalog.START_PAGES
         SettingKey.UPDATE_SPEED -> SettingsCatalog.UPDATE_SPEEDS
+        SettingKey.CPU_USAGE_PRECISION -> SettingsCatalog.CPU_USAGE_PRECISIONS
         SettingKey.LAST_PAGE -> SettingsCatalog.PAGES
 
         else -> emptyList()
@@ -450,6 +451,11 @@ object SettingsStore {
 
         if (result.updateSpeed !in SettingsCatalog.UPDATE_SPEEDS) {
             result = result.copy(updateSpeed = SettingsDefaults.updateSpeed)
+        }
+
+        // 利用率精确度：只影响显示位数，非法值直接回落默认，不牵连任何采集逻辑
+        if (result.cpuUsagePrecision !in SettingsCatalog.CPU_USAGE_PRECISIONS) {
+            result = result.copy(cpuUsagePrecision = SettingsDefaults.cpuUsagePrecision)
         }
 
         // last_page：空串是合法状态（没有待办）；非空就必须是真实页面名，
@@ -523,6 +529,8 @@ object SettingsStore {
             SettingKey.DEFAULT_START_PAGE -> values.copy(defaultStartPage = asString(values.defaultStartPage))
 
             SettingKey.UPDATE_SPEED -> values.copy(updateSpeed = asString(values.updateSpeed))
+
+            SettingKey.CPU_USAGE_PRECISION -> values.copy(cpuUsagePrecision = asString(values.cpuUsagePrecision))
 
             SettingKey.WINDOW_ALWAYS_ON_TOP -> values.copy(windowAlwaysOnTop = asBoolean(values.windowAlwaysOnTop))
 
