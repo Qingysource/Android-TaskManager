@@ -3066,10 +3066,11 @@ typedef struct {
 } TmDeviceRef;
 
 /**
- * 一台 CPU 设备实例 = 一颗芯片（一个插槽）。
+ * 一台 CPU 实例 = 一颗芯片（一个插槽）：枚举与采集用这个粒度。
  *
- * 不按核心拆、也不按逻辑处理器拆：任务管理器页面上的一台 CPU 就是一颗芯片，
- * 核心与逻辑处理器是它内部的数据（logical_ids），不是独立设备。
+ * 不按核心拆、也不按逻辑处理器拆：核心与逻辑处理器是它内部的数据（logical_ids）。
+ * 这只是**采集层**的粒度——输出层会把所有芯片合并成一台 CPU（见 build_cpu_devices），
+ * 因为内核把多颗处理器的逻辑核放进了同一个调度池，页面上也只显示一个处理器。
  *
  * id          协议里的设备标识，cpu0 / cpu1
  * device_id   同类型实例序号，与 id 尾巴上的数字一致；采集函数靠它定位
@@ -3096,7 +3097,7 @@ typedef TmDeviceRef TmPlainDevice;
  * 每个函数还得自己再猜一遍它对应哪颗芯片；先把实例枚举成数组，采集函数直接拿
  * 数组元素，里面已经存好 path / package_id / 逻辑核列表，不用重复定位。
  *
- * 这一版只有 CPU 与 SYSTEM 进包；其余四类只建表，等字段补齐再发。
+ * 五类设备都进包；CPU 在输出层合并成一台，其余四类这一版只发名称。
  */
 typedef struct {
     TmCpuDevice cpu[TM_OUT_DEVICE_MAX];
@@ -3938,24 +3939,30 @@ static TmQueryValue probe_virtualization_internal(void)
 }
 
 /**
- * 把每颗芯片的逻辑核拼成协议里的 cpu_ids（逗号分隔）。
+ * 把逻辑核号拼成协议里的 cpu_ids（逗号分隔）。
  *
- * @return false = 这颗芯片一个逻辑核都没记下来
+ * @param ids      逻辑核号数组；顺序由调用方按内核顺序拼好，这里不排序、不打乱
+ * @param count    ids 的条数
+ * @return false = 一个都没给
  */
-static bool format_logical_ids(const TmCpuDevice *device, char *out, int capacity)
+static bool format_logical_ids(const int *ids, int count, char *out, int capacity)
 {
+    if (ids == NULL || count <= 0 || out == NULL || capacity <= 0) {
+        return false;
+    }
+
     out[0] = '\0';
 
     size_t used = 0;
 
-    for (int i = 0; i < device->logical_count; i++) {
+    for (int i = 0; i < count; i++) {
 
         char item[16];
 
         if (i == 0) {
-            snprintf(item, sizeof(item), "%d", device->logical_ids[i]);
+            snprintf(item, sizeof(item), "%d", ids[i]);
         } else {
-            snprintf(item, sizeof(item), ",%d", device->logical_ids[i]);
+            snprintf(item, sizeof(item), ",%d", ids[i]);
         }
 
         size_t length = strlen(item);
@@ -3973,15 +3980,21 @@ static bool format_logical_ids(const TmCpuDevice *device, char *out, int capacit
 }
 
 /**
- * 把每颗芯片的逐核利用率拼成协议里的 logical_usage（逗号分隔，两位小数）。
+ * 把逐核利用率拼成协议里的 logical_usage（逗号分隔，两位小数）。
  *
  * 顺序与 cpu_ids 严格一一对应：这个列表的第 n 个数就是 cpu_ids 第 n 个核的利用率。
  * 某一核这一帧没有值（刚热插拔、计数器回退）写 -1.00，占住位置不让后面错位。
  *
+ * @param ids   逻辑核号数组（与 cpu_ids 同一份，同一顺序）
+ * @param count ids 的条数
  * @return TM_QUERY_OK = 有值；NOT_AVAILABLE = 一个都没算出来；TRUNCATED = 太长装不下
  */
-static TmQueryValue format_logical_usage(const TmCpuDevice *device, const TmCpuUsage *usage)
+static TmQueryValue format_logical_usage(const int *ids, int count, const TmCpuUsage *usage)
 {
+    if (ids == NULL || count <= 0 || usage == NULL) {
+        return query_value_none(TM_QUERY_NOT_AVAILABLE);
+    }
+
     char text[TM_OUT_VALUE_MAX];
 
     text[0] = '\0';
@@ -3989,9 +4002,9 @@ static TmQueryValue format_logical_usage(const TmCpuDevice *device, const TmCpuU
     size_t used = 0;
     bool any = false;
 
-    for (int i = 0; i < device->logical_count; i++) {
+    for (int i = 0; i < count; i++) {
 
-        int logical = device->logical_ids[i];
+        int logical = ids[i];
 
         double percent = -1.0;
 
@@ -4032,33 +4045,69 @@ static TmQueryValue format_logical_usage(const TmCpuDevice *device, const TmCpuU
 }
 
  /**
-  * 填 CPU 设备：按实例表逐台填，每台用自己存的 path 与逻辑核列表。
+  * 填 CPU 设备：永远只填一台，把所有枚举到的物理处理器合并成这一台。
   *
-  * 利用率与频率是整机口径（/proc/stat 汇总行与 cpu0 的 cpufreq），
-  * 多颗芯片时每颗设备共用同一份整机值 —— 汇总行没有按插槽拆的数据，
-  * 这里不假装能算出单颗芯片的利用率；单核利用率下面单独给。
+  * 为什么合并：内核把多颗处理器的逻辑核心放进了同一个调度池，任务管理器也只显示
+  * 一个处理器；而 /proc/stat 的汇总行本身就是整机口径，按芯片拆不出单颗的利用率。
+  * 分成多台只会逼着 UI 为每颗芯片各画一套视图，数据却还是同一份整机的。
   *
-  * 名字 / 虚拟化 / 缓存三项按设备逐个查：先自己探测（sysfs、/proc/cpuinfo），
-  * 再调外部实现；外部返回 TM_QUERY_OK 才覆盖自己的值，不是 OK 就保留自己的，
-  * 两边都没有才把状态发出去。
+  * 合并规则逐字段不同，不要按同一套想：
+  *   usage_percent   整机汇总行，本来就是各处理器一起算的，直接用
+  *   speed_mhz       不相加：多颗处理器通常同频，取 cpu0 那一份
+  *   base_mhz        同上
+  *   name            全部同名只写一个；不同名按 "名1 名2" 拼，缺名的写 NAME
+  *   virtualization  只问第一颗（主处理器）
+  *   sockets         物理处理器实例数（枚举到几颗就是几，不是核心数）
+  *   cores           各芯片物理核心总数（内核的插槽 + 核号去重口径）
+  *   logical_cpus    合并后的逻辑核总数
+  *   l1/l2/l3_cache  各芯片相加（两颗各 1 KB → 2 KB）
+  *   cpu_ids         按内核顺序拼：第 0 颗的核在前、第 1 颗的在后，不打乱
+  *   logical_usage   与 cpu_ids 一一对应，同一个顺序
   *
-  * @param registry 已枚举好的实例表
+  * 名字 / 虚拟化 / 缓存仍是"自己探测优先，外部返回 OK 才覆盖"，多颗时逐颗问一遍。
+  *
+  * @param registry 已枚举好的实例表（内部仍按芯片存，合并只发生在输出这一层）
   * @param usage    这一帧的利用率（整机 + 每逻辑核）
-  * @return 填了几台设备
+  * @return 1 = 填了一台；0 = 没有 CPU 实例或容量不足
   */
 static int build_cpu_devices(TmOutDevice *out, int capacity,
                              const TmDeviceRegistry *registry, const TmCpuUsage *usage)
 {
-    if (out == NULL || registry == NULL || capacity <= 0 || registry->cpu_count <= 0) {
+    if (out == NULL || registry == NULL || usage == NULL || capacity <= 0
+        || registry->cpu_count <= 0) {
         return 0;
     }
 
-    int count = registry->cpu_count;
+    // 先把所有芯片的逻辑核号按内核顺序拼成一份：第 0 颗的在前，第 1 颗的在后
+    int merged_ids[TM_OUT_LOGICAL_MAX];
 
-    if (count > capacity) {
-        count = capacity;
+    int merged_count = 0;
+
+    for (int i = 0; i < registry->cpu_count; i++) {
+
+        const TmCpuDevice *device = &registry->cpu[i];
+
+        for (int j = 0; j < device->logical_count; j++) {
+
+            if (merged_count >= TM_OUT_LOGICAL_MAX) {
+                break;
+            }
+
+            merged_ids[merged_count++] = device->logical_ids[j];
+        }
     }
 
+    device_begin(&out[0], "cpu0", TM_DEV_TYPE_CPU);
+
+    // 单实例：这一类只有这一台，序号恒 0
+    device_put(&out[0], "cpu_id", "0");
+
+    device_put_value(&out[0], "usage_percent",
+                     query_value_float(usage->total_percent >= 0.0,
+                                       usage->total_percent, 2,
+                                       TM_QUERY_NO_BASELINE));
+
+    // 频率取第一颗处理器（cpu0 的 cpufreq）；多颗通常同频，不相加
     double cur_khz = 0.0;
 
     bool has_cur_khz = read_cpu_cur_freq_khz(&cur_khz);
@@ -4067,97 +4116,162 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
 
     bool has_max_khz = read_cpu_max_freq_khz(&max_khz);
 
-    int sockets = -1;
-    int cores = -1;
+    device_put_int(&out[0], "speed_mhz",
+                   has_cur_khz ? (long long) (cur_khz / 1000.0 + 0.5) : -1,
+                   TM_FIELD_STATUS_NOT_AVAILABLE);
 
-    count_sockets_and_cores(&sockets, &cores);
+    device_put_int(&out[0], "base_mhz",
+                   has_max_khz ? (long long) (max_khz / 1000.0 + 0.5) : -1,
+                   TM_FIELD_STATUS_NOT_AVAILABLE);
 
-    int logical_cpus = count_logical_cpus();
+    // 名字：逐颗求最终值（外部优先，内部探测兜底），再按"同名只留一个 / 异名拼接"汇总
+    TmQueryValue internal_name = probe_cpu_name_internal();
 
-    for (int i = 0; i < count; i++) {
+    char primary_name[TM_OUT_VALUE_MAX];
+
+    primary_name[0] = '\0';
+
+    char name_text[TM_OUT_VALUE_MAX];
+
+    name_text[0] = '\0';
+
+    size_t name_used = 0;
+
+    TmQueryStatus name_status = TM_QUERY_UNSUPPORTED;
+
+    bool name_overflow = false;
+
+    for (int i = 0; i < registry->cpu_count && !name_overflow; i++) {
 
         const TmCpuDevice *device = &registry->cpu[i];
 
-        device_begin(&out[i], device->id, TM_DEV_TYPE_CPU);
+        char one_name[TM_OUT_VALUE_MAX];
 
-        // 同类型设备序号：与 id 里的数字一致，客户端不用再拆字符串
-        char index_text[32];
+        one_name[0] = '\0';
 
-        snprintf(index_text, sizeof(index_text), "%d", device->device_id);
+        TmQueryStatus one_status = query_cpu_name_external(device->device_id, device->path,
+                                                           one_name, (int) sizeof(one_name));
 
-        device_put(&out[i], "cpu_id", index_text);
+        bool have_one = false;
 
-        // 两位小数：显示几位由客户端设置决定，协议不截断到整数
-        device_put_value(&out[i], "usage_percent",
-                         query_value_float(usage->total_percent >= 0.0,
-                                           usage->total_percent, 2,
-                                           TM_QUERY_NO_BASELINE));
+        if (one_status == TM_QUERY_OK && one_name[0] != '\0') {
 
-        device_put_int(&out[i], "speed_mhz",
-                       has_cur_khz ? (long long) (cur_khz / 1000.0 + 0.5) : -1,
-                       TM_FIELD_STATUS_NOT_AVAILABLE);
+            have_one = true;
 
-        device_put_int(&out[i], "base_mhz",
-                       has_max_khz ? (long long) (max_khz / 1000.0 + 0.5) : -1,
-                       TM_FIELD_STATUS_NOT_AVAILABLE);
+            name_status = TM_QUERY_OK;
 
-        // 名字：先自己从 /proc/cpuinfo 探一份，外部返回 OK 再覆盖
-        TmQueryValue name_value = probe_cpu_name_internal();
+        } else if (internal_name.status == TM_QUERY_OK) {
 
-        char external_text[TM_OUT_VALUE_MAX];
+            snprintf(one_name, sizeof(one_name), "%s", internal_name.text);
 
-        external_text[0] = '\0';
+            have_one = true;
 
-        TmQueryStatus name_status = query_cpu_name_external(device->device_id, device->path,
-                                                           external_text,
-                                                           (int) sizeof(external_text));
-
-        if (name_status == TM_QUERY_OK && external_text[0] != '\0') {
-
-            name_value = query_value_text(TM_QUERY_OK, external_text);
-
-        } else if (name_value.status != TM_QUERY_OK) {
-
-            name_value = query_value_none(name_status);
+            name_status = TM_QUERY_OK;
         }
 
-        device_put_value(&out[i], "name", name_value);
-
-        // 虚拟化：把刚查到的名字一起传过去，外部实现可能要按平台区分方案
-        TmQueryValue virtualization_value = probe_virtualization_internal();
-
-        char external_virtualization[TM_OUT_VALUE_MAX];
-
-        external_virtualization[0] = '\0';
-
-        TmQueryStatus virtualization_status = query_virtualization_external(
-            device->device_id, device->path,
-            name_value.status == TM_QUERY_OK ? name_value.text : "",
-            external_virtualization, (int) sizeof(external_virtualization));
-
-        if (virtualization_status == TM_QUERY_OK && external_virtualization[0] != '\0') {
-
-            virtualization_value = query_value_text(TM_QUERY_OK, external_virtualization);
-
-        } else if (virtualization_value.status != TM_QUERY_OK) {
-
-            virtualization_value = query_value_none(virtualization_status);
+        // 缺名用 NAME 占位：一颗有名一颗没名，也要能看出它们不一样
+        if (!have_one) {
+            snprintf(one_name, sizeof(one_name), "%s", "NAME");
         }
 
-        device_put_value(&out[i], "virtualization", virtualization_value);
+        if (i == 0) {
 
-        device_put_int(&out[i], "sockets", sockets, TM_FIELD_STATUS_NOT_AVAILABLE);
+            snprintf(primary_name, sizeof(primary_name), "%s", one_name);
 
-        device_put_int(&out[i], "cores", cores, TM_FIELD_STATUS_NOT_AVAILABLE);
+            snprintf(name_text, sizeof(name_text), "%s", one_name);
 
-        device_put_int(&out[i], "logical_cpus", logical_cpus, TM_FIELD_STATUS_NOT_AVAILABLE);
+            name_used = strlen(name_text);
 
-        // 缓存：先扫这台实例自己的 cache/index*，再问外部；外部 OK 才覆盖
+            continue;
+        }
+
+        // 与第一颗的名字完全相同就只留一个
+        if (strcmp(one_name, name_text) == 0) {
+            continue;
+        }
+
+        if (name_used + 1 + strlen(one_name) + 1 > sizeof(name_text)) {
+
+            name_overflow = true;
+
+            break;
+        }
+
+        name_text[name_used++] = ' ';
+
+        snprintf(name_text + name_used, sizeof(name_text) - name_used, "%s", one_name);
+
+        name_used = strlen(name_text);
+    }
+
+    if (name_overflow) {
+
+        device_put_value(&out[0], "name", query_value_none(TM_QUERY_TRUNCATED));
+
+    } else if (name_status == TM_QUERY_OK) {
+
+        device_put_value(&out[0], "name", query_value_text(TM_QUERY_OK, name_text));
+
+    } else {
+
+        device_put_value(&out[0], "name", query_value_none(name_status));
+    }
+
+    // 虚拟化只问第一颗（主处理器）：多颗的方案一般一致，各问一遍没有意义
+    const TmCpuDevice *primary = &registry->cpu[0];
+
+    TmQueryValue virtualization_value = probe_virtualization_internal();
+
+    char external_virtualization[TM_OUT_VALUE_MAX];
+
+    external_virtualization[0] = '\0';
+
+    TmQueryStatus virtualization_status = query_virtualization_external(
+        primary->device_id, primary->path, primary_name,
+        external_virtualization, (int) sizeof(external_virtualization));
+
+    if (virtualization_status == TM_QUERY_OK && external_virtualization[0] != '\0') {
+
+        virtualization_value = query_value_text(TM_QUERY_OK, external_virtualization);
+
+    } else if (virtualization_value.status != TM_QUERY_OK) {
+
+        virtualization_value = query_value_none(virtualization_status);
+    }
+
+    device_put_value(&out[0], "virtualization", virtualization_value);
+
+    // 插槽数 = 枚举到的物理处理器实例数；cores 走内核的"插槽 + 核号"去重口径
+    int sockets = registry->cpu_count;
+
+    int cores = -1;
+
+    int socket_count_ignored = -1;
+
+    count_sockets_and_cores(&socket_count_ignored, &cores);
+
+    int logical_cpus = count_logical_cpus();
+
+    device_put_int(&out[0], "sockets", sockets, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "cores", cores, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "logical_cpus", logical_cpus, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    // 缓存逐颗求再相加：两颗各 1 KB → 2 KB。某颗某级没值就不算它
+    long long cache_sum[3] = { 0, 0, 0 };
+
+    int cache_has[3] = { 0, 0, 0 };
+
+    TmQueryStatus cache_status[3] = {
+        TM_QUERY_NOT_AVAILABLE, TM_QUERY_NOT_AVAILABLE, TM_QUERY_NOT_AVAILABLE
+    };
+
+    for (int i = 0; i < registry->cpu_count; i++) {
+
+        const TmCpuDevice *device = &registry->cpu[i];
+
         int cache_kb[3] = { -1, -1, -1 };
-
-        TmQueryStatus cache_status[3] = {
-            TM_QUERY_NOT_AVAILABLE, TM_QUERY_NOT_AVAILABLE, TM_QUERY_NOT_AVAILABLE
-        };
 
         probe_cpu_cache_from_sysfs(device->path, cache_kb);
 
@@ -4168,39 +4282,56 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
             TmQueryStatus status = query_cache_kb_external(device->device_id, device->path,
                                                            level, &external_kb);
 
+            // 外部 OK 才覆盖自己扫到的
             if (status == TM_QUERY_OK && external_kb > 0) {
-
                 cache_kb[level - 1] = external_kb;
-                cache_status[level - 1] = TM_QUERY_OK;
-
-                continue;
             }
 
-            cache_status[level - 1] = cache_kb[level - 1] >= 0 ? TM_QUERY_OK : status;
+            if (cache_kb[level - 1] >= 0) {
+
+                cache_sum[level - 1] += cache_kb[level - 1];
+
+                cache_has[level - 1] = 1;
+
+                cache_status[level - 1] = TM_QUERY_OK;
+
+            } else if (i == 0 && cache_status[level - 1] != TM_QUERY_OK) {
+
+                cache_status[level - 1] = status;
+            }
         }
-
-        device_put_value(&out[i], "l1_cache_kb",
-                         query_value_int(cache_kb[0], cache_status[0]));
-
-        device_put_value(&out[i], "l2_cache_kb",
-                         query_value_int(cache_kb[1], cache_status[1]));
-
-        device_put_value(&out[i], "l3_cache_kb",
-                         query_value_int(cache_kb[2], cache_status[2]));
-
-        // 这颗芯片包含的逻辑处理器号，例如 0,1,2,3
-        char member_text[TM_OUT_VALUE_MAX];
-
-        if (format_logical_ids(device, member_text, (int) sizeof(member_text))) {
-            device_put(&out[i], "cpu_ids", member_text);
-        }
-
-        // 逐核利用率：顺序与 cpu_ids 一一对应，给以后按芯片画核心用
-        device_put_value(&out[i], "logical_usage",
-                         format_logical_usage(device, usage));
     }
 
-    return count;
+    static const char *const cache_keys[3] = {
+        "l1_cache_kb", "l2_cache_kb", "l3_cache_kb"
+    };
+
+    for (int level = 1; level <= 3; level++) {
+
+        if (cache_has[level - 1]) {
+
+            device_put_value(&out[0], cache_keys[level - 1],
+                             query_value_int(cache_sum[level - 1], TM_QUERY_NOT_AVAILABLE));
+
+            continue;
+        }
+
+        device_put_value(&out[0], cache_keys[level - 1],
+                         query_value_none(cache_status[level - 1]));
+    }
+
+    // 合并后的逻辑核号，例如 0,1,2,3,4,5,6,7
+    char member_text[TM_OUT_VALUE_MAX];
+
+    if (format_logical_ids(merged_ids, merged_count, member_text, (int) sizeof(member_text))) {
+        device_put(&out[0], "cpu_ids", member_text);
+    }
+
+    // 逐核利用率：顺序与 cpu_ids 一一对应
+    device_put_value(&out[0], "logical_usage",
+                     format_logical_usage(merged_ids, merged_count, usage));
+
+    return 1;
 }
 
 /**
@@ -4295,7 +4426,7 @@ static void emit_device_block(const TmOutDevice *device)
   * 发包头 -> 逐块发。条数必须先定：客户端按 count 收满才算完整包。
   *
   * 包内容（有实例才发，没有的类型一条 D 行都不发）：
-  *   CPU     : 每个插槽一块，含利用率 / 频率 / 拓扑 / 缓存 / 逐核利用率
+  *   CPU     : 永远一块，把所有物理处理器合并；含利用率 / 频率 / 拓扑 / 缓存 / 逐核利用率
   *   MEMORY  : 每个内存设备一块，这一版只有名称
   *   DISK    : 每块磁盘一块，这一版只有块名
   *   NETWORK : 每个网卡一块，这一版只有接口名
