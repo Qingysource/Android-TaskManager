@@ -85,6 +85,7 @@ import com.android.taskmanager.UserCredentialState
 import com.android.taskmanager.normalizeThemeMode
 
 import com.android.taskmanager.data.AndroidService
+import com.android.taskmanager.data.ProcessKey
 import com.android.taskmanager.data.LinuxService
 import com.android.taskmanager.data.LinuxControlCode
 import com.android.taskmanager.data.LinuxField
@@ -1777,13 +1778,34 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         val snapshot = linux.deviceSnapshot(linuxRequestTimeoutMs) ?: return
 
+        // Android 层的 SYSTEM 数据并进这一帧：AVF 支持只有 Framework 知道，
+        // Linux 那一份 SYSTEM 设备里没有这一格。取不到就保持 null —— 页面整行不出现，
+        // 不会显示成"AVF 支持：否"。
+        val merged = mergeAndroidSystem(snapshot)
+
         // 采样时刻在这里取：ELF 那边只回"当前值"，时间轴由本服务自己的点来排，
         // 不依赖跨进程的时钟，也不受一次往返耗时的抖动影响。
-        appendCpuUsagePoint(snapshot, SystemClock.elapsedRealtime())
+        appendCpuUsagePoint(merged, SystemClock.elapsedRealtime())
 
-        performanceLastSnapshot = snapshot
+        performanceLastSnapshot = merged
 
-        pushPerformanceSnapshot(snapshot)
+        pushPerformanceSnapshot(merged)
+    }
+
+    /**
+     * 把 Android 侧的 SYSTEM 设备字段并进设备快照帧。
+     *
+     * 为什么合并在 UIService：它是唯一聚合点（Linux / Android / 未来的 GPU 都在这里汇合），
+     * 页面只该看到"填好的那一帧"，不该自己再去问一遍服务。
+     *
+     * 现在只有一个字段（AVF 支持）。AndroidService 没起来 / 探测不到时原样返回，
+     * 帧里的 avfSupported 保持 null，页面据此判断"不显示这一行"。
+     */
+    private fun mergeAndroidSystem(snapshot: PerformanceSnapshot): PerformanceSnapshot {
+
+        val facts = AndroidService.instanceOrNull()?.systemFacts() ?: return snapshot
+
+        return snapshot.copy(avfSupported = facts.avfSupported)
     }
 
     /**
@@ -2416,16 +2438,37 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     /**
      * 把 Android 服务才能拿到的字段并进一行。
      *
-     * **当前是空实现**：AndroidService 还没有这套查询，这五格保持 Linux 侧给的
-     * `!NOT_AVAILABLE`（不是 0，也不是空白）——"没有这个数据"与"值是 0"必须分得开。
+     * 只补 Linux 侧**明确回 NOT_AVAILABLE** 的五格：
+     * package_name / target_sdk / description / android_priority / isolation。
+     * Linux 已经给出数值的列一概不碰 —— 重复采集等于白花一次 PackageManager 查询。
      *
-     * 将来在这里按 pid / uid 批量向 AndroidService 要
-     * package_name / target_sdk / description / android_priority / isolation，
-     * 覆盖 values 里对应的键即可：表结构、排序、列选择都不用改。
+     * 调用形态是"按 pid 单查"：AndroidService 与本服务同进程，
+     * 这一次调用不是 IPC、不走协议、没有序列化，查询本体是 uid 索引里的一次取值。
+     *
+     * 失败语义：AndroidService 没起来、进程没有应用身份、这一格本来就没有值，
+     * 一律**保持原样**（Linux 的 `—（暂无数据）`），绝不填 0 或空串冒充有值。
+     *
+     * @param values 已按 43 列铺好的显示值，就地覆盖
+     * @param record Linux 侧的原始行（pid / startTicks / uid 都是行身份的一部分）
      */
     private fun enrichWithAndroid(values: MutableMap<String, String>, record: LinuxProcessRecord) {
-        // TODO(Android 补字段)：批量查询后覆盖 values；
-        //  未实现前保留 Linux 侧的状态标记，别在这里填 "—" 或 "0" 冒充有值。
+
+        val android = AndroidService.instanceOrNull() ?: return
+
+        val supplement = android.queryProcess(
+            ProcessKey(
+                pid = record.pid,
+                startTicks = record.startTicks ?: -1L,
+                uid = record.uid
+            )
+        ) ?: return
+
+        // 只覆盖确实拿到了的格：null 的字段保持 Linux 的状态文案
+        supplement.packageName?.let { values[DetailColumnId.PACKAGE_NAME] = it }
+        supplement.targetSdk?.let { values[DetailColumnId.TARGET_SDK] = it.toString() }
+        supplement.description?.let { values[DetailColumnId.DESCRIPTION] = it }
+        supplement.androidPriority?.let { values[DetailColumnId.ANDROID_PRIORITY] = it.toString() }
+        supplement.isolation?.let { values[DetailColumnId.ISOLATION] = it }
     }
 
     /**

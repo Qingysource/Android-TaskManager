@@ -442,6 +442,15 @@ data class LinuxProcessRecord(
      */
     val startTicks: Long?
         get() = fields[LinuxProtocol.PROC_KEY_START_TICKS]?.toLongOrNull()
+
+    /**
+     * 进程属主 uid（P 行的 uid 扩展键，不进 43 列）。
+     *
+     * 用途是让 Android 侧把进程映射回应用（包名 / targetSdk / 应用描述）。
+     * 后端没带上来时为 null —— 这时 Android 侧无法定位应用，只能保留"暂无数据"。
+     */
+    val uid: Int?
+        get() = fields[LinuxProtocol.PROC_KEY_UID]?.toIntOrNull()
 }
 
 /**
@@ -588,6 +597,18 @@ object LinuxProtocol {
      * 所以服务端无条件输出它；客户端拿 [LinuxProcessRecord.startTicks] 直接读。
      */
     const val PROC_KEY_START_TICKS = "start_ticks"
+
+    /**
+     * P 行恒带的属主 uid 键。
+     *
+     * 与 [PROC_KEY_START_TICKS] 一样不占 43 位掩码：它是行元数据，
+     * 不是"表格要显示哪一列"。Android 侧靠它把进程换算成"哪个应用"的
+     * 包名 / targetSdk / 应用描述，所以后端采集相位就顺带 stat 一次属主并带上来。
+     *
+     * 取不到（目录刚消失、被 SELinux 挡住）时这个键整个不出现，
+     * 客户端按"这条行没有 uid"处理（[LinuxProcessRecord.uid] 为 null），绝不拿 0 顶替。
+     */
+    const val PROC_KEY_UID = "uid"
 
     /** 应答头解析结果（P 行还没到齐时先存着）。 */
     data class PacketHeader(

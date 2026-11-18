@@ -248,17 +248,24 @@ private fun cpuSummaryRows(
  *
  * 接口字段与 ELF 侧一一对应：处理器商品名与虚拟化方案由 ELF 后续实现，
  * 现在前者显示占位、后者显示"不支持"，不会被当成 0。
+ *
+ * "AVF 支持"这一行是**条件式**的：它属于 Android 层数据，只有明确支持才出现
+ * （在虚拟化与 L1 缓存之间），不支持与探测不到都直接不显示 —— 不存在"AVF 支持：否"。
  */
-private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, String>> = listOf(
-    "基准速度" to snapshot.cpuBaseText(),
-    "插槽" to snapshot.socketsText(),
-    "内核" to snapshot.coresText(),
-    "逻辑处理器" to snapshot.logicalCpusText(),
-    "虚拟化" to snapshot.virtualizationText(),
-    "L1 缓存" to snapshot.l1Text(),
-    "L2 缓存" to snapshot.l2Text(),
-    "L3 缓存" to snapshot.l3Text()
-)
+private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, String>> = buildList {
+
+    add("基准速度" to snapshot.cpuBaseText())
+    add("插槽" to snapshot.socketsText())
+    add("内核" to snapshot.coresText())
+    add("逻辑处理器" to snapshot.logicalCpusText())
+    add("虚拟化" to snapshot.virtualizationText())
+
+    snapshot.avfText()?.let { add("AVF 支持" to it) }
+
+    add("L1 缓存" to snapshot.l1Text())
+    add("L2 缓存" to snapshot.l2Text())
+    add("L3 缓存" to snapshot.l3Text())
+}
 
 /**
  * 图表菜单"复制"到底往剪贴板写什么：按当前硬件分发。
@@ -320,6 +327,10 @@ private fun cpuClipboardText(snapshot: PerformanceSnapshot, usageDecimals: Int):
         append("\n\t内核:\t").append(snapshot.coresText())
         append("\n\t逻辑处理器:\t").append(snapshot.logicalCpusText())
         append("\n\t虚拟化:\t").append(snapshot.virtualizationText())
+
+        // AVF 支持只在这一格"有"的时候才写：复制出来的文本不能凭空多一行"否"
+        snapshot.avfText()?.let { append("\n\tAVF 支持:\t").append(it) }
+
         append("\n\tL1 缓存:\t").append(snapshot.l1Text())
         append("\n\tL2 缓存:\t").append(snapshot.l2Text())
         append("\n\tL3 缓存:\t").append(snapshot.l3Text())

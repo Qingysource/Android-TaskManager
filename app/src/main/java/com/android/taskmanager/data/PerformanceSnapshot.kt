@@ -82,6 +82,18 @@ data class PerformanceSnapshot(
     /** 三级缓存总量（KB）；null = 这台机器没有 L3。 */
     val l3CacheKb: Int? = null,
 
+    /**
+     * AVF（Android Virtualization Framework）支持。
+     *
+     * 这一格属于 Android 层数据（由 UIService 从 AndroidService 的 SYSTEM 数据并进来），
+     * Linux 侧不知道它，所以 [from] 解析设备快照时永远是 null。
+     *
+     * 用法只有两种：true = 支持，页面显示"AVF 支持：是"；
+     * false / null = 一律**不出现这一行** —— 明确不支持与探测不到都按"不提供"处理，
+     * 界面不存在"AVF 支持：否"这种文案。
+     */
+    val avfSupported: Boolean? = null,
+
     /** 采到这一帧的时刻（SystemClock.elapsedRealtime），只用于判断"是不是新一帧"。 */
     val receivedAtMs: Long = 0L
 ) {
@@ -114,6 +126,14 @@ data class PerformanceSnapshot(
 
     /** 虚拟化：后端没报就当不支持。 */
     fun virtualizationText(): String = virtualization ?: "不支持"
+
+    /**
+     * AVF 支持文案：只有明确支持才给"是"。
+     *
+     * 返回 null = 页面整行不出现（明确不支持与探测不到都归这一类）。
+     * 调用方必须用 nullable 判断，不要拿"否"去凑一行。
+     */
+    fun avfText(): String? = if (avfSupported == true) "是" else null
 
     /** 开机时长：天:时:分:秒。 */
     fun uptimeText(): String {

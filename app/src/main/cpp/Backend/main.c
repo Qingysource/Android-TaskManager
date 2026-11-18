@@ -103,6 +103,10 @@
  *     - 行首 pid 与 start_ticks 是**行身份**，无条件输出、不占 43 位掩码：
  *       PID 会被系统复用，客户端必须两个一起比才认得出"还是不是同一个进程"，
  *       所以即使表格不显示它们，也必须每次都带；
+ *     - uid 也是行元数据（不进 43 位掩码）：它是 /proc/<pid> 目录属主。
+ *       Android 侧要拿它把进程映射回"哪个应用装的"（包名 / targetSdk / 应用描述），
+ *       而这一轮采集判 scope 时已经 stat 过属主，带上它不增加额外文件读取；
+ *       取不到（目录已消失或被 SELinux 挡住）时整个键都不输出，客户端按"没有"处理；
  *     - 之后按字段表顺序输出 `键=值`；
  *     - 值一律百分号编码：空格 %20、换行 %0A、回车 %0D、制表 %09、
  *       % 记 %25、= 记 %3D、! 记 %21；客户端解析后解码。
@@ -166,9 +170,10 @@
  *           rss / peak_rss / rss_delta / active_private_rss / private_rss / shared_rss /
  *           vss / page_faults / page_faults_delta / nice / fd_count / thread_count /
  *           io_read_count / io_write_count / io_read_bytes / io_write_bytes /
- *           exe_path / cmdline / selinux / platform / arch / is_admin / nx_protect
+ *           exe_path / cmdline / selinux / platform / arch / is_admin / nx_protect /
+ *           android_priority（= /proc/<pid>/oom_score_adj，见 field_text_of）
  *   - 归 Android 服务填（回 NOT_AVAILABLE）：package_name / target_sdk /
- *     description / android_priority / isolation
+ *     description / isolation
  *   - 本版没有（回 UNSUPPORTED）：cpu_cycles（要 perf_event_open）、四个 GPU 字段
  *   - cet_protect：只有 x86 内核的 status 才报 x86_Thread_features，arm64 回 UNSUPPORTED
  *   - 首轮没有基准时 cpu_usage / rss_delta / page_faults_delta 回 NO_BASELINE
@@ -607,6 +612,17 @@ typedef struct TmProcStat {
     /** 启动时刻（stat 第 22 字段，单位 clock ticks）：与 pid 一起才是进程身份。 */
     long long start_ticks;
 
+    /**
+     * 进程属主 uid（stat("/proc/<pid>") 的 st_uid）。
+     *
+     * 采集阶段只 stat 一次，同时用于三处：范围筛选（用户 / 系统）、
+     * `user` 字段的用户名解析、以及 P 行的 uid 扩展键（Android 侧按它映射包名）。
+     */
+    int uid;
+
+    /** uid 是否取到；false = 目录已消失或权限不够，P 行不输出 uid 键。 */
+    bool uid_known;
+
     /** 进程短名（stat 第 2 字段 comm）。 */
     char comm[TM_COMM_MAX];
 
@@ -1032,11 +1048,16 @@ static int compare_by_pid(const void *left, const void *right)
 }
 
 /**
- * 一个进程属于哪个范围。
+ * 一个进程属于哪个范围，并顺手把属主 uid 带出来。
  *
+ * 为什么要一起取：判范围要 stat("/proc/<pid>") 看属主，
+ * 而 P 行的 uid 扩展键要的正是同一个数字。
+ * 分成两个函数会在每个进程上多一次 stat，没有任何收益。
+ *
+ * @param out_uid 非 NULL 时写入目录属主 uid；返回 -1 时保持调用方原值
  * @return [TM_SCOPE_USER] / [TM_SCOPE_SYSTEM]；-1 = 目录 stat 不了（刚退出或权限不够），无法判定
  */
-static int process_scope_of(int pid)
+static int process_scope_of(int pid, int *out_uid)
 {
     char path[TM_PATH_MAX];
 
@@ -1048,13 +1069,19 @@ static int process_scope_of(int pid)
         return -1;
     }
 
+    if (out_uid != NULL) {
+        *out_uid = (int) info.st_uid;
+    }
+
     return ((long long) info.st_uid >= TM_UID_APP_START) ? TM_SCOPE_USER : TM_SCOPE_SYSTEM;
 }
 
 /**
  * 第一轮（mini）采样：遍历 /proc，每个进程只读一次 stat。
  *
- * @param scope 范围筛选；[TM_SCOPE_ALL] 时连属主 stat 都不做，零额外开销
+ * @param scope 范围筛选。选 USER / SYSTEM 时，属主 stat 是筛选本身；
+ *              选 ALL 时也会做这一次 stat —— 它同时供 P 行的 uid 扩展键使用，
+ *              每进程一次目录 stat 在整轮里只有毫秒级，换来 Android 侧能直接映射包名
  * @return 收录到的进程数；0 = /proc 打不开（几乎没有这种情况）
  */
 static int collect_snapshot(int scope)
@@ -1077,9 +1104,14 @@ static int collect_snapshot(int scope)
 
         int pid = (int) strtol(entry->d_name, NULL, 10);
 
-        // 筛选放在最前面：不合范围的进程连 stat 都不读，
+        // 属主 uid 与范围判定共用同一次 stat：既判"用户 / 系统"，
+        // 也留作 P 行的 uid 扩展键（安卓侧按它查包名、targetSdk、应用描述）。
+        int owner_uid = 0;
+        int owner_scope = process_scope_of(pid, &owner_uid);
+
+        // 筛选放在最前面：不合范围的进程连 stat 文件都不读，
         // 于是"包里的行"和"第二轮要补读的文件"一起省掉了。
-        if (scope != TM_SCOPE_ALL && process_scope_of(pid) != scope) {
+        if (scope != TM_SCOPE_ALL && owner_scope != scope) {
             continue;
         }
 
@@ -1099,6 +1131,11 @@ static int collect_snapshot(int scope)
         if (!parse_proc_stat(text, &item)) {
             continue;
         }
+
+        // parse_proc_stat 会 memset 整个结构，uid 必须在这之后回填：
+        // 它是采集阶段 stat 到的事实，不是 /proc/<pid>/stat 里的字段。
+        item.uid = owner_uid;
+        item.uid_known = (owner_scope >= 0);
 
         table_append(&g_snapshot, &item);
     }
@@ -1745,9 +1782,11 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
 
     if (strcmp(key, "user") == 0) {
 
-        int uid = 0;
+        // 属主 uid 采集阶段已经 stat 过（P 行那条 uid 扩展键就是它），
+        // 这里优先复用；只有采集时没取到，才补一次 stat。
+        int uid = cur->uid;
 
-        if (!proc_uid_of(cur->pid, &uid)) {
+        if (!cur->uid_known && !proc_uid_of(cur->pid, &uid)) {
             *out_status = TM_FIELD_STATUS_ACCESS_DENIED;
 
             return NULL;
@@ -1793,6 +1832,31 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
         }
 
         return text_result(out_status, second + 1);
+    }
+
+    if (strcmp(key, "android_priority") == 0) {
+
+        // Android 的进程优先级就是 LMK 口径的 oom_score_adj：
+        // 负数 = 越不容易被杀（前台 / 常驻），正数 = 越先被回收。
+        // 这一格必须由 Linux 侧读：Android Framework 只能看到自己的 importance，
+        // 别人的 oom_score_adj 恰恰是提权身份才有权限打开的文件。
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/proc/%d/oom_score_adj", cur->pid);
+
+        if (read_text_file(path, buffer, capacity) < 0) {
+            *out_status = TM_FIELD_STATUS_ACCESS_DENIED;
+
+            return NULL;
+        }
+
+        char *newline = strchr(buffer, '\n');
+
+        if (newline != NULL) {
+            *newline = '\0';
+        }
+
+        return text_result(out_status, buffer);
     }
 
     if (strcmp(key, "peak_rss") == 0) {
@@ -2108,6 +2172,13 @@ static void emit_process_row(const TmProcStat *cur, unsigned long long mask)
     // 掩码决定"表格显示哪几列"，身份是每行都必须有的元数据）。
     // PID 会被系统复用，客户端只比 pid 会认错成另一个进程。
     printf("P %d start_ticks=%lld", cur->pid, cur->start_ticks);
+
+    // 属主 uid：与 start_ticks 同样是行元数据，不占 43 位掩码。
+    // Android 侧靠它把 uid 换成包名 / targetSdk / 应用描述，
+    // 采集阶段已经 stat 过目录属主，这里只做输出，不再读 /proc。
+    if (cur->uid_known) {
+        printf(" uid=%d", cur->uid);
+    }
 
     // 第二轮：先把"多个字段共用"的文件读一份（掩码没点到就不读）
     load_extras(cur->pid, mask);

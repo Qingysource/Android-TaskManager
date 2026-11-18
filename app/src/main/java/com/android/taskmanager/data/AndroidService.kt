@@ -30,10 +30,13 @@ package com.android.taskmanager.data
 
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import com.android.taskmanager.UpstreamIdentityMode
 import com.android.taskmanager.service.RootManager
@@ -77,6 +80,18 @@ class AndroidService : Service() {
 
         /** 输出缓冲保留的行数（够调试页看清一次启动的全过程即可）。 */
         private const val KEEP_LINES = 40
+
+        /**
+         * uid 索引的软过期时间。
+         *
+         * 用户装 / 卸 / 更新应用后，索引最多这么久重建一次；
+         * 不挂系统广播是为了避开接收器导出标志的兼容问题（见 [ensureUidIndex]）。
+         */
+        private const val INDEX_TTL_MS = 60_000L
+
+        /** 隔离进程 uid 段的起止（AID_ISOLATED_START / AID_ISOLATED_END）。 */
+        private const val ISOLATED_UID_START = 99000
+        private const val ISOLATED_UID_END = 99999
 
         /** 当前运行的实例；未启动 / 已销毁时为 null。 */
         @Volatile
@@ -164,8 +179,25 @@ class AndroidService : Service() {
             record("跳过提权自检（当前不是提权模式）")
         }
 
+        // 预热 uid 索引：详细页把 Linux 行转表行时是同步调用本服务的 queryProcess，
+        // 第一次查询不该让调用方（很可能在刷新路径上）陪着 PackageManager 扫一遍全量包。
+        startUidIndexWarmUp()
+
         // 不粘连启动：进程被杀后不自动重建，避免后台服务被系统反复拉起
         return START_NOT_STICKY
+    }
+
+    /** 后台把 uid 索引建起来；失败不影响任何功能，查询时还会再试。 */
+    private fun startUidIndexWarmUp() {
+
+        Thread {
+
+            runCatching { ensureUidIndex() }
+
+        }.apply {
+            isDaemon = true
+            name = "TMAndroid-UidIndex"
+        }.start()
     }
 
     /**
@@ -184,6 +216,226 @@ class AndroidService : Service() {
 
         return "Android UID: ${Process.myUid()} | $identity"
     }
+
+    // ============================================================
+    // 进程补充查询（给详细信息页补 Linux 拿不到的那五格）
+    //
+    // 为什么是"按 pid 单查"而不是"把 Linux 的整份快照传进来"：
+    // Linux 的 P 行本来就是 /proc 的权威结果，再整表搬一次没有任何收益；
+    // 真正缺的只有 package_name / target_sdk / description /
+    // android_priority / isolation 这五格，一个进程查一次就够。
+    //
+    // 为什么不做防 PID 复用校验：Android 侧拿不到可靠的进程启动时刻，
+    // 硬校验只会把活着的进程判成"换了人"。startTicks 由调用方带着走、
+    // 原样回传，它只用于"把补充字段并回正确的行"，防复用由 Linux 侧保证。
+    //
+    // 线程：调用方（UIService 的采集线程）同步调用，本方法不派发、不回调。
+    // ============================================================
+
+    /**
+     * 查一个进程的 Android 侧补充字段。
+     *
+     * @param key pid + startTicks + uid；uid 来自 Linux P 行的 uid 扩展键
+     * @return 五格中能确定的那部分；查不到应用身份（uid 缺失 / 不是已装应用）返回 null
+     */
+    fun queryProcess(key: ProcessKey): ProcessSupplement? {
+
+        val uid = key.uid ?: return null
+
+        val facts = ensureUidIndex()[uid] ?: return null
+
+        // 隔离进程的 uid 由内核固定分配在 99000..99999（AID_ISOLATED_START..END）。
+        // 公开 API 只有"当前进程"版本的 Process.isIsolated()，按 uid 段判才看得到别人。
+        val isolated = uid in ISOLATED_UID_START..ISOLATED_UID_END
+
+        return ProcessSupplement(
+            packageName = facts.packageName,
+            targetSdk = facts.targetSdk,
+            description = facts.label,
+            // 进程调度优先级走 /proc/<pid>/oom_score_adj，归 Linux 侧读（它有权限），
+            // Android 侧看不到别的进程的 importance，这里不填，保持"暂无数据"
+            androidPriority = null,
+            isolation = if (isolated) "已隔离" else "未隔离"
+        )
+    }
+
+    /** uid -> 应用档案（建一次，查询时 O(1)）。 */
+    private data class AppFacts(
+        val packageName: String,
+        val targetSdk: Int,
+        val label: String?,
+        val isSystem: Boolean
+    )
+
+    private val uidIndexLock = Any()
+
+    @Volatile
+    private var uidIndex: Map<Int, AppFacts>? = null
+
+    @Volatile
+    private var uidIndexAtMs: Long = 0L
+
+    /**
+     * 拿 uid 索引，过期就重建。
+     *
+     * 为什么不挂 PACKAGE_ADDED 之类的广播：那要动态注册接收器，
+     * 还要处理"导出标志"在系统广播上的兼容问题；索引本身只要几毫秒，
+     * 用一分钟的软过期就够了 —— 用户装完应用，最迟一分钟后新进程就能认出包名。
+     */
+    private fun ensureUidIndex(): Map<Int, AppFacts> {
+
+        val cached = uidIndex
+
+        if (cached != null && SystemClock.elapsedRealtime() - uidIndexAtMs < INDEX_TTL_MS) {
+            return cached
+        }
+
+        synchronized(uidIndexLock) {
+
+            val again = uidIndex
+
+            if (again != null && SystemClock.elapsedRealtime() - uidIndexAtMs < INDEX_TTL_MS) {
+                return again
+            }
+
+            val built = buildUidIndex()
+
+            uidIndex = built
+            uidIndexAtMs = SystemClock.elapsedRealtime()
+
+            return built
+        }
+    }
+
+    /**
+     * 扫一遍已安装包，建 uid -> 应用档案。
+     *
+     * 注意这**不是**每个进程扫一次：整个索引只建一次，
+     * 之后五百个进程查询就是五百次 HashMap 取值，没有 PackageManager 开销。
+     *
+     * 同一 uid 可能对应多个包（共享 uid、应用分身）：优先保留非系统包，
+     * 都是非系统就保留先扫到的，保证同一个 uid 每次查到的包名稳定。
+     */
+    private fun buildUidIndex(): Map<Int, AppFacts> {
+
+        val result = HashMap<Int, AppFacts>(256)
+
+        val packages = runCatching {
+            packageManager.getInstalledPackages(0)
+        }.getOrNull() ?: return result
+
+        for (pkg in packages) {
+
+            val info = pkg.applicationInfo ?: continue
+
+            val isSystem = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+
+            val existing = result[info.uid]
+
+            if (existing != null && (!existing.isSystem || isSystem)) {
+                continue
+            }
+
+            val label = runCatching { info.loadLabel(packageManager)?.toString() }.getOrNull()
+
+            result[info.uid] = AppFacts(
+                packageName = pkg.packageName,
+                targetSdk = info.targetSdkVersion,
+                // 标签与包名相同时不重复显示：那一格留给"真正有描述"的应用
+                label = label?.trim()?.takeIf { it.isNotEmpty() && it != pkg.packageName },
+                isSystem = isSystem
+            )
+        }
+
+        record("应用索引就绪：${result.size} 个 uid / ${packages.size} 个包")
+
+        return result
+    }
+
+    // ============================================================
+    // SYSTEM 设备数据（Android 层）
+    //
+    // 这一组是"Linux 内核不知道、只有 Android Framework 能回答"的系统级事实，
+    // 对应设备快照里 type=SYSTEM 的那台设备。现在只有 AVF 支持一项。
+    //
+    // 为什么放在 Android 侧：AVF（Android Virtualization Framework）是 Framework
+    // 与 bootloader 共同决定的能力，/proc 与 sysfs 里没有可靠答案。
+    // ============================================================
+
+    /**
+     * 取 Android 层的 SYSTEM 设备字段。
+     *
+     * 结果只与设备固件有关，探测一次就缓存，不能每秒都起子进程读属性。
+     */
+    fun systemFacts(): AndroidSystemFacts = AndroidSystemFacts(
+        avfSupported = avfSupportedOrNull()
+    )
+
+    @Volatile
+    private var cachedAvfSupported: Boolean? = null
+
+    @Volatile
+    private var avfProbed: Boolean = false
+
+    /**
+     * 这台设备是否支持 AVF。
+     *
+     * 两条独立信号：
+     * 1) API 34 起有 `virtualization` 系统服务 —— 那是 AVF 对外的门面，
+     *    只有真支持 AVF 的设备才会注册它；
+     * 2) 属性 `ro.boot.hypervisor.vm.supported` —— AVF / pKVM 打开时由 bootloader 置 1。
+     *
+     * @return true = 支持；false = 明确不支持；null = 两条都问不出来（按"不提供"处理）
+     */
+    private fun avfSupportedOrNull(): Boolean? {
+
+        if (avfProbed) return cachedAvfSupported
+
+        synchronized(uidIndexLock) {
+
+            if (avfProbed) return cachedAvfSupported
+
+            val result = detectAvf()
+
+            cachedAvfSupported = result
+            avfProbed = true
+
+            record("AVF 探测：" + (result?.let { if (it) "支持" else "不支持" } ?: "未取到"))
+
+            return result
+        }
+    }
+
+    /** 真正的探测：先问系统服务，再退到 bootloader 属性。 */
+    private fun detectAvf(): Boolean? {
+
+        // 用字符串取名而不是常量：常量是 API 34 才有的，老设备编译期用不到
+        if (Build.VERSION.SDK_INT >= 34) {
+
+            val service = runCatching { getSystemService("virtualization") }.getOrNull()
+
+            if (service != null) return true
+        }
+
+        val property = readSystemProperty("ro.boot.hypervisor.vm.supported")
+
+        if (property != null) return property == "1"
+
+        return null
+    }
+
+    /** 读一条系统属性；读不到（命令不存在、被拦）返回 null，空值也算没读到。 */
+    private fun readSystemProperty(name: String): String? = runCatching {
+
+        val process = Runtime.getRuntime().exec(arrayOf("getprop", name))
+
+        val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
+
+        process.waitFor()
+
+        text.ifEmpty { null }
+
+    }.getOrNull()
 
     /** 最近的输出快照（UIService.upstreamOutput() 调它）。 */
     fun outputSnapshot(): String = synchronized(lineLock) {
@@ -324,3 +576,53 @@ class AndroidService : Service() {
         }
     }
 }
+
+// ============================================================
+// 进程补充查询的数据形状（同进程直连，不走文本协议）
+// ============================================================
+
+/**
+ * 一次进程补充查询的键。
+ *
+ * @param pid        Linux P 行行首的进程号
+ * @param startTicks 同一行的 start_ticks（0 合法、-1 未知）。
+ *                   只用于让调用方把补充字段并回"哪一行"，本服务不解析、不校验 ——
+ *                   Android 侧拿不到可靠的进程启动时刻，硬校验会把活着的进程判成换了人；
+ *                   防 PID 复用由 Linux 侧的 pid + start_ticks 保证
+ * @param uid        同一行的 uid 扩展键；null = 后端没取到，此时无法定位到应用
+ */
+data class ProcessKey(
+    val pid: Int,
+    val startTicks: Long,
+    val uid: Int? = null
+)
+
+/**
+ * Android 侧补出来的五格（Linux 那侧回的都是 NOT_AVAILABLE）。
+ *
+ * 每个字段 null = 这一格 Android 也给不出（例如 native daemon 没有应用身份），
+ * 调用方必须保留 Linux 的"暂无数据"，绝不填 0 或空串冒充有值。
+ */
+data class ProcessSupplement(
+    val packageName: String? = null,
+    val targetSdk: Int? = null,
+    val description: String? = null,
+    val androidPriority: Int? = null,
+    val isolation: String? = null
+)
+
+/**
+ * Android 层的 SYSTEM 设备字段。
+ *
+ * 对应设备快照里 type=SYSTEM 的那台设备：Linux 内核不知道、只有 Framework 能回答的
+ * 系统级事实。现在只有 AVF 一项，以后开新字段就往这里加，
+ * 由 UIService 合并到性能页那一帧（页面只判"有没有值"）。
+ */
+data class AndroidSystemFacts(
+    /**
+     * true = 支持 AVF；false / null = 都不显示这一行。
+     *
+     * 用户明确要求：只有"显示"与"不提供"两种状态，界面不存在"AVF 支持：否"。
+     */
+    val avfSupported: Boolean? = null
+)
