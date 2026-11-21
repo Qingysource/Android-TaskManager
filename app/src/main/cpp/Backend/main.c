@@ -67,13 +67,16 @@
  *     参数：无（掩码写 0x0）。
  *     应答：PKG 的 count = 随后的 I 行条数（这次没有 P 行），然后一组 I 行：
  *       cpu_usage_percent / cpu_speed_mhz / cpu_base_mhz / cpu_name /
- *       virtualization / process_count / thread_count / fd_count /
+ *       virtualization / is_vm / process_count / thread_count / fd_count /
  *       uptime_seconds / sockets / cores / logical_cpus /
  *       l1_cache_kb / l2_cache_kb / l3_cache_kb
  *     没值的项发 `I key=!状态`（UNSUPPORTED / NOT_AVAILABLE / NO_BASELINE），
  *     客户端按"这一格没数据"处理，绝不当作 0。
- *     cpu_name（处理器商品名）与 virtualization（虚拟化方案）由 ELF 这一侧后续补实现，
- *     现在固定回 UNSUPPORTED，客户端会把这两格显示成占位内容。
+ *     cpu_name（处理器商品名）由 ELF 这一侧后续补实现，现在固定回 UNSUPPORTED。
+ *     virtualization 的取值是"整串状态"，客户端不做加工直接显示：
+ *       不支持 / 已禁用 / 已启用(Gunyah) / 已启用(KVM) / 已启用(GenieZone) / 已启用(Halla)
+ *     判定见 probe_virtualization_internal（只看 /dev 节点）。
+ *     is_vm 恒为 0：客户端见到 1 才显示"虚拟机"，见到 0 时虚拟化与 AVF 两行才显示。
  *
  * 未知 typeCode → status=UNSUPPORTED + I error=unsupported request type N。
  *
@@ -234,11 +237,24 @@
 /**
  * 设备快照：一次抓齐整机各硬件的当前状态，按设备集合发送。
  *
- * 请求 `REQ <seq> 5 0x0`，无附加参数；应答由 D 行（设备头）与 F 行（设备字段）组成，
- * 所以包头的 count = 随后的 D 行与 F 行总条数（不是 0）——客户端按 count 收满才算完整包。
+ * 请求 `REQ <seq> 5 0x0 [键=值 ...]`。第四段之后的都是**本帧上下文参数**，
+ * 由上层把只有应用层才知道的设备事实带进来（目前是 SoC 型号 / 厂商 / 名称库路径，
+ * 后续给虚拟化与 AVF 这类字段留位）。值里不能有空格，特殊字符写成 %XX。
+ * 一个参数都不带也能正常出快照，只是用上一次的上下文。
+ *
+ * 应答由 D 行（设备头）与 F 行（设备字段）组成，所以包头的 count = 随后的
+ * D 行与 F 行总条数（不是 0）——客户端按 count 收满才算完整包。
  * 没有某类设备就不发它的 D 行，客户端据此知道这一类型没有实例。
  */
 #define TM_REQ_DEVICE_SNAPSHOT 5
+
+/**
+ * 设备快照请求最多收几个附加参数（`键=值`）。
+ *
+ * 目前用到三个键（soc_model / soc_manufacturer / cpu_name_db，最后一个可给两次），
+ * 留出余量给后续 Android 侧的设备字段，比如虚拟化与 AVF 这类只有应用层才知道的信息。
+ */
+#define TM_DEVICE_CONTEXT_ARGUMENT_MAX 12
 
 /** 设备快照 CPU 利用率的最短采样间隔（毫秒）：两轮 /proc/stat 挨太近，算出来的百分比全是噪声。 */
 #define TM_DEVICE_CPU_SAMPLE_MS 200
@@ -3920,7 +3936,12 @@ static bool value_after_colon(const char *line, char *out, int capacity)
 /**
  * 在 /proc/cpuinfo 的一行里按空白分隔找 token，用于判断 flags 里有没有 vmx / svm / virt。
  * 必须卡边界：直接 strstr 会把 virtualization 里的 virt 也算成扩展支持。
+ *
+ * 目前没有调用点（虚拟化探测已改成只看 /dev 节点，见 probe_virtualization_internal），
+ * 保留是因为以后若要判"硬件支持但内核没启用"还会用它；
+ * unused 属性只是压掉 -Wunused-function 的告警，不代表它不该留。
  */
+__attribute__((unused))
 static bool flags_has_token(const char *line, const char *token)
 {
     size_t length = strlen(token);
@@ -3946,71 +3967,668 @@ static bool flags_has_token(const char *line, const char *token)
     return false;
 }
 
+// ============================================================
+// SoC 名称库（CPUNAME.txt）与厂商规范化
+// ============================================================
+//
+// 内核给的名字经常不能用：ARM 设备的 /proc/cpuinfo 里 Hardware 可能是空的，
+// 也可能只写一个 cpu。这种时候改走 Android 侧读到的 SoC 型号：
+//   ro.soc.model          SM8635
+//   ro.soc.manufacturer   QTI
+// 这两个值连同名称库路径，都由 Kotlin 侧在**每次设备快照请求**里带进来
+// （见文件头第二节的 typeCode=5 附加参数），不再走进程启动参数：
+// 这样设备模型只有一个维护入口，上层数据随时能刷新，本进程也不必重启。
+//
+// 本块只做三件事：查库、规范化厂商、拼最终展示名。
+// 不读系统属性、不猜平台 —— 型号与厂商都是别人给的事实。
+
 /**
- * 内部探测：从 /proc/cpuinfo 取处理器商品名（ARM 用 Hardware，x86 用 model name）。
+ * 名称库路径（请求键 cpu_name_db，最多两个）。
  *
- * 只读一次并缓存：这个名字开机期间不会变，每帧读 /proc/cpuinfo 没必要。
- * 读不到就返回 UNSUPPORTED，让外部实现去补；不要编造。
+ * Kotlin 侧会同时给两份：外部私有目录一份（shell / root 身份读得到），
+ * 应用内部 files 目录一份（应用自身身份读得到）。
+ * 查表时按给的顺序试，第一个读得开的为准 —— 换身份起进程也不需要换路径。
+ */
+static char g_cpu_name_database[2][TM_PATH_MAX];
+
+/** 实际给了几条名称库路径（0 = 没有库，只能回退 厂商 + 大写型号）。 */
+static int g_cpu_name_database_count = 0;
+
+/** SoC 型号标识（请求键 soc_model），比较时不分大小写，回退拼名时转大写。 */
+static char g_soc_model[TM_OUT_VALUE_MAX] = {0};
+
+/** SoC 厂商原始值（请求键 soc_manufacturer），可能形如 QTI / QCOM / MTK / SAMSUNG。 */
+static char g_soc_manufacturer[TM_OUT_VALUE_MAX] = {0};
+
+/**
+ * 上下文是否变过（名称探测的缓存失效标记）。
+ *
+ * 快照每帧都会把这三个值带上，但值本身开机不会变；逐帧重读 cpuinfo 与库文件
+ * 纯属浪费，所以只在值真的换了才让下次探测重算。
+ */
+static bool g_cpu_name_context_dirty = true;
+
+/**
+ * ASCII 小写。
+ * 只认 A-Z：型号与厂商都是 ASCII，中文名字里的字节原样返回，不会被改坏。
+ */
+static char ascii_lower(char c)
+{
+    if (c >= 'A' && c <= 'Z') {
+        return (char) (c + ('a' - 'A'));
+    }
+
+    return c;
+}
+
+/** ASCII 大写，规则同上。 */
+static char ascii_upper(char c)
+{
+    if (c >= 'a' && c <= 'z') {
+        return (char) (c - ('a' - 'A'));
+    }
+
+    return c;
+}
+
+/**
+ * 一个十六进制字符转数值（大小写都认）。
+ *
+ * 只给请求参数的百分号转义用；不是十六进制字符返回 -1。
+ */
+static int ascii_hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return (int) (c - '0');
+    }
+
+    if (c >= 'a' && c <= 'f') {
+        return (int) (c - 'a') + 10;
+    }
+
+    if (c >= 'A' && c <= 'F') {
+        return (int) (c - 'A') + 10;
+    }
+
+    return -1;
+}
+
+/** 两个字符串忽略大小写是否相等；任一为 NULL 都不相等。 */
+static bool text_equal_ignore_case(const char *left, const char *right)
+{
+    if (left == NULL || right == NULL) {
+        return false;
+    }
+
+    while (*left != '\0' && *right != '\0') {
+
+        if (ascii_lower(*left) != ascii_lower(*right)) {
+            return false;
+        }
+
+        left++;
+        right++;
+    }
+
+    return *left == *right;
+}
+
+/**
+ * 内核给的这行字是不是一个「能给人看的」处理器名。
+ *
+ * 空、纯空白、cpu、unknown、armv8、0x0 都算没拿到 —— 安卓设备上这些值很常见，
+ * 直接显示出来比显示占位还难看，所以一律当作失败，交给 SoC 那一套去补。
+ */
+static bool cpu_name_is_usable(const char *text)
+{
+    if (text == NULL) {
+        return false;
+    }
+
+    while (*text == ' ' || *text == '\t') {
+        text++;
+    }
+
+    if (*text == '\0') {
+        return false;
+    }
+
+    char trimmed[TM_OUT_VALUE_MAX];
+
+    snprintf(trimmed, sizeof(trimmed), "%s", text);
+
+    size_t length = strlen(trimmed);
+
+    while (length > 0) {
+
+        char tail = trimmed[length - 1];
+
+        if (tail != ' ' && tail != '\t' && tail != '\n' && tail != '\r') {
+            break;
+        }
+
+        trimmed[--length] = '\0';
+    }
+
+    if (length == 0) {
+        return false;
+    }
+
+    if (text_equal_ignore_case(trimmed, "cpu")
+        || text_equal_ignore_case(trimmed, "unknown")
+        || text_equal_ignore_case(trimmed, "armv8")
+        || text_equal_ignore_case(trimmed, "armv7")
+        || text_equal_ignore_case(trimmed, "0x0")) {
+
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * 在 CPUNAME.txt 里按型号查商品名。
+ *
+ * 文件格式（UTF-8，一型号一行）：
+ *   型号 展示名
+ * 例如：
+ *   sm8635 Qualcomm(R) Snapdragon(R) 8s Gen 3
+ * 约定：# 开头是注释，空行忽略，型号不分大小写，
+ * 第一个空格之后的整段（含空格）都是展示名。
+ *
+ * @param model     要查的型号，例如 SM8635
+ * @param out       查到的展示名（调用方给的缓冲）
+ * @param capacity  out 的字节数
+ * @return true = 命中，out 里是展示名；false = 没库 / 读不了 / 没这个型号
+ */
+static bool cpu_name_database_lookup(const char *model, char *out, size_t capacity)
+{
+    out[0] = '\0';
+
+    if (g_cpu_name_database_count == 0 || model == NULL || model[0] == '\0') {
+        return false;
+    }
+
+    for (int file_index = 0; file_index < g_cpu_name_database_count; file_index++) {
+
+        const char *path = g_cpu_name_database[file_index];
+
+        if (path[0] == '\0' || access(path, R_OK) != 0) {
+            continue;
+        }
+
+        FILE *file = fopen(path, "r");
+
+        if (file == NULL) {
+            continue;
+        }
+
+        char line[512];
+        bool found = false;
+
+        while (!found && fgets(line, sizeof(line), file) != NULL) {
+
+        size_t length = strlen(line);
+
+        while (length > 0) {
+
+            char tail = line[length - 1];
+
+            if (tail != '\n' && tail != '\r') {
+                break;
+            }
+
+            line[--length] = '\0';
+        }
+
+        char *cursor = line;
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+
+        if (*cursor == '\0' || *cursor == '#') {
+            continue;
+        }
+
+        // 第一段是型号
+        char *token_start = cursor;
+
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+            cursor++;
+        }
+
+        char token[64];
+        size_t token_length = (size_t) (cursor - token_start);
+
+        if (token_length == 0 || token_length >= sizeof(token)) {
+            continue;
+        }
+
+        memcpy(token, token_start, token_length);
+
+        token[token_length] = '\0';
+
+        if (!text_equal_ignore_case(token, model)) {
+            continue;
+        }
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+
+        if (*cursor == '\0') {
+            continue;
+        }
+
+        snprintf(out, capacity, "%s", cursor);
+
+        found = true;
+        }
+
+        fclose(file);
+
+        if (found) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 规范厂商名：QTI / QCOM / Qualcomm 统一成 Qualcomm(R)，MTK 统一成 MediaTek。
+ *
+ * (R) 用半角括号写在名字里，不依赖字体里的 ® 字形：
+ * 这一层的输出要进复制文本、要进等宽显示，纯 ASCII 最稳。
+ * 认不出来的厂商原样保留 —— 不要给它硬套一个商标。
+ */
+static void normalize_soc_manufacturer(const char *manufacturer, char *out, size_t capacity)
+{
+    out[0] = '\0';
+
+    if (manufacturer == NULL || manufacturer[0] == '\0') {
+        return;
+    }
+
+    if (text_equal_ignore_case(manufacturer, "QTI")
+        || text_equal_ignore_case(manufacturer, "QCOM")
+        || text_equal_ignore_case(manufacturer, "Qualcomm")
+        || text_equal_ignore_case(manufacturer, "Qualcomm Technologies, Inc")) {
+
+        snprintf(out, capacity, "%s", "Qualcomm(R)");
+
+        return;
+    }
+
+    if (text_equal_ignore_case(manufacturer, "MTK")
+        || text_equal_ignore_case(manufacturer, "MediaTek")) {
+
+        snprintf(out, capacity, "%s", "MediaTek");
+
+        return;
+    }
+
+    if (text_equal_ignore_case(manufacturer, "SAMSUNG")) {
+
+        snprintf(out, capacity, "%s", "Samsung");
+
+        return;
+    }
+
+    if (text_equal_ignore_case(manufacturer, "GOOGLE")) {
+
+        snprintf(out, capacity, "%s", "Google");
+
+        return;
+    }
+
+    snprintf(out, capacity, "%s", manufacturer);
+}
+
+/**
+ * 拼 SoC 的最终展示名。
+ *
+ * 顺序：
+ *   1. 名称库命中 → 直接用库里的商品名（Qualcomm(R) Snapdragon(R) 8s Gen 3）；
+ *   2. 没命中 → 规范化厂商 + 空格 + 大写型号（Qualcomm(R) SM8635）；
+ *   3. 厂商也没有 → 只给大写型号。
+ *
+ * @return false = 连型号都没有，调用方按没数据发出去
+ */
+static bool build_soc_display_name(char *out, size_t capacity)
+{
+    out[0] = '\0';
+
+    if (g_soc_model[0] == '\0') {
+        return false;
+    }
+
+    if (cpu_name_database_lookup(g_soc_model, out, capacity)) {
+        return true;
+    }
+
+    char manufacturer[TM_OUT_VALUE_MAX];
+
+    normalize_soc_manufacturer(g_soc_manufacturer, manufacturer, sizeof(manufacturer));
+
+    char model_upper[TM_OUT_VALUE_MAX];
+
+    size_t length = strlen(g_soc_model);
+
+    if (length >= sizeof(model_upper)) {
+        length = sizeof(model_upper) - 1;
+    }
+
+    for (size_t index = 0; index < length; index++) {
+        model_upper[index] = ascii_upper(g_soc_model[index]);
+    }
+
+    model_upper[length] = '\0';
+
+    if (manufacturer[0] != '\0') {
+
+        snprintf(out, capacity, "%s %s", manufacturer, model_upper);
+
+    } else {
+
+        snprintf(out, capacity, "%s", model_upper);
+    }
+
+    return out[0] != '\0';
+}
+
+/**
+ * 把请求里的一项取值解码出来。
+ *
+ * 协议用空格分字段，所以值里不能有空格：客户端把空格、百分号、等号写成 %XX，
+ * 这里只认 %XX 一种转义，其余字符原样搬。
+ *
+ * @param input    键名之后的部分（可能为空）
+ * @param out      解码结果
+ * @param capacity out 的字节数；超长的尾部丢弃，不截半个转义序列
+ */
+static void decode_request_value(const char *input, char *out, size_t capacity)
+{
+    if (out == NULL || capacity == 0) {
+        return;
+    }
+
+    size_t used = 0;
+
+    for (const char *cursor = input; cursor != NULL && *cursor != '\0' && used + 1 < capacity; cursor++) {
+
+        if (*cursor == '%' && cursor[1] != '\0' && cursor[2] != '\0') {
+
+            int high = ascii_hex_digit(cursor[1]);
+            int low = ascii_hex_digit(cursor[2]);
+
+            if (high >= 0 && low >= 0) {
+
+                out[used++] = (char) (high * 16 + low);
+
+                cursor += 2;
+
+                continue;
+            }
+        }
+
+        out[used++] = *cursor;
+    }
+
+    out[used] = '\0';
+}
+
+/**
+ * 接收一次设备快照请求的附加参数，刷新设备模型的 Android 层事实。
+ *
+ * 键名（都不含空格，值按百分号转义）：
+ *   soc_model=SM8635
+ *   soc_manufacturer=QTI
+ *   cpu_name_db=<名称库绝对路径>      可给两次，按出现顺序试
+ *   refresh_names=1                  只清名称缓存，不改上下文（进性能页那一下用）
+ *
+ * 语义是"请求即权威"：这次请求给了上下文键，就以它为全集重建 ——
+ * 没给 soc_manufacturer 说明上层这次没拿到厂商，那就按没有处理，
+ * 不沿用上一次的旧值（否则旧的错误值会一直粘着）。
+ *
+ * 上下文键一个都没带时什么都不改：老客户端、或只带 refresh_names 的请求，
+ * 都保持上次上下文，不能把已有的库路径冲掉。
+ *
+ * @param arguments      附加参数数组，形如 键=值
+ * @param argument_count 数组长度
+ */
+static void apply_device_context(const char *const *arguments, int argument_count)
+{
+    if (arguments == NULL || argument_count <= 0) {
+        return;
+    }
+
+    static const char *const k_model_key = "soc_model";
+    static const char *const k_manufacturer_key = "soc_manufacturer";
+    static const char *const k_database_key = "cpu_name_db";
+    static const char *const k_refresh_key = "refresh_names";
+
+    char model[TM_OUT_VALUE_MAX];
+    char manufacturer[TM_OUT_VALUE_MAX];
+    char database[2][TM_PATH_MAX];
+
+    model[0] = '\0';
+    manufacturer[0] = '\0';
+
+    int database_count = 0;
+
+    // 这次请求有没有带"上下文"键（三条真数据）；refresh_names 不算
+    bool context_given = false;
+
+    bool refresh_requested = false;
+
+    for (int index = 0; index < argument_count; index++) {
+
+        const char *item = arguments[index];
+
+        if (item == NULL) {
+            continue;
+        }
+
+        const char *separator = strchr(item, '=');
+
+        if (separator == NULL || separator == item) {
+            continue;
+        }
+
+        size_t key_length = (size_t) (separator - item);
+
+        const char *value = separator + 1;
+
+        if (key_length == strlen(k_model_key) && strncmp(item, k_model_key, key_length) == 0) {
+
+            decode_request_value(value, model, sizeof(model));
+
+            context_given = true;
+
+            continue;
+        }
+
+        if (key_length == strlen(k_manufacturer_key)
+            && strncmp(item, k_manufacturer_key, key_length) == 0) {
+
+            decode_request_value(value, manufacturer, sizeof(manufacturer));
+
+            context_given = true;
+
+            continue;
+        }
+
+        if (key_length == strlen(k_database_key) && strncmp(item, k_database_key, key_length) == 0) {
+
+            if (database_count < (int) (sizeof(database) / sizeof(database[0]))) {
+
+                decode_request_value(value, database[database_count], sizeof(database[0]));
+
+                database_count++;
+
+                context_given = true;
+            }
+
+            continue;
+        }
+
+        if (key_length == strlen(k_refresh_key) && strncmp(item, k_refresh_key, key_length) == 0) {
+
+            // 只认 1：其它值当作没提出要求，免得客户端误传把缓存一直刷掉
+            if (value[0] == '1' && value[1] == '\0') {
+                refresh_requested = true;
+            }
+        }
+    }
+
+    // 要求重算的场合：只清名称缓存，不动上下文
+    if (refresh_requested) {
+        g_cpu_name_context_dirty = true;
+    }
+
+    // 没带上下文键：除了上面那一下，什么都不改
+    if (!context_given) {
+        return;
+    }
+
+    // 值没变就不动缓存：快照逐帧都带这几个键，没必要每帧重新读 cpuinfo 与库文件
+    bool changed = strcmp(model, g_soc_model) != 0
+                   || strcmp(manufacturer, g_soc_manufacturer) != 0
+                   || database_count != g_cpu_name_database_count;
+
+    for (int index = 0; index < database_count && !changed; index++) {
+
+        if (strcmp(database[index], g_cpu_name_database[index]) != 0) {
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    snprintf(g_soc_model, sizeof(g_soc_model), "%s", model);
+
+    snprintf(g_soc_manufacturer, sizeof(g_soc_manufacturer), "%s", manufacturer);
+
+    g_cpu_name_database_count = database_count;
+
+    for (int index = 0; index < database_count; index++) {
+
+        snprintf(g_cpu_name_database[index], sizeof(g_cpu_name_database[0]), "%s",
+                 database[index]);
+    }
+
+    for (int index = database_count;
+         index < (int) (sizeof(g_cpu_name_database) / sizeof(g_cpu_name_database[0])); index++) {
+
+        g_cpu_name_database[index][0] = '\0';
+    }
+
+    g_cpu_name_context_dirty = true;
+}
+
+/**
+ * 内部探测：处理器商品名。
+ *
+ * 两条来源，按顺序试：
+ *   1. 内核的 /proc/cpuinfo（ARM 看 Hardware，x86 看 model name）；
+ *      这个值不像名字（空 / cpu / unknown / armv8）就当没拿到；
+ *   2. Android 的 SoC 型号 + 名称库：先查 CPUNAME.txt，再回退 厂商 + 大写型号。
+ *
+ * 内核名恰好就是 SoC 型号时，也先拿它查一次库 —— 很多安卓设备只报 SM8635 这种，
+ * 库里有商品名就该显示商品名，而不是把型号直接摆出来。
+ *
+ * 只读一次并缓存：同一份上下文里名字不会变，每帧读文件没必要；
+ * 上下文换过（apply_device_context 标记 dirty）才重算。
  */
 static TmQueryValue probe_cpu_name_internal(void)
 {
     static bool probed = false;
     static TmQueryValue cached;
 
-    if (probed) {
+    if (probed && !g_cpu_name_context_dirty) {
         return cached;
     }
 
     probed = true;
 
+    g_cpu_name_context_dirty = false;
+
     cached = query_value_none(TM_QUERY_UNSUPPORTED);
+
+    char hardware[TM_OUT_VALUE_MAX];
+    char model_name[TM_OUT_VALUE_MAX];
+
+    hardware[0] = '\0';
+    model_name[0] = '\0';
+
+    bool cpuinfo_read = false;
 
     FILE *file = fopen("/proc/cpuinfo", "r");
 
-    if (file == NULL) {
+    if (file != NULL) {
 
-        cached = query_value_none(TM_QUERY_READ_FAILED);
+        cpuinfo_read = true;
+
+        char line[256];
+
+        while (fgets(line, sizeof(line), file) != NULL) {
+
+            char value[TM_OUT_VALUE_MAX];
+
+            if (hardware[0] == '\0' && strncmp(line, "Hardware", 8) == 0
+                && value_after_colon(line, value, (int) sizeof(value))) {
+
+                snprintf(hardware, sizeof(hardware), "%s", value);
+
+                continue;
+            }
+
+            if (model_name[0] == '\0' && strncmp(line, "model name", 10) == 0
+                && value_after_colon(line, value, (int) sizeof(value))) {
+
+                snprintf(model_name, sizeof(model_name), "%s", value);
+            }
+        }
+
+        fclose(file);
+    }
+
+    // ARM 的 Hardware 是 SoC 名，比 model name 更贴近处理器商品名
+    const char *kernel_name = hardware[0] != '\0' ? hardware : model_name;
+
+    if (cpu_name_is_usable(kernel_name)) {
+
+        char friendly[TM_OUT_VALUE_MAX];
+
+        if (cpu_name_database_lookup(kernel_name, friendly, sizeof(friendly))) {
+
+            cached = query_value_text(TM_QUERY_OK, friendly);
+
+        } else {
+
+            cached = query_value_text(TM_QUERY_OK, kernel_name);
+        }
 
         return cached;
     }
 
-    char hardware[TM_OUT_VALUE_MAX];
-    char model[TM_OUT_VALUE_MAX];
+    // 内核没给可用名字：交给 SoC 那一套补
+    char soc_name[TM_OUT_VALUE_MAX];
 
-    hardware[0] = '\0';
-    model[0] = '\0';
+    if (build_soc_display_name(soc_name, sizeof(soc_name))) {
 
-    char line[256];
+        cached = query_value_text(TM_QUERY_OK, soc_name);
 
-    while (fgets(line, sizeof(line), file) != NULL) {
-
-        char value[TM_OUT_VALUE_MAX];
-
-        if (hardware[0] == '\0' && strncmp(line, "Hardware", 8) == 0
-            && value_after_colon(line, value, (int) sizeof(value))) {
-
-            snprintf(hardware, sizeof(hardware), "%s", value);
-
-            continue;
-        }
-
-        if (model[0] == '\0' && strncmp(line, "model name", 10) == 0
-            && value_after_colon(line, value, (int) sizeof(value))) {
-
-            snprintf(model, sizeof(model), "%s", value);
-        }
+        return cached;
     }
 
-    fclose(file);
-
-    // ARM 的 Hardware 是 SoC 名，比 model name 更贴近处理器商品名
-    if (hardware[0] != '\0') {
-
-        cached = query_value_text(TM_QUERY_OK, hardware);
-
-    } else if (model[0] != '\0') {
-
-        cached = query_value_text(TM_QUERY_OK, model);
+    // 两边都没拿到：cpuinfo 都打不开就报读失败，否则就是这台机器没这项信息
+    if (!cpuinfo_read) {
+        cached = query_value_none(TM_QUERY_READ_FAILED);
     }
 
     return cached;
@@ -4019,11 +4637,19 @@ static TmQueryValue probe_cpu_name_internal(void)
 /**
  * 内部探测：虚拟化方案。
  *
- * 判断顺序：
- * 1. /dev/kvm 存在 = 内核已经启用 KVM，报 已启用(KVM)；
- * 2. cpuinfo 的 flags 里有 vmx / svm / virt = 硬件支持，但没看到 /dev/kvm，
- *    报 已禁用(硬件支持，内核未启用)；
- * 3. 都探不到就返回 UNSUPPORTED，交给外部实现判断 —— 不要武断说 不支持。
+ * 只看内核暴露出来的虚拟化字符设备，按平台惯例取第一个存在的：
+ *   /dev/gunyah → Gunyah（Qualcomm）
+ *   /dev/kvm    → KVM（含 pKVM 形态，Google Pixel 等）
+ *   /dev/gzvm   → GenieZone（MediaTek）
+ *   /dev/halla  → Halla（Samsung Exynos）
+ * 一个都没有 = 不支持。
+ *
+ * 为什么不再看 /proc/cpuinfo 的 vmx / svm / virt 去报"已禁用"：
+ * 这一版没有可靠办法区分"硬件根本没有虚拟化"与"有但内核没启用"，
+ * 与其猜一个状态，不如直接说 不支持。已禁用 这个描述留给外部实现
+ * （真的有能力判断时由 query_virtualization_external 返回）。
+ *
+ * 返回值形如 `已启用(KVM)`，整串直接作为字段值发出去，客户端不做加工。
  */
 static TmQueryValue probe_virtualization_internal(void)
 {
@@ -4036,46 +4662,36 @@ static TmQueryValue probe_virtualization_internal(void)
 
     probed = true;
 
-    cached = query_value_none(TM_QUERY_UNSUPPORTED);
+    static const char *const k_paths[] = {
+        "/dev/gunyah",
+        "/dev/kvm",
+        "/dev/gzvm",
+        "/dev/halla",
+    };
 
-    if (access("/dev/kvm", F_OK) == 0) {
+    static const char *const k_names[] = {
+        "Gunyah",
+        "KVM",
+        "GenieZone",
+        "Halla",
+    };
 
-        cached = query_value_text(TM_QUERY_OK, "已启用(KVM)");
+    for (size_t index = 0; index < sizeof(k_paths) / sizeof(k_paths[0]); index++) {
 
-        return cached;
-    }
-
-    FILE *file = fopen("/proc/cpuinfo", "r");
-
-    if (file == NULL) {
-        return cached;
-    }
-
-    char line[256];
-
-    bool hardware_support = false;
-
-    while (fgets(line, sizeof(line), file) != NULL) {
-
-        if (strncmp(line, "flags", 5) != 0 && strncmp(line, "Features", 8) != 0) {
+        if (access(k_paths[index], F_OK) != 0) {
             continue;
         }
 
-        if (flags_has_token(line, "vmx") || flags_has_token(line, "svm")
-            || flags_has_token(line, "virt")) {
+        char text[64];
 
-            hardware_support = true;
+        snprintf(text, sizeof(text), "已启用(%s)", k_names[index]);
 
-            break;
-        }
+        cached = query_value_text(TM_QUERY_OK, text);
+
+        return cached;
     }
 
-    fclose(file);
-
-    if (hardware_support) {
-
-        cached = query_value_text(TM_QUERY_OK, "已禁用(硬件支持，内核未启用)");
-    }
+    cached = query_value_text(TM_QUERY_OK, "不支持");
 
     return cached;
 }
@@ -4392,6 +5008,11 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
 
     device_put_value(&out[0], "virtualization", virtualization_value);
 
+    // 是不是虚拟机客人：这一版没有可靠检测手段，按约定恒为 0。
+    // 客户端只在这一格是 1 时显示"虚拟机: 是"，为 0 时整行都不出现
+    // （没有"虚拟机: 否"这种说法），并据此决定是否显示虚拟化 / AVF 两行。
+    device_put_value(&out[0], "is_vm", query_value_text(TM_QUERY_OK, "0"));
+
     // 插槽数 = 枚举到的物理处理器实例数；cores 走内核的"插槽 + 核号"去重口径
     int sockets = registry->cpu_count;
 
@@ -4527,6 +5148,537 @@ static int build_named_devices(TmOutDevice *out, int capacity,
     return limit;
 }
 
+// ============================================================
+// 内存设备：全部走 Linux 通用接口
+//
+// 分工写在最前面，免得后来的人又去加 Android 私有接口重复采：
+//   统计量（总量 / 可用 / 使用中 / 已提交 / 已缓存 / 内核可回收…）只读 /proc/meminfo，
+//     Android 的 ActivityManager 给的也是同一份内核数据，再采一遍纯属浪费；
+//   压缩量读 /sys/block/zram*\/mm_stat 的 mem_used_total（多设备必须遍历，不能写死 zram0）；
+//   规格读 Device Tree 的 ddr_type 属性（高通把这套枚举放在 dt 里）。
+//
+// Linux 通用接口给不出的（标称容量、插槽数、外观规格、为硬件保留、速度）这里一律不发，
+// 由上层按缺省显示，等 Android 侧补 —— 不拿相似指标冒充真数据。
+// ============================================================
+
+/**
+ * 从 /proc/meminfo 的文本里取一项，换算成字节。
+ *
+ * 每行形如 `MemTotal:        3908 kB`：键必须从行首开始整段匹配并紧跟冒号，
+ * 所以 "Cached" 不会误配到 "SwapCached"。带 kB 单位的乘 1024，不带的按个数返回。
+ *
+ * @param text meminfo 全文
+ * @param key  行首键名，如 MemTotal / Inactive(file)
+ * @return 字节数；-1 = 没有这一项，或这一行的值不是数字
+ */
+static long long meminfo_bytes(const char *text, const char *key)
+{
+    if (text == NULL || key == NULL || key[0] == '\0') {
+        return -1;
+    }
+
+    size_t key_length = strlen(key);
+
+    const char *cursor = text;
+
+    while (cursor != NULL && cursor[0] != '\0') {
+
+        if (strncmp(cursor, key, key_length) == 0 && cursor[key_length] == ':') {
+
+            const char *number = cursor + key_length + 1;
+
+            while (number[0] == ' ' || number[0] == '\t') {
+                number++;
+            }
+
+            char *end = NULL;
+
+            long long value = (long long) strtoll(number, &end, 10);
+
+            if (end == number || value < 0) {
+                return -1;
+            }
+
+            while (end[0] == ' ' || end[0] == '\t') {
+                end++;
+            }
+
+            if (end[0] == 'k' && end[1] == 'B') {
+                return value * 1024LL;
+            }
+
+            return value;
+        }
+
+        const char *newline = strchr(cursor, '\n');
+
+        if (newline == NULL) {
+            break;
+        }
+
+        cursor = newline + 1;
+    }
+
+    return -1;
+}
+
+/**
+ * 扫一个目录下的 zram 设备，累加 mm_stat 的 mem_used_total（字节）。
+ *
+ * 为什么遍历：一台机器可以有 zram0 / zram1 好几块，写死 zram0 会漏掉后面的。
+ * 为什么用 mem_used_total（第 3 列）：它是 zram 实际吃掉的物理内存；
+ * 第 2 列 compr_data_size 只是压缩后数据本身的大小，不含页表与元数据。
+ *
+ * @param base_dir sysfs 里块设备的目录，/sys/block 或 /sys/class/block
+ * @return 字节数；0 = 这个目录下没有 zram；-1 = 目录打不开，或有 zram 但一块都读不到
+ */
+static long long sum_zram_mem_used(const char *base_dir)
+{
+    DIR *dir = opendir(base_dir);
+
+    if (dir == NULL) {
+        return -1;
+    }
+
+    long long total = 0;
+    int saw_zram = 0;
+    int found = 0;
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (strncmp(entry->d_name, "zram", 4) != 0) {
+            continue;
+        }
+
+        saw_zram = 1;
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "%s/%s/mm_stat", base_dir, entry->d_name);
+
+        char text[256];
+
+        if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+            continue;
+        }
+
+        // 列顺序：orig_data_size compr_data_size mem_used_total ...
+        long long orig = 0;
+        long long compr = 0;
+        long long used = 0;
+
+        if (sscanf(text, "%lld %lld %lld", &orig, &compr, &used) != 3) {
+            continue;
+        }
+
+        if (used <= 0) {
+            continue;
+        }
+
+        total += used;
+        found = 1;
+    }
+
+    closedir(dir);
+
+    if (!saw_zram) {
+        return 0;
+    }
+
+    return found ? total : -1;
+}
+
+/**
+ * mm_stat 读不到时的折算分母。
+ *
+ * zram 的常见压缩比在 2:1 到 3:1 之间，这里取中间值 3：只影响"没有 sysfs 权限"那一档，
+ * 有权限时用的都是 mm_stat 的精确值。宁可量级对、不精确，也比报 0 强 ——
+ * 报 0 会让人以为这台机器没开压缩内存。
+ */
+#define TM_ZRAM_FALLBACK_DIVISOR 3LL
+
+/**
+ * 从 /proc/swaps 里取 zram 设备已用掉的交换量（字节）。
+ *
+ * 这一行是**压缩前**的数据量（和 mm_stat 的 orig_data_size 是同一个数），
+ * 只有在 mm_stat 读不到时才拿它折算压缩后占用，不能直接当成压缩量显示。
+ *
+ * @return 字节数；-1 = 没有 zram 交换，或这个文件读不到
+ */
+static long long read_zram_swap_used_bytes(void)
+{
+    // 多块 zram 也只有几行，2 KB 足够
+    static char text[2048];
+
+    if (read_text_file("/proc/swaps", text, (int) sizeof(text)) <= 0) {
+        return -1;
+    }
+
+    long long total = 0;
+    int found = 0;
+
+    char *cursor = text;
+
+    while (cursor != NULL && cursor[0] != '\0') {
+
+        char *newline = strchr(cursor, '\n');
+
+        if (newline != NULL) {
+            newline[0] = '\0';
+        }
+
+        // 表头是 Filename Type Size Used Priority，不含 zram，会被这一条挡掉
+        if (strstr(cursor, "zram") != NULL) {
+
+            char name[64];
+            char type[32];
+            long long size_kb = 0;
+            long long used_kb = 0;
+
+            if (sscanf(cursor, "%63s %31s %lld %lld", name, type, &size_kb, &used_kb) == 4 &&
+                used_kb > 0) {
+
+                total += used_kb * 1024LL;
+                found = 1;
+            }
+        }
+
+        if (newline == NULL) {
+            break;
+        }
+
+        cursor = newline + 1;
+    }
+
+    return found ? total : -1;
+}
+
+/**
+ * 压缩内存：所有 zram 设备实际占住的物理内存。
+ *
+ * 三档来源，逐档降级：
+ *   1) sys block 下每块 zram 的 mm_stat      精确值，首选；
+ *   2) sys class 下的同一批属性              同一个 inode 的另一条路径，个别机型只留着这条；
+ *   3) 两处都读不到（普通应用域常常被 SELinux 挡在 sysfs 外）时，
+ *      用 /proc/swaps 里 zram 的已用量按常见压缩比折算，量级正确但不是精确值。
+ *
+ * 三档都说不过去（没有 zram、也没有 /proc/swaps）时返回 -1，
+ * 上层按这一项没有值处理，不拿 0 顶替。
+ *
+ * @return 字节数；0 = 这台机器确实没开压缩内存
+ */
+static long long read_zram_used_bytes(void)
+{
+    long long from_block = sum_zram_mem_used("/sys/block");
+
+    if (from_block > 0) {
+        return from_block;
+    }
+
+    long long from_class = sum_zram_mem_used("/sys/class/block");
+
+    if (from_class > 0) {
+        return from_class;
+    }
+
+    // 两处都明说"这里没有 zram"，那压缩内存就是 0
+    if (from_block == 0 || from_class == 0) {
+        return 0;
+    }
+
+    long long swapped = read_zram_swap_used_bytes();
+
+    if (swapped > 0) {
+        return swapped / TM_ZRAM_FALLBACK_DIVISOR;
+    }
+
+    return -1;
+}
+
+/** 高通内核头文件里 ddr_type 的枚举顺序，值即下标的含义与厂商一致。 */
+static const char *const k_dram_type_names[] = {
+    NULL,           // 0 没有 DDR，按读不到处理
+    "LPDDR1",
+    "LPDDR2",
+    "DDR2",
+    "DDR3",
+    "LPDDR3",
+    "LPDDR4",
+    "LPDDR4X",
+    "LPDDR5",
+    "LPDDR5X"
+};
+
+#define TM_DRAM_TYPE_COUNT 10
+
+/**
+ * 把一段 dt 属性解释成内存规格名。
+ *
+ * 属性可能是两种形态：
+ *   纯文本（compatible 之类的字符串表）—— 转大写后按关键字认，长的先认，
+ *     否则 LPDDR5X 会被 LPDDR5 抢先匹配；
+ *   二进制（高通 ddr_type，big-endian 的 u32）—— 小枚举值只有最后一个字节非零，
+ *     取它当下标查表。
+ *
+ * @return true = 认出来了，out 里是规格名；false = 认不出，调用方不要发这个字段
+ */
+static bool dram_spec_from_property(const char *raw, int length, char *out, int capacity)
+{
+    if (raw == NULL || length <= 0 || out == NULL || capacity <= 0) {
+        return false;
+    }
+
+    bool printable = true;
+
+    for (int i = 0; i < length; i++) {
+
+        unsigned char ch = (unsigned char) raw[i];
+
+        if (ch != 0 && (ch < 0x20 || ch > 0x7e)) {
+            printable = false;
+            break;
+        }
+    }
+
+    if (printable) {
+
+        char upper[64];
+
+        int count = length < (int) sizeof(upper) - 1 ? length : (int) sizeof(upper) - 1;
+
+        for (int i = 0; i < count; i++) {
+            upper[i] = (char) toupper((unsigned char) raw[i]);
+        }
+
+        upper[count] = '\0';
+
+        static const char *const k_names[] = {
+            "LPDDR5X", "LPDDR5", "LPDDR4X", "LPDDR4", "LPDDR3", "LPDDR2", "LPDDR1",
+            "DDR4", "DDR3", "DDR2"
+        };
+
+        for (int i = 0; i < (int) (sizeof(k_names) / sizeof(k_names[0])); i++) {
+
+            if (strstr(upper, k_names[i]) != NULL) {
+                snprintf(out, (size_t) capacity, "%s", k_names[i]);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    int value = (int) ((unsigned char) raw[length - 1]);
+
+    if (value > 0 && value < TM_DRAM_TYPE_COUNT && k_dram_type_names[value] != NULL) {
+        snprintf(out, (size_t) capacity, "%s", k_dram_type_names[value]);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * 读一个 Device Tree 属性当 big-endian 的无符号整数。
+ *
+ * dt 的标量属性固定 4 字节、大端存放，所以 00 00 00 08 就是 8。
+ * 只有 4 字节以内才当标量：再长说明这个属性是数组或字符串表，
+ * 硬解出来的第一个数没有意义。
+ *
+ * @return 数值；-1 = 读不到，或长度不像标量
+ */
+static long long read_dt_u32(const char *path)
+{
+    unsigned char raw[8];
+
+    int length = read_text_file(path, (char *) raw, (int) sizeof(raw));
+
+    if (length <= 0 || length > 4) {
+        return -1;
+    }
+
+    long long value = 0;
+
+    for (int i = 0; i < length; i++) {
+        value = (value << 8) | (long long) raw[i];
+    }
+
+    return value;
+}
+
+/**
+ * 内存规格：高通的 ddr_device_type 属性就是这套枚举，值即下标。
+ *
+ * 除了高通自己的位置，另外几个通用路径也顺手试一下，读不到就整项不发。
+ * 值是二进制（big-endian u32），所以走 dram_spec_from_property 的二进制分支。
+ */
+static bool read_dram_spec(char *out, int capacity)
+{
+    static const char *const k_paths[] = {
+        "/proc/device-tree/memory/ddr_device_type",
+        "/proc/device-tree/qcom,ddr-type",
+        "/proc/device-tree/qcom,ddr_type",
+        "/proc/device-tree/ddr-type",
+        "/proc/device-tree/ddr_type",
+        "/proc/device-tree/dram/ddr_type",
+        "/proc/device-tree/memory/ddr_type",
+        "/sys/firmware/devicetree/base/memory/ddr_device_type",
+        "/sys/firmware/devicetree/base/qcom,ddr-type",
+        "/sys/firmware/devicetree/base/ddr_type"
+    };
+
+    static char raw[64];
+
+    for (int i = 0; i < (int) (sizeof(k_paths) / sizeof(k_paths[0])); i++) {
+
+        int length = read_text_file(k_paths[i], raw, (int) sizeof(raw));
+
+        if (length <= 0) {
+            continue;
+        }
+
+        // 只用到 0..length-1：read_text_file 会在末尾补一个 0，不能算进属性内容
+        if (dram_spec_from_property(raw, length, out, capacity)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 标称容量：高通 dt 的 ddr_size，单位是 GB（8 就是 8 GB）。
+ *
+ * 为什么不用 MemTotal：那是内核能用的内存，已经被保留区啃掉一截，
+ * 拿它当商品标称容量会少一档（8 GB 的机器显示 7.4 GB）。
+ *
+ * @return 字节数；-1 = 读不到或值明显不对（0、超过 4 TB）
+ */
+static long long read_dram_size_bytes(void)
+{
+    long long gigabytes = read_dt_u32("/proc/device-tree/memory/ddr_size");
+
+    if (gigabytes <= 0 || gigabytes > 4096) {
+        return -1;
+    }
+
+    return gigabytes * 1024LL * 1024LL * 1024LL;
+}
+
+/**
+ * 填内存设备。一台机器一份 /proc/meminfo，所以只发第一台实例。
+ *
+ * 所有容量一律字节（kB 在 meminfo_bytes 里就乘掉了），换算成 GB / MB 是显示层的事。
+ * 每一项单独发状态：读不到就发感叹号标记，上层据此显示破折号，
+ * 绝不拿 0 顶替（0 是有效值，会和"没读到"混在一起）。
+ *
+ * 分条图四段（使用中 / 已修改 / 备用 / 可用）在这层的口径：
+ *   使用中 = MemTotal - MemAvailable（和统计区同一口径）
+ *   已修改 = Dirty + Writeback（Linux 没有和 Windows 一致的 Modified 列表，这是近似）
+ *   备用   = Inactive(file)（较少活跃的文件页，和 Windows 的 Standby 不是一一对应）
+ *   可用   = MemFree（真正的空闲页）
+ * 这四项在 Linux 里存在包含关系，比例由上层归一化后再画。
+ *
+ * 名称行要的是两个不同的量：
+ *   标称容量 = dt 的 ddr_size（这台机器卖的是多少 GB）
+ *   实际可用 = MemTotal（内核手上还剩多少，图表顶端就是它）
+ * 两者差的就是保留区，不能互相顶替。
+ */
+static int build_memory_devices(TmOutDevice *out, int capacity,
+                                const TmDeviceRef *devices, int count)
+{
+    if (out == NULL || devices == NULL || capacity <= 0 || count <= 0) {
+        return 0;
+    }
+
+    device_begin(&out[0], devices[0].id, TM_DEV_TYPE_MEMORY);
+
+    device_put(&out[0], "name", devices[0].name);
+
+    // meminfo 只有一两 KB，但缓冲别放栈上：这条通道是单线程，static 够用
+    static char meminfo[4096];
+
+    if (read_text_file("/proc/meminfo", meminfo, (int) sizeof(meminfo)) <= 0) {
+
+        // 连 meminfo 都打不开：只报名称，统计项一个都不发
+        return 1;
+    }
+
+    long long total = meminfo_bytes(meminfo, "MemTotal");
+    long long available = meminfo_bytes(meminfo, "MemAvailable");
+    long long free_memory = meminfo_bytes(meminfo, "MemFree");
+    long long cached = meminfo_bytes(meminfo, "Cached");
+    long long sreclaimable = meminfo_bytes(meminfo, "SReclaimable");
+    long long sunreclaim = meminfo_bytes(meminfo, "SUnreclaim");
+    long long committed = meminfo_bytes(meminfo, "Committed_AS");
+    long long commit_limit = meminfo_bytes(meminfo, "CommitLimit");
+    long long dirty = meminfo_bytes(meminfo, "Dirty");
+    long long writeback = meminfo_bytes(meminfo, "Writeback");
+    long long inactive_file = meminfo_bytes(meminfo, "Inactive(file)");
+
+    // 使用中：总量减可用。不用 MemFree —— 那是"彻底空闲"，会把可回收缓存算成已用
+    long long used = -1;
+
+    if (total >= 0 && available >= 0) {
+
+        used = total - available;
+
+        if (used < 0) {
+            used = -1;
+        }
+    }
+
+    long long modified = -1;
+
+    if (dirty >= 0 || writeback >= 0) {
+        modified = (dirty >= 0 ? dirty : 0) + (writeback >= 0 ? writeback : 0);
+    }
+
+    device_put_int(&out[0], "total_bytes", total, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "available_bytes", available, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "used_bytes", used, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "cached_bytes", cached, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "committed_bytes", committed, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "commit_limit_bytes", commit_limit, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "reclaimable_kernel_bytes", sreclaimable,
+                   TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "nonreclaimable_kernel_bytes", sunreclaim,
+                   TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    // 压缩内存在 zram 里，meminfo 的 SwapTotal 只是它的上限，不能用
+    device_put_int(&out[0], "compressed_bytes", read_zram_used_bytes(),
+                   TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    // 分条图另外三段
+    device_put_int(&out[0], "modified_bytes", modified, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "standby_bytes", inactive_file, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "free_bytes", free_memory, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    // 标称容量与规格都来自高通 Device Tree，读不到就整项不发：
+    // 名称行那边会用 MemTotal 兜容量、少写规格，不会空着
+    device_put_int(&out[0], "nominal_bytes", read_dram_size_bytes(),
+                   TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    char spec[32];
+
+    if (read_dram_spec(spec, (int) sizeof(spec))) {
+        device_put(&out[0], "spec", spec);
+    }
+
+    return 1;
+}
+
 /** 填系统信息：进程 / 线程 / 句柄 / 开机时长（不属于任何一类硬件）。 */
 static int build_system_device(TmOutDevice *out, int capacity)
 {
@@ -4584,20 +5736,30 @@ static void emit_device_block(const TmOutDevice *device)
   *
   * 包内容（有实例才发，没有的类型一条 D 行都不发）：
   *   CPU     : 永远一块，把所有物理处理器合并；含利用率 / 频率 / 拓扑 / 缓存 / 逐核利用率
-  *   MEMORY  : 每个内存设备一块，这一版只有名称
+  *   MEMORY  : 一台，含 /proc/meminfo 的统计项、zram 压缩量、Device Tree 里的规格
   *   DISK    : 每块磁盘一块，这一版只有块名
   *   NETWORK : 每个网卡一块，这一版只有接口名
   *   GPU     : 每个图形设备一块，这一版只有节点名
   *   SYSTEM  : 进程 / 线程 / 句柄 / 开机时长
+  *
+  * 附加参数是本帧的设备模型上下文（见 apply_device_context）：请求即权威，
+  * 每帧都按它刷新，所以上层拿到新数据时不必重启本进程。
+  *
+  * @param arguments      本次请求带的 `键=值` 列表
+  * @param argument_count 列表长度
   */
-static bool handle_device_snapshot(unsigned long long seq, int type)
+static bool handle_device_snapshot(unsigned long long seq, int type,
+                                  const char *const *arguments, int argument_count)
 {
     // 这条通道是单线程顺序处理，缓冲用 static：不占栈，也不用每次清整块
     static TmOutDevice devices[TM_OUT_DEVICE_MAX];
     static TmDeviceRegistry registry;
     static TmCpuUsage usage;
 
-    // 先枚举实例，再采集：一次请求只枚举一次，采集期间 DeviceId 不会漂移
+    // 先吃上下文：CPU 名称要用型号 / 厂商 / 库路径，采集前定下来，这一帧就一致
+    apply_device_context(arguments, argument_count);
+
+    // 再枚举实例：一次请求只枚举一次，采集期间 DeviceId 不会漂移
     registry_refresh(&registry);
 
     // 利用率整机与每逻辑核共用一对采样点；首帧没有对比点，字段会按 NO_BASELINE 发
@@ -4609,11 +5771,10 @@ static bool handle_device_snapshot(unsigned long long seq, int type)
                                       TM_OUT_DEVICE_MAX - device_count,
                                       &registry, &usage);
 
-    // 内存：这一版只报名称（总量 / 可用量等口径还没定）
-    device_count += build_named_devices(devices + device_count,
-                                        TM_OUT_DEVICE_MAX - device_count,
-                                        registry.memory, registry.memory_count,
-                                        TM_DEV_TYPE_MEMORY);
+    // 内存：/proc/meminfo 的统计项 + zram 压缩量 + 设备树里的规格
+    device_count += build_memory_devices(devices + device_count,
+                                         TM_OUT_DEVICE_MAX - device_count,
+                                         registry.memory, registry.memory_count);
 
     // 系统信息紧跟硬件之后：进程 / 线程 / 句柄三项都在这一台里
     device_count += build_system_device(devices + device_count,
@@ -4912,6 +6073,24 @@ static bool handle_request(TmBackend *backend, const char *line)
         return true;
     }
 
+    // 设备快照：第四段之后全是上下文参数（键=值，可多个），收齐后交给采集侧
+    if ((int) type == TM_REQ_DEVICE_SNAPSHOT) {
+
+        const char *arguments[TM_DEVICE_CONTEXT_ARGUMENT_MAX];
+        int argument_count = 0;
+
+        char *token = strtok_r(NULL, " \t", &save);
+
+        while (token != NULL && argument_count < TM_DEVICE_CONTEXT_ARGUMENT_MAX) {
+
+            arguments[argument_count++] = token;
+
+            token = strtok_r(NULL, " \t", &save);
+        }
+
+        return handle_device_snapshot(seq, (int) type, arguments, argument_count);
+    }
+
     // 第四个字段之后：控制类的 code，再往后是两个参数（参数都不含空格）。
     // KILL 用 `code pid start_ticks`，其余控制码忽略这两个字段。
     char *code_text = strtok_r(NULL, " \t", &save);
@@ -4934,9 +6113,6 @@ static bool handle_request(TmBackend *backend, const char *line)
 
         case TM_REQ_PING:
             return handle_ping(seq, (int) type);
-
-        case TM_REQ_DEVICE_SNAPSHOT:
-            return handle_device_snapshot(seq, (int) type);
 
         default:
             reply_package_header(seq, (int) type, mask, TM_STATUS_UNSUPPORTED, 0);
@@ -5011,6 +6187,8 @@ static void run_message_loop(TmBackend *backend)
  */
 int main(int argc, char *argv[])
 {
+    // 本进程不接受启动参数：设备模型的 Android 层事实统一由设备快照请求带入
+    // （typeCode=5 的附加参数，见 apply_device_context），这样上层数据变了也不用重启进程。
     (void) argc;
     (void) argv;
 

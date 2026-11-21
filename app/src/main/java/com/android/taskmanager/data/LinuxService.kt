@@ -24,7 +24,9 @@
 package com.android.taskmanager.data
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 
@@ -631,6 +633,22 @@ object LinuxProtocol {
         val body = "$REQ_PREFIX $seq $typeCode 0x${java.lang.Long.toHexString(mask)}"
 
         return if (extra.isBlank()) body else "$body $extra"
+    }
+
+    /**
+     * 组一个设备快照请求：`REQ <seq> 5 0x0 [键=值 ...]`。
+     *
+     * 第四段之后是本帧的设备模型上下文（SoC 型号 / 厂商 / 名称库路径），
+     * 由上层用 [LinuxService] 侧的 CpuNameDatabase 组装；值里不能有空格，
+     * 特殊字符按 %XX 编码，服务端 decode_request_value 解回来。
+     *
+     * 不带参数也是合法请求：服务端沿用上一次的上下文。
+     */
+    fun buildDeviceSnapshot(seq: Long, arguments: List<String> = emptyList()): String {
+
+        val body = "$REQ_PREFIX $seq ${LinuxRequestType.DEVICE_SNAPSHOT} 0x0"
+
+        return if (arguments.isEmpty()) body else "$body ${arguments.joinToString(" ")}"
     }
 
     /**
@@ -1355,6 +1373,9 @@ class LinuxService : Service(), ILinuxServiceApi {
             return false
         }
 
+        // 启动命令只带 ELF 本体：SoC 型号 / 厂商 / 名称库路径这些设备事实
+        // 改为随设备快照请求一起带（见 CpuNameDatabase.snapshotArguments），
+        // 这样上层数据换了不用重启本进程，设备模型也只有一个维护入口。
         val command = listOf(LINKER, elf.absolutePath)
 
         // ---- 提权通路：只按"目标身份是 uid 0 还是 uid 2000"来选，不管权限从哪来 ----
@@ -1398,7 +1419,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         // ---- 兜底：应用自身 UID ----
         return try {
-            val process = ProcessBuilder(LINKER, elf.absolutePath)
+            val process = ProcessBuilder(command)
                 .redirectErrorStream(true)
                 .start()
 
@@ -1699,11 +1720,27 @@ class LinuxService : Service(), ILinuxServiceApi {
     // ---------- 友好接口：调用方（UIService）只用这一层，不碰协议细节 ----------
 
     /**
+     * 下一帧设备快照是否要强制重算一次 CPU 名称。
+     *
+     * 进性能页那一下置位，用掉就清：名称本身开机不变，只在用户"刚看这一页"时
+     * 值得重新探一次（名称库换过、上层给的 SoC 事实更新了，都能反映出来）。
+     * 每帧都重算是浪费，所以做成一次性请求，不排队、不立即单独发请求。
+     */
+    @Volatile
+    private var cpuNameRefreshPending = false
+
+    /** 请求下一帧设备快照重算一次 CPU 名称（静默置位，下一帧自动带出去）。 */
+    fun requestCpuNameRefreshOnce() {
+        cpuNameRefreshPending = true
+    }
+
+    /**
      * 取一帧设备快照的原始包（调试页用）。
      *
-     * 请求措辞：`REQ <seq> 5 0x0`，没有附加参数。应答是 v3 设备集合：
-     * 每台设备一条 D 行（id + type），紧跟若干 F 行（`字段=值`，或 `字段=!状态`），
-     * 没有 P 行，所以这里不需要掩码，也不做范围筛选。
+     * 请求措辞：`REQ <seq> 5 0x0 [键=值 ...]`，第四段之后是本帧的设备模型上下文
+     * （SoC 型号 / 厂商 / 名称库路径），由 [CpuNameDatabase.snapshotArguments] 组装。
+     * 应答是 v3 设备集合：每台设备一条 D 行（id + type），紧跟若干 F 行
+     * （`字段=值`，或 `字段=!状态`），没有 P 行，所以这里不需要掩码，也不做范围筛选。
      *
      * 为什么要单独留这个入口：性能页只要解析后的那几个字段，
      * 调试页要能看清"这次到底收到了哪些设备、每个设备有哪些字段"，
@@ -1719,7 +1756,26 @@ class LinuxService : Service(), ILinuxServiceApi {
             return null
         }
 
-        val packet = requestPackage(LinuxRequestType.DEVICE_SNAPSHOT, 0L, timeoutMs)
+        val seq = nextSeqOf()
+
+        // 上下文参数随每一帧带出去（设备模型只有一个维护入口）；
+        // 进性能页时多加一个 refresh_names=1，让服务端只把名称缓存清一次。
+        val arguments = CpuNameDatabase.snapshotArguments(this).toMutableList()
+
+        if (cpuNameRefreshPending) {
+
+            cpuNameRefreshPending = false
+
+            arguments += "refresh_names=1"
+        }
+
+        val packet = exchange(
+            seq,
+            LinuxProtocol.buildDeviceSnapshot(seq, arguments),
+            LinuxRequestType.DEVICE_SNAPSHOT,
+            0L,
+            timeoutMs
+        )
 
         if (packet != null && !packet.isOk) {
             append("设备快照未采用：${packet.failureReason ?: packet.summary()}")
@@ -2270,4 +2326,212 @@ class LinuxService : Service(), ILinuxServiceApi {
             }
         }
     }
+}
+
+/**
+ * CPU / SoC 名称库的安装与 SoC 事实读取。
+ *
+ * 为什么放在 Kotlin 侧：assets 只有 Framework 读得到，而查表由 ELF 侧的 C 代码做。
+ * 这里负责两件事：把库文件刷到「ELF 也读得到」的目录，读出 SoC 型号与厂商，
+ * 启动 ELF 时作为命令行参数一起传过去（见 main.c 的 parse_startup_arguments）。
+ *
+ * 目录选择：
+ *   1. getExternalFilesDir(null)：/storage/emulated/0/Android/data/<包名>/files
+ *      —— shell / root 身份起的 ELF 通常读得到，首选；
+ *   2. 外部目录不可用（没挂载 / 被限制）时退到 filesDir：应用自身身份读得到，
+ *      最差就是库用不上，名称回退成「厂商 + 大写型号」，不影响功能。
+ *
+ * 每次启动都覆盖一遍：APK 里的版本永远最新，不存在读到上次旧文件的问题。
+ */
+object CpuNameDatabase {
+
+    /** APK 里放的位置（app/src/main/assets/CPUNAME.txt）。 */
+    private const val ASSET_NAME = "CPUNAME.txt"
+
+    /** 落盘后的文件名；ELF 只认传过去的路径，不关心名字。 */
+    private const val FILE_NAME = "CPUNAME.txt"
+
+    /** 请求键名（与 main.c 的 apply_device_context 逐个匹配）。 */
+    private const val KEY_MODEL = "soc_model"
+
+    private const val KEY_MANUFACTURER = "soc_manufacturer"
+
+    private const val KEY_DATABASE = "cpu_name_db"
+
+    /**
+     * 已落盘的路径。
+     *
+     * 库文件是 APK 自带的，运行期不会变，所以复制一次就复用；
+     * 每帧快照都写两遍盘纯属浪费。库换过时调 [refresh] 清掉。
+     */
+    @Volatile
+    private var installedPaths: List<String>? = null
+
+    /** SoC 事实会被后台启动线程读，缓存一份就够。 */
+    @Volatile
+    private var cachedSocFacts: Pair<String, String>? = null
+
+    /**
+     * 把 assets 里的名称库复制到私有目录，外部目录与应用内部目录各放一份。
+     *
+     * 两份的作用不一样：
+     *   外部私有目录（getExternalFilesDir）：shell / root 身份起的 ELF 读得到；
+     *   应用内部 files 目录：应用自身身份起的 ELF 读得到。
+     * 两个路径都传给 ELF，它按顺序试，换身份起进程也不需要换配置。
+     *
+     * 先写 .tmp 再 rename：ELF 不会读到半个文件。
+     *
+     * @return 成功落盘的路径列表；全部失败返回空列表（调用方就不传 --cpu-name-db）
+     */
+    fun install(context: Context): List<String> {
+
+        installedPaths?.let { return it }
+
+        val directories = buildList {
+
+            context.getExternalFilesDir(null)?.let { add(it) }
+
+            add(context.filesDir)
+        }
+
+        val paths = directories.distinct().mapNotNull { copyAsset(context, it) }
+
+        if (paths.isNotEmpty()) {
+            installedPaths = paths
+        }
+
+        return paths
+    }
+
+    /** 把单个文件刷到目标目录；失败返回 null。 */
+    private fun copyAsset(context: Context, directory: File): String? = runCatching {
+
+        val destination = File(directory, FILE_NAME)
+
+        val temporary = File(directory, "$FILE_NAME.tmp")
+
+        context.assets.open(ASSET_NAME).use { input ->
+
+            temporary.outputStream().use { output ->
+
+                input.copyTo(output)
+
+                output.flush()
+            }
+        }
+
+        if (destination.exists() && !destination.delete()) {
+
+            temporary.delete()
+
+            return@runCatching null
+        }
+
+        if (!temporary.renameTo(destination)) {
+
+            temporary.delete()
+
+            return@runCatching null
+        }
+
+        destination.absolutePath
+
+    }.getOrNull()
+
+    /**
+     * SoC 型号与厂商的原始值：第一项 model，第二项 manufacturer。
+     *
+     * 优先 Build.SOC_MODEL / Build.SOC_MANUFACTURER（API 31 起的官方接口），
+     * 读不到再退到 getprop 的同名属性 —— 官方接口本来就是读它们。
+     * 厂商常见值是 QTI；厂商规范化由 ELF 侧做，这里只给事实。
+     */
+    fun socFacts(): Pair<String, String> {
+
+        cachedSocFacts?.let { return it }
+
+        val model = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else ""
+
+        val manufacturer = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MANUFACTURER else ""
+
+        return Pair(
+            model.ifEmpty { readProperty("ro.soc.model") },
+            manufacturer.ifEmpty { readProperty("ro.soc.manufacturer") }
+        ).also { cachedSocFacts = it }
+    }
+
+    /**
+     * 一次设备快照请求要带的上下文参数（`键=值`，值已转义）。
+     *
+     * 走设备快照而不走进程启动参数，是为了让设备模型只有一个维护入口：
+     * 上层数据变了，下一帧快照就带上新值，ELF 不必重启。
+     * 目前三项，后续 Android 侧字段（虚拟化 / AVF 之类）也加在这里。
+     *
+     * 缺哪项就不传哪项：ELF 按「这次没有这项信息」处理，少一个键也能出错快照。
+     */
+    fun snapshotArguments(context: Context): List<String> {
+
+        val arguments = mutableListOf<String>()
+
+        install(context).forEach { path -> arguments += "$KEY_DATABASE=${encodeWireValue(path)}" }
+
+        val facts = socFacts()
+
+        if (facts.first.isNotEmpty()) {
+            arguments += "$KEY_MODEL=${encodeWireValue(facts.first)}"
+        }
+
+        if (facts.second.isNotEmpty()) {
+            arguments += "$KEY_MANUFACTURER=${encodeWireValue(facts.second)}"
+        }
+
+        return arguments
+    }
+
+    /** 丢弃已落盘路径的缓存，下次 [install] 重新复制（库文件换过时用）。 */
+    fun refresh(context: Context): List<String> {
+
+        installedPaths = null
+
+        return install(context)
+    }
+
+    /**
+     * 把值转成协议里能带的形式。
+     *
+     * 请求用空格分字段，所以空格、等号、百分号本身与控制字符都写成 %XX，
+     * C 侧 decode_request_value 按同一套规则解回来。
+     */
+    private fun encodeWireValue(value: String): String {
+
+        val builder = StringBuilder(value.length)
+
+        for (character in value) {
+
+            if (character == '%' || character == ' ' || character == '=' || character.code < 0x20
+                || character.code > 0x7e) {
+
+                val code = character.code.toString(16).uppercase().padStart(2, '0')
+
+                builder.append('%').append(code)
+            } else {
+
+                builder.append(character)
+            }
+        }
+
+        return builder.toString()
+    }
+
+    /** 读一条系统属性；getprop 不存在 / 被拦 / 读空都返回空串。 */
+    private fun readProperty(name: String): String = runCatching {
+
+        val process = Runtime.getRuntime().exec(arrayOf("getprop", name))
+
+        val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
+
+        process.waitFor()
+
+        text
+
+    }.getOrDefault("")
 }

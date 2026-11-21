@@ -10,13 +10,7 @@
  *   │ 0% 0GHz  │  60 秒内的利用率 %          100%  │
  *   ├──────────┤  ┌───────────────────────────────┐  │
  *   │ ▁▁ 内存  │  │ 历史折线（大图表）             │  │
- *   ├──────────┤  └───────────────────────────────┘  │
- *   │ ▁▁ 磁盘  │  统计块 │ 明细块 │ 预留            │
- *   ├──────────┤                                     │
- *   │ ▁▁ WLAN  │                                     │
- *   ├──────────┤                                     │
- *   │ ▁▁ GPU   │                                     │
- *   └──────────┴─────────────────────────────────────┘
+ *   └──────────┴──└───────────────────────────────┘──┘
  *
  *   窄屏（竖屏手机 / 窄浮窗，< 520.dp）
  *   ┌─────────────────────────────────────────────────┐
@@ -27,7 +21,7 @@
  *   │  ░ 统计数据面板：统计块(左) │ 明细块(右) ░      │
  *   │                                                 │  ← 主界面竖屏才有这 1 份空白
  *   ├─────────────────────────────────────────────────┤
- *   │  CPU │ 内存 │ 磁盘 │ WLAN │ GPU   ← 只文字      │
+ *   │  CPU │ 内存            ← 只文字                 │
  *   └─────────────────────────────────────────────────┘
  *
  * 窄屏细节：图表与底部空白按 4:1 分高度（空白正好是图表的 1/4）；
@@ -45,12 +39,12 @@
  * - 点一行 = 右区换成这个硬件；选中行用主色容器着色，未选中用透明底。
  *
  * 宽度策略：宽屏严格 1:4；窄屏（< 520.dp）换成"详情在上、硬件条在下"的竖向结构，
- * 硬件条一行五个等宽文字块，不再显示迷你图和数据小字。
+ * 硬件条一行等宽文字块（现在两项），不再显示迷你图和数据小字。
  *
- * 数据现状：**只有 CPU 那一组接了真实数据**，来源是
+ * 数据现状：CPU 与内存两组都已接真实数据，来源是
  *   ELF 设备快照（typeCode=5）-> LinuxService.deviceSnapshot()
  *   -> UIService 清洗成 PerformanceSnapshot -> IPageDataApi.performanceSnapshot()。
- * 其余四个硬件（内存 / 磁盘 / WLAN / GPU）仍是写死的 0 值占位，等各自的采集实现。
+ * 磁盘 / WLAN / GPU 三个入口与它们的占位数据已整体删除，重新设计时再加回（见 [HardwareKind]）。
  *
  * 图表窗口那一行的文案由 UIService 按"实时更新速度"换算（高 30 / 常规 60 / 低 240 秒，
  * 已暂停时整段换成 利用率 % (已暂停)）；页面只在切进来时取一次，之后跟着帧一起显示。
@@ -81,6 +75,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -98,8 +93,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 
 import androidx.compose.ui.Alignment
@@ -112,7 +107,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -121,10 +118,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 import com.android.taskmanager.data.CpuUsagePoint
+import com.android.taskmanager.data.MemorySnapshot
 import com.android.taskmanager.data.PerformanceSnapshot
 import com.android.taskmanager.service.UIService
 import java.io.File
 import java.util.concurrent.Executors
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 /** 页面实现状态：改成 IMPLEMENTED 后，MainActivity 的 PageContent() 才会渲染本页。 */
@@ -144,13 +143,14 @@ private val PERFORMANCE_WIDE_MIN_WIDTH = 520.dp
 private const val PERFORMANCE_CHART_POINTS = 60
 
 /**
- * 图表菜单"复制"的兜底文本：只有 CPU 已经有真实内容（见 [cpuClipboardText]），
- * 内存 / 磁盘 / 网络 / GPU 的复制块等各自的数据齐了再补，现在统一回落到这里。
+ * 横屏底部 CPU 明细的"基准行数"，即上一版固定的 8 行：
+ * 基准速度 / 插槽 / 内核 / 逻辑处理器 / 虚拟化 / L1 缓存 / L2 缓存 / L3 缓存。
  *
- * 保留这段占位是为了让菜单项在任何硬件页上都可点、可验证剪贴板通路；
- * 新设备接入时不要改它，而是像 CPU 一样在 [clipboardTextFor] 里加分支。
+ * 后面新增的条件行（虚拟机、AVF 支持）不再参与图表的空间分配：
+ * 图表按这 8 行时的尺寸走，多出来的行由底部裁切（见 [HardwareDetail] 的宽屏分支）。
+ * 改这里的数字等于改"图表占多大"，只影响横屏。
  */
-private const val CHART_MENU_COPY_TEXT = "测试内容"
+private const val CPU_DETAIL_BASELINE_ROWS = 8
 
 /** 内核图形口径：整颗处理器的总利用率 / 逐个逻辑处理器。 */
 private const val CPU_KERNEL_GRAPH_TOTAL = "TOTAL"
@@ -159,30 +159,25 @@ private const val CPU_KERNEL_GRAPH_LOGICAL = "LOGICAL"
 /** 窄屏底部硬件条的单项高度：一行文字，按压目标够大就行。 */
 private val PERFORMANCE_COMPACT_TAB_HEIGHT = 38.dp
 
-/** 图表时间窗口（秒）。CPU 页用服务给的值，其余四个硬件暂时沿用这个测试值。 */
+/** 图表时间窗口（秒）的默认值：服务还没回过窗口文案时先用它，避免先闪一屏空字。 */
 private const val TEST_CHART_WINDOW_SECONDS = 60
 
 /** 硬件名称占位：CPU 用服务给的处理器商品名，取不到才回落它。 */
 private const val TEST_HARDWARE_NAME = "NAME"
 
 /**
- * 左栏的五个硬件入口。
+ * 性能页的硬件入口。
  *
- * 显示名按需求写（CPU / 内存 / 磁盘 / WLAN / GPU）；
- * [testPercent] / [testDetail] / [testName] 是**其余四个硬件写死的测试数据，全部 0**；
- * CPU 那一项不用它们，改由服务给的 PerformanceSnapshot 提供。
+ * 现在只有 CPU 与内存两项：两者都接通了真实数据。
+ * 磁盘 / WLAN / GPU 三个入口连同它们的占位数据（`0%`、`0.00 MB/s` 那一套）已整体删除，
+ * 后面重新设计时在这里加回一项即可 —— 本文件里所有按硬件分发的 when 都是穷举写法，
+ * 漏掉哪一处编译器会直接报出来，不会悄悄渲染成别人的数据。
  */
-private enum class HardwareKind(
-    val displayName: String,
-    val testName: String,
-    val testPercent: String,
-    val testDetail: String
-) {
-    CPU("CPU", TEST_HARDWARE_NAME, "0%", "0.00 GHz"),
-    MEMORY("内存", TEST_HARDWARE_NAME, "0%", "0.00 / 0.00 GB"),
-    DISK("磁盘", TEST_HARDWARE_NAME, "0%", "0.00 MB/s"),
-    WLAN("WLAN", TEST_HARDWARE_NAME, "0%", "0.00 Mbps"),
-    GPU("GPU", TEST_HARDWARE_NAME, "0%", "0.00 MHz")
+private enum class HardwareKind(val displayName: String) {
+
+    CPU("CPU"),
+
+    MEMORY("内存")
 }
 
 /**
@@ -246,11 +241,14 @@ private fun cpuSummaryRows(
 /**
  * 统计区中间块的竖排明细（格式统一为「内容: 数据」，全部小字）。
  *
- * 接口字段与 ELF 侧一一对应：处理器商品名与虚拟化方案由 ELF 后续实现，
+ * 接口字段与 ELF 侧一一对应：处理器商品名与虚拟化方案由 ELF 提供，
  * 现在前者显示占位、后者显示"不支持"，不会被当成 0。
  *
- * "AVF 支持"这一行是**条件式**的：它属于 Android 层数据，只有明确支持才出现
- * （在虚拟化与 L1 缓存之间），不支持与探测不到都直接不显示 —— 不存在"AVF 支持：否"。
+ * 最后三行（虚拟机 / 虚拟化 / AVF 支持）的取舍全在数据层：
+ * 是虚拟机 → 只留"虚拟机: 是"，另外两行让位；
+ * 不是虚拟机 → 给"虚拟化"（不支持 / 已禁用 / 已启用(实现)），
+ * 系统里真有 AVF 组件时才再加一行"AVF 支持: 是/否"。
+ * 这里只把拿到的文案排进列表，不做任何判断。
  */
 private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, String>> = buildList {
 
@@ -258,8 +256,9 @@ private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, Str
     add("插槽" to snapshot.socketsText())
     add("内核" to snapshot.coresText())
     add("逻辑处理器" to snapshot.logicalCpusText())
-    add("虚拟化" to snapshot.virtualizationText())
 
+    snapshot.virtualMachineText()?.let { add("虚拟机" to it) }
+    snapshot.virtualizationText()?.let { add("虚拟化" to it) }
     snapshot.avfText()?.let { add("AVF 支持" to it) }
 
     add("L1 缓存" to snapshot.l1Text())
@@ -270,10 +269,8 @@ private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, Str
 /**
  * 图表菜单"复制"到底往剪贴板写什么：按当前硬件分发。
  *
- * 现在只有 CPU 有真实内容。其它四种设备照菜单结构也应该有各自的一整块文本，
- * 但它们连采集字段都还没接完，先回落到 [CHART_MENU_COPY_TEXT]。
- *
- * 接入新设备时在这里加分支即可，菜单与剪贴板调用处都不用动。
+ * CPU 与内存各有一整块文本，两者都是穷举分支。
+ * 以后接新设备时在这里加一个分支，菜单与剪贴板调用处都不用动。
  */
 private fun clipboardTextFor(
     kind: HardwareKind,
@@ -283,8 +280,56 @@ private fun clipboardTextFor(
 
     HardwareKind.CPU -> cpuClipboardText(snapshot, usageDecimals)
 
-    // TODO 内存 / 磁盘 / WLAN / GPU 的复制文本：等各自的实例数据能进快照后逐块补上
-    else -> CHART_MENU_COPY_TEXT
+    HardwareKind.MEMORY -> memoryClipboardText(snapshot)
+}
+
+/**
+ * 内存视图"复制"写进剪贴板的文本，形状与 CPU 那份同一个骨架：
+ *
+ * 内存                      设备名，顶格
+ * （空行）
+ * \t8.0 GB LPDDR5           名称行：标称容量 + 内存规格
+ * （空行）
+ * \t速度:\t3200 MT/秒        规格块：字段名后面带冒号，字段名与值之间是 Tab
+ * \t已使用的插槽:\t1/1
+ * \t外观规格:\t其他
+ * \t为硬件保留的内存:\t262 MB
+ * （空行）
+ * \t可用\t4.3 GB            实时块：字段名后面不带冒号
+ * ...
+ * （末尾空行）
+ *
+ * 用词按 Linux 侧的叫法，不照搬任务管理器的 Windows 术语：
+ * 分页缓冲池 / 非分页缓冲池在这里是可回收内核缓存 / 不可回收内核缓存。
+ * 数值一律走与页面同一套 xxxText()，读不到的照页面写破折号，不编造 0。
+ * 速度那一行没数据就整行不写（与页面明细块一致）。
+ */
+private fun memoryClipboardText(snapshot: PerformanceSnapshot): String {
+
+    val memory = snapshot.memory ?: MemorySnapshot()
+
+    return buildString {
+
+        append("内存")
+
+        append("\n\n\t").append(memory.nameText())
+
+        // 规格块：静态信息，开机之后基本不变
+        memory.speedText()?.let { append("\n\t速度:\t").append(it) }
+        append("\n\t已使用的插槽:\t").append(memory.slotsText())
+        append("\n\t外观规格:\t").append(memory.formFactorText())
+        append("\n\t为硬件保留的内存:\t").append(memory.reservedText())
+
+        // 实时块：用 Linux 的名字，顺序照任务管理器（使用中排最后）
+        append("\n\n\t可用\t").append(memory.availableText())
+        append("\n\t已缓存\t").append(memory.cachedText())
+        append("\n\t已提交\t").append(memory.committedText())
+        append("\n\t可回收内核缓存\t").append(memory.reclaimableText())
+        append("\n\t不可回收内核缓存\t").append(memory.nonReclaimableText())
+        append("\n\t使用中(已压缩)\t").append(memory.usedText())
+
+        append("\n\n")
+    }
 }
 
 /**
@@ -326,9 +371,10 @@ private fun cpuClipboardText(snapshot: PerformanceSnapshot, usageDecimals: Int):
         append("\n\t插槽:\t").append(snapshot.socketsText())
         append("\n\t内核:\t").append(snapshot.coresText())
         append("\n\t逻辑处理器:\t").append(snapshot.logicalCpusText())
-        append("\n\t虚拟化:\t").append(snapshot.virtualizationText())
 
-        // AVF 支持只在这一格"有"的时候才写：复制出来的文本不能凭空多一行"否"
+        // 与页面同一套取舍：虚拟机优先，非虚拟机才写虚拟化与 AVF
+        snapshot.virtualMachineText()?.let { append("\n\t虚拟机:\t").append(it) }
+        snapshot.virtualizationText()?.let { append("\n\t虚拟化:\t").append(it) }
         snapshot.avfText()?.let { append("\n\tAVF 支持:\t").append(it) }
 
         append("\n\tL1 缓存:\t").append(snapshot.l1Text())
@@ -358,13 +404,29 @@ private fun cpuClipboardText(snapshot: PerformanceSnapshot, usageDecimals: Int):
 @Composable
 fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
-    // 默认选 CPU；rememberSaveable 让切页回来还停在原来那一项
-    var selectedName by rememberSaveable { mutableStateOf(HardwareKind.CPU.name) }
+    // 当前选中的硬件放在进程级共享状态里（见 PerformanceSelection）。
+    //
+    // 为什么不放在页面里：竖屏 / 横屏 / 浮窗是三个宿主，页面离开组合时
+    // rememberSaveable 的值会一起丢掉，表现就是每换一个宿主、每次切页回来都退回 CPU。
+    // 三处宿主读同一个值时，横竖屏切换、浮窗打开、切页往返都停在原来那一项。
+    val selected = PerformanceSelection.kind
 
-    val selected = HardwareKind.entries.firstOrNull { it.name == selectedName } ?: HardwareKind.CPU
+    // 同进程内直连服务；取不到时按空帧显示。
+    //
+    // 这里必须"等到实例出现"，不能只在组合的第一帧取一次：服务是异步创建的，
+    // 起始页如果就是本页，组合首帧往往还拿不到实例（UIService 正在 onCreate 里跑），
+    // 而取一次之后本页没有任何状态会变、也就不会重组，实例再也不会被重新读到——
+    // 表现就是"默认启动页设成性能页，图一直不出数据"；从别的页切进来时才碰巧正常。
+    // 等实例期间也顺带处理服务被系统回收后重建的情况。
+    val service by produceState<UIService?>(initialValue = UIService.instanceOrNull()) {
 
-    // 同进程内直连服务；服务还没起来时给 null，页面按空帧显示
-    val service = UIService.instanceOrNull()
+        while (value == null) {
+
+            delay(150)
+
+            value = UIService.instanceOrNull()
+        }
+    }
 
     // 图表窗口文案：只在切进本页时取一次。用户改"实时更新速度"必须先回设置页，
     // 再切回来时这次读取自然拿到新值 —— 不需要每帧都去问设置。
@@ -376,16 +438,19 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     // 它只影响这几个字怎么画，不影响采集精度，也不影响图表曲线（曲线一直按浮点值画）。
     var usageDecimals by remember { mutableStateOf(0) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(service) {
 
-        windowLabel = service?.performanceChartWindowLabel() ?: windowLabel
+        val current = service ?: return@LaunchedEffect
+
+        windowLabel = current.performanceChartWindowLabel()
 
         usageDecimals = SettingsCatalog.cpuUsageDecimals(
-            service?.settings()?.cpuUsagePrecision ?: SettingsDefaults.cpuUsagePrecision
+            current.settings()?.cpuUsagePrecision ?: SettingsDefaults.cpuUsagePrecision
         )
 
-        // 立刻补采一帧：后台可能刚采过，但"切进来的第一屏"不该等一个周期
-        service?.refreshPerformanceNow()
+        // 立刻补采一帧：后台可能刚采过，但"切进来的第一屏"不该等一个周期。
+        // 这一下同时也请求服务端重算一次 CPU 名称（只清名称缓存，不动别的刷新节奏）。
+        current.refreshPerformanceNow()
     }
 
     // 读可观察状态：服务每采到一帧就会让本页重组一次
@@ -393,6 +458,18 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
     // 历史点：大图与左列迷你图共用这一份，只有取哪些点、画在哪里不同
     val history = service?.performanceCpuHistory() ?: emptyList()
+
+    // 内存那条曲线有自己的一份队列（纵轴是占总量的百分比），不能拿 CPU 的点顶替
+    val memoryHistory = service?.performanceMemoryHistory() ?: emptyList()
+
+    // 明细区 / 摘要区用的历史点：跟着当前选中项走。
+    // 写死 CPU 会让内存页拿到一条空的 CPU 队列 —— 图就只剩进入时那一帧的回落值，之后再也不动。
+    val detailHistory = when (selected) {
+
+        HardwareKind.CPU -> history
+
+        HardwareKind.MEMORY -> memoryHistory
+    }
 
     // 长按图表弹出的菜单
     var chartDialogVisible by remember { mutableStateOf(false) }
@@ -413,11 +490,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     val showKernelTime = ChartViewState.showKernelTime
 
     // 双击图表切进摘要视图。
-    // 只认 CPU：其余四个硬件现在没有真实曲线，在它们上面双击会弹出一张 CPU 图，容易误解。
+    // 现在页面上只有 CPU 与内存两项，两者都有真实曲线，所以不需要准入判断；
+    // 以后再加没有数据的硬件入口时，这里要恢复"只让有曲线的项进摘要"的过滤。
     val enterChartSummary: () -> Unit = {
-        if (selected == HardwareKind.CPU) {
-            ChartSummaryView.active.value = true
-        }
+        ChartSummaryView.active.value = true
     }
 
     // 图形摘要视图：整页只剩这一页的头部（名称行 / 标签行）与图表，图表吃满其余高度。
@@ -447,12 +523,15 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
             // wide 传 true：摘要里没有下方那两块，这个值只影响它们怎么排，传哪个都不影响结果；
             // 传 true 是为了让名称行与标签行按"整行铺开"的排法走。
+            //
+            // kind 必须跟着当前选中项走：内存进摘要要显示内存那一套（名称行、标签行、纵轴），
+            // 写死 CPU 会让内存双击后看到一张 CPU 图。
             HardwareDetail(
-                kind = HardwareKind.CPU,
+                kind = selected,
 
                 snapshot = snapshot,
 
-                history = history,
+                history = detailHistory,
 
                 windowLabel = windowLabel,
 
@@ -510,25 +589,46 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         HardwareKind.entries.forEach { kind ->
 
-                            val isCpu = kind == HardwareKind.CPU
-
+                            // 左栏每一格：百分比 + 小字 + 迷你图，三者都按当前硬件取数
                             HardwareTab(
                                 kind = kind,
 
-                                percentText = if (isCpu) {
-                                    snapshot.cpuUsageText(usageDecimals)
-                                } else {
-                                    kind.testPercent
+                                percentText = when (kind) {
+
+                                    HardwareKind.CPU -> snapshot.cpuUsageText(usageDecimals)
+
+                                    HardwareKind.MEMORY -> snapshot.memoryUsageText(usageDecimals)
                                 },
 
-                                detailText = if (isCpu) snapshot.cpuSpeedText() else kind.testDetail,
+                                detailText = when (kind) {
+
+                                    HardwareKind.CPU -> snapshot.cpuSpeedText()
+
+                                    HardwareKind.MEMORY -> snapshot.memory?.amountText() ?: "—"
+                                },
 
                                 // 迷你图取的是同一份历史点的尾部，只是画得小
-                                history = if (isCpu) history else emptyList(),
+                                history = when (kind) {
+
+                                    HardwareKind.CPU -> history
+
+                                    HardwareKind.MEMORY -> memoryHistory
+                                },
 
                                 selected = kind == selected,
 
-                                onClick = { selectedName = kind.name }
+                                // 内存这一行按"用量在前、百分比收在括号里"排：
+                                // 例 `1.0/2.0 GB (50%)`。CPU 那行仍是"50% 3.20 GHz"。
+                                lineText = when (kind) {
+
+                                    HardwareKind.MEMORY ->
+                                        "${snapshot.memory?.amountText() ?: "—"} " +
+                                            "(${snapshot.memoryUsageText(usageDecimals)})"
+
+                                    HardwareKind.CPU -> null
+                                },
+
+                                onClick = { PerformanceSelection.kindName.value = kind.name }
                             )
                         }
                     }
@@ -542,7 +642,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         snapshot = snapshot,
 
-                        history = if (selected == HardwareKind.CPU) history else emptyList(),
+                        history = detailHistory,
 
                         windowLabel = windowLabel,
 
@@ -577,7 +677,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         snapshot = snapshot,
 
-                        history = if (selected == HardwareKind.CPU) history else emptyList(),
+                        history = detailHistory,
 
                         windowLabel = windowLabel,
 
@@ -606,7 +706,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                     HardwareCompactBar(
                         selected = selected,
 
-                        onSelect = { selectedName = it.name }
+                        onSelect = { PerformanceSelection.kindName.value = it.name }
                     )
                 }
             }
@@ -617,6 +717,9 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
         PerformanceChartDialog(
             hostedInOverlay = hostedInOverlay,
+
+            // 菜单内容按当前硬件裁剪：内核图形那三项只有 CPU 有，内存页不摆它们
+            kind = selected,
 
             // 菜单读的是全应用唯一那份画图偏好，改一处三处宿主与摘要视图同时变色
             kernelGraphMode = if (logicalGraph) CPU_KERNEL_GRAPH_LOGICAL else CPU_KERNEL_GRAPH_TOTAL,
@@ -634,10 +737,11 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
             onEnterSummary = {
                 chartDialogVisible = false
 
+                // 现在只有 CPU 与内存两项，两者都有真实曲线，直接进摘要
                 ChartSummaryView.active.value = true
             },
 
-            // 复制内容按当前选中的硬件现算：CPU 是那份完整文本，其余四种暂时还是占位
+            // 复制内容按当前选中的硬件现算：CPU / 内存各有一整块
             copyText = clipboardTextFor(kind = selected, snapshot = snapshot, usageDecimals = usageDecimals),
 
             onDismiss = { chartDialogVisible = false }
@@ -650,13 +754,82 @@ private fun usageFraction(snapshot: PerformanceSnapshot): Float =
     (snapshot.cpuUsagePercent ?: 0f).coerceIn(0f, 100f) / 100f
 
 /**
- * 其余四个硬件的统计块占位：结构与 CPU 相同，但各格都是"暂无数据"。
+ * 内存用量换算成 0..1 的绘制比例：已用 / 总容量。
  *
- * 它们各自的采集实现落地后，把这两个函数换成各自的数据源即可，版式一行都不用改。
+ * 两边的量拿不到就贴底 —— 与 CPU 图同一条规矩：宁可从 0 起，不拿假值撑起一条线。
  */
-private fun emptyCpuSummaryRows(): List<List<CpuStat>> = cpuSummaryRows(PerformanceSnapshot.EMPTY)
+private fun memoryUsageFraction(memory: MemorySnapshot?): Float {
 
-private fun emptyCpuDetailLines(): List<Pair<String, String>> = cpuDetailLines(PerformanceSnapshot.EMPTY)
+    val used = memory?.usedBytes ?: return 0f
+
+    val total = memory.totalBytes ?: return 0f
+
+    if (total <= 0L) return 0f
+
+    return (used.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+}
+
+/**
+ * 内存页的统计区：三行两列，顺序与版式固定（不随数据变）。
+ *
+ * 第一行 使用中(已压缩) / 可用
+ * 第二行 已提交        / 已缓存
+ * 第三行 可回收内核缓存 / 不可回收内核缓存
+ *
+ * 标题里的括号用半角，与明细块同一套规矩；空格宽度按最长取值估算，数字每秒都在变。
+ */
+private fun memorySummaryRows(memory: MemorySnapshot?): List<List<CpuStat>> {
+
+    val data = memory ?: MemorySnapshot()
+
+    return listOf(
+        listOf(
+            CpuStat(
+                "使用中(已压缩)", data.usedText(),
+                wideWidth = 118.dp, narrowWidth = 104.dp
+            ),
+            CpuStat("可用", data.availableText(), wideWidth = 72.dp, narrowWidth = 62.dp)
+        ),
+
+        listOf(
+            CpuStat("已提交", data.committedText(), wideWidth = 104.dp, narrowWidth = 92.dp),
+            CpuStat("已缓存", data.cachedText(), wideWidth = 72.dp, narrowWidth = 62.dp)
+        ),
+
+        listOf(
+            CpuStat(
+                "可回收内核缓存", data.reclaimableText(),
+                wideWidth = 104.dp, narrowWidth = 92.dp
+            ),
+            CpuStat(
+                "不可回收内核缓存", data.nonReclaimableText(),
+                wideWidth = 118.dp, narrowWidth = 104.dp
+            )
+        )
+    )
+}
+
+/**
+ * 内存页的明细块：与 CPU 那边同一个排法（内容: 数据）。
+ *
+ * 速度这一行只在底层真给了内容时才出现 —— 没有数据就整行不画，
+ * 空着一行破折号比少一行更让人以为采坏了。外观规格读不到写"其他"。
+ */
+private fun memoryDetailLines(memory: MemorySnapshot?): List<Pair<String, String>> {
+
+    val data = memory ?: MemorySnapshot()
+
+    return buildList {
+
+        data.speedText()?.let { add("速度" to it) }
+
+        add("已使用的插槽" to data.slotsText())
+
+        add("外观规格" to data.formFactorText())
+
+        add("为硬件保留的内存" to data.reservedText())
+    }
+}
 
 /**
  * 左栏的一行：迷你趋势图 + 硬件名大字 + 数据小字。
@@ -671,7 +844,8 @@ private fun HardwareTab(
     detailText: String,
     history: List<CpuUsagePoint>,
     selected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    lineText: String? = null
 ) {
 
     val container = if (selected) {
@@ -743,7 +917,9 @@ private fun HardwareTab(
                 )
 
                 Text(
-                    text = "$percentText $detailText",
+                    // lineText 非空就整行替换：内存那格要"量在前、百分比在括号里"，
+                    // 顺序与 CPU 的"百分比 速度"不同，靠这里换掉拼接方式，别的行不受影响
+                    text = lineText ?: "$percentText $detailText",
 
                     style = MaterialTheme.typography.bodySmall,
 
@@ -908,6 +1084,10 @@ private fun HardwareDetail(
 
     val isCpu = kind == HardwareKind.CPU
 
+    val isMemory = kind == HardwareKind.MEMORY
+
+    val memory = snapshot.memory
+
     // 主界面竖屏：图表下方留出呼吸空间（图表 3 : 留白 1，即图表再缩 1/4 后的比例）。
     // 浮窗不留：窗本来就小，把高度全给图表才好看。
     val reserveBottom = !wide && !hostedInOverlay
@@ -915,11 +1095,57 @@ private fun HardwareDetail(
     // 有留白时图表 weight 3、留白 weight 1（图表再缩 1/4）；其余情况图表吃满
     val chartWeight = if (reserveBottom) 3f else 1f
 
-    // 名称：CPU 用 ELF 给的处理器商品名（由用户侧补实现），取不到才回落占位
-    val nameText = if (isCpu) (snapshot.cpuName ?: TEST_HARDWARE_NAME) else kind.testName
+    // 横屏底部明细：CPU 那三行可变内容（虚拟机 / 虚拟化 / AVF 支持）会把明细块撑高，
+    // 而图表拿的是"剩余高度"，明细一高图就跟着矮 —— 用户看到的就是图表变小。
+    // 所以这里以上一版的固定 8 行（[CPU_DETAIL_BASELINE_ROWS]）为基准：
+    // 多出来的行不再向上挤压图表，图表拿回那一份高度，多出的行由底部裁切。
+    // 竖屏不参与，那里图表下面本来留了空白，不是同一套高度分配。
+    val detailLines = when (kind) {
 
-    // 窗口文案：CPU 跟着实时更新速度走，其余硬件先把测试文案摆着
-    val chartLabel = if (isCpu) windowLabel else "$TEST_CHART_WINDOW_SECONDS 秒内的利用率 %"
+        HardwareKind.CPU -> cpuDetailLines(snapshot)
+
+        HardwareKind.MEMORY -> memoryDetailLines(memory)
+    }
+
+    // 统计区的三行指标：CPU 与内存各一套
+    val summaryRows = when (kind) {
+
+        HardwareKind.CPU -> cpuSummaryRows(snapshot, usageDecimals)
+
+        HardwareKind.MEMORY -> memorySummaryRows(memory)
+    }
+
+    val extraDetailRows = if (wide) {
+        (detailLines.size - CPU_DETAIL_BASELINE_ROWS).coerceAtLeast(0)
+    } else {
+        0
+    }
+
+    val density = LocalDensity.current
+
+    // 一行明细占的高度：正文行高（bodySmall）+ 3dp 行间距，与 CpuDetailList 的排法一致
+    val extraDetailHeight = with(density) {
+        (MaterialTheme.typography.bodySmall.lineHeight.toDp() + 3.dp) * extraDetailRows
+    }
+
+    // 名称：CPU 用 ELF 给的处理器商品名（由用户侧补实现），取不到才回落占位；
+    // 内存写「容量 规格」（如 16.0 GB LPDDR5），与左边大字同一行、同一字号
+    val nameText = when (kind) {
+        HardwareKind.CPU -> snapshot.cpuName ?: TEST_HARDWARE_NAME
+        HardwareKind.MEMORY -> memory?.nameText() ?: "—"
+    }
+
+    // 图表上方那行小字：CPU 跟着实时更新速度写明统计窗口；内存这里改写成"内存使用量"
+    val chartLabel = when (kind) {
+        HardwareKind.CPU -> windowLabel
+        HardwareKind.MEMORY -> "内存使用量"
+    }
+
+    // 同一行右端：CPU 写 100%（图的顶端就是满利用率）；内存写实际容量（顶端刻度）
+    val chartTopRightText = when (kind) {
+        HardwareKind.CPU -> "100%"
+        HardwareKind.MEMORY -> memory?.totalText() ?: "—"
+    }
 
     Column(
         modifier = modifier
@@ -982,7 +1208,7 @@ private fun HardwareDetail(
             )
 
             Text(
-                text = "100%",
+                text = chartTopRightText,
 
                 style = MaterialTheme.typography.bodySmall,
 
@@ -1000,7 +1226,12 @@ private fun HardwareDetail(
         DetailChartPlaceholder(
             points = history,
 
-            fallbackFraction = if (isCpu) usageFraction(snapshot) else 0f,
+            fallbackFraction = when (kind) {
+
+                HardwareKind.CPU -> usageFraction(snapshot)
+
+                HardwareKind.MEMORY -> memoryUsageFraction(memory)
+            },
 
             // 菜单两项直接决定画法：没勾"显示内核时间"就一行都不多画；
             // 图形口径选了"逻辑处理器"才切成逐核网格，两种口径共用同一份历史。
@@ -1019,8 +1250,62 @@ private fun HardwareDetail(
 
         // 摘要视图到此为止：统计块 / 明细块 / 底部留白都不画，
         // 名称行与标签行留着，所以画面上仍然是这一页的头部，只是下面全部让给图。
+        // 内存是例外：它的分条图（内存组合）跟图一起进摘要 —— 那块是这张图的图例，
+        // 删掉之后曲线就只剩一条无从对照的折线。图底两角的小字（窗口 / 起点 0）
+        // 仍不进摘要，摘要本来就不显示刻度文字。
         if (summary) {
+
+            if (isMemory) {
+
+                Spacer(
+                    modifier = Modifier.height(6.dp)
+                )
+
+                MemoryBreakdownSection(memory)
+            }
+
             return
+        }
+
+        // 4) 内存专属两块：图底两角的小字，和一条「使用中 → 可用」的分条图。
+        //
+        // 左角是更新频率（压短成"60 秒"这种），右角是统计起点 0：CPU 图把这两件事
+        // 分别放在左上（窗口文案）与刻度上，内存图按设计把它们落到图底两角。
+        if (isMemory) {
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+
+                Text(
+                    text = shortWindowText(windowLabel),
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(
+                    modifier = Modifier.weight(1f)
+                )
+
+                Text(
+                    text = "0",
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(
+                modifier = Modifier.height(6.dp)
+            )
+
+            // 标题 + 分条图在完整版式与摘要视图里是同一块，所以抽成一个函数
+            MemoryBreakdownSection(memory)
         }
 
         Spacer(
@@ -1032,8 +1317,32 @@ private fun HardwareDetail(
         //    窄屏与浮窗：统计 / 明细 并排、**各自一块背景板**，都左对齐，明细紧挨着统计块
         if (wide) {
 
+            // 底部这块的"自然高度"只在第一帧量一次：之后固定成 自然高度 - 多出的明细行，
+            // 图表（weight）就能把那一份高度拿回来。超出的行**不裁**：
+            // Row 只是占位高度变小，多出来的内容照常往下画，屏幕上能看见多少是多少。
+            var naturalBottomHeight by remember { mutableStateOf<Dp?>(null) }
+
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onSizeChanged { size ->
+                        if (naturalBottomHeight == null) {
+                            naturalBottomHeight = with(density) { size.height.toDp() }
+                        }
+                    }
+                    .then(
+                        naturalBottomHeight
+                            ?.takeIf { extraDetailHeight > 0.dp }
+                            ?.let { natural ->
+                                Modifier
+                                    .height((natural - extraDetailHeight).coerceAtLeast(0.dp))
+                                    // 关键：让 Row 的子项按**自然高度**测量，Row 自己只占压缩后的高度。
+                                    // 只写 height 的话，Column 会把剩余高度用光，最后一行拿到 0 高度约束
+                                    // 直接被压成 0 —— 那就是 L3 缓存"一点都看不到"的原因。
+                                    // unbounded 测量后，超出的行照常布局、照常绘制，屏幕能显示多少算多少。
+                                    .wrapContentHeight(unbounded = true, align = Alignment.Top)
+                            } ?: Modifier
+                    ),
 
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -1041,13 +1350,13 @@ private fun HardwareDetail(
                 // 统计块与明细块都按内容取宽：明细紧挨在统计块右边，
                 // 谁也不会把对方推远，剩下的宽度全部给末尾的空白预留区
                 CpuSummaryBlock(
-                    rows = if (isCpu) cpuSummaryRows(snapshot, usageDecimals) else emptyCpuSummaryRows(),
+                    rows = summaryRows,
 
                     wide = true
                 )
 
                 CpuDetailList(
-                    lines = if (isCpu) cpuDetailLines(snapshot) else emptyCpuDetailLines()
+                    lines = detailLines
                 )
 
                 // 空白预留区：只在宽屏留，靠 weight 吃掉剩余宽度，位置随前两块自动变化
@@ -1070,7 +1379,7 @@ private fun HardwareDetail(
                 DataPanel {
 
                     CpuSummaryBlock(
-                        rows = if (isCpu) cpuSummaryRows(snapshot, usageDecimals) else emptyCpuSummaryRows(),
+                        rows = summaryRows,
 
                         wide = false
                     )
@@ -1079,7 +1388,7 @@ private fun HardwareDetail(
                 DataPanel {
 
                     CpuDetailList(
-                        lines = if (isCpu) cpuDetailLines(snapshot) else emptyCpuDetailLines()
+                        lines = detailLines
                     )
                 }
             }
@@ -1114,6 +1423,123 @@ private fun DataPanel(
             .padding(horizontal = 10.dp, vertical = 10.dp)
     ) {
         content()
+    }
+}
+
+/** 窗口文案里的"数字 + 秒 / 分钟"，只在这里用；提成常量免得每次组合都新建一个。 */
+private val WINDOW_SECONDS_PATTERN = Regex("(\\d+)\\s*(秒|分钟)")
+
+/**
+ * 把图表的窗口文案压短，给内存图左下角用。
+ *
+ * "60 秒内的利用率 %" -> "60 秒"；"4 分钟内的利用率 %" -> "240 秒"（这一处要的是秒数，
+ * 不写"4 分钟"）；"利用率 % (已暂停)" -> "已暂停"。
+ *
+ * 认不出格式时按常规档的 60 秒写：那是最常见的一档，也好过显示一串原始文案。
+ */
+private fun shortWindowText(windowLabel: String): String {
+
+    if (windowLabel.contains("已暂停")) {
+        return "已暂停"
+    }
+
+    val match = WINDOW_SECONDS_PATTERN.find(windowLabel)
+
+    val count = match?.groupValues?.get(1)?.toIntOrNull() ?: return "60 秒"
+
+    return if (match.groupValues[2] == "分钟") "${count * 60} 秒" else "$count 秒"
+}
+
+/**
+ * 「内存组合」标题 + 分条图，整块固定结构。
+ *
+ * 两处用它：完整版式里排在图表下方，图形摘要视图里也带着它一起走 ——
+ * 分条图本身就是内存图的图例，摘要里少了它，上面那条曲线就只剩一条无从对照的折线。
+ *
+ * 标题字号与上方「内存使用量」同档（bodySmall），只是定住左端、右边留空。
+ */
+@Composable
+private fun MemoryBreakdownSection(memory: MemorySnapshot?) {
+
+    Text(
+        text = "内存组合",
+
+        style = MaterialTheme.typography.bodySmall,
+
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+
+    Spacer(
+        modifier = Modifier.height(3.dp)
+    )
+
+    MemoryBreakdownBar(
+        parts = (memory ?: MemorySnapshot()).breakdownParts(),
+
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(10.dp)
+    )
+}
+
+/**
+ * 内存分条图：一条与上方图表同宽的横条，按「使用中 / 已修改 / 备用 / 可用」切成四段。
+ *
+ * 四段比例来自数据（[MemorySnapshot.breakdownParts]，已经归一），整条宽度就是总容量；
+ * 最右的"可用"不填充主题色，只留一层极淡的底。
+ *
+ * 按设计只画图形：图上不标任何文字、不加提示，三条竖线就是全部说明。
+ */
+@Composable
+private fun MemoryBreakdownBar(
+    parts: List<Float>,
+    modifier: Modifier = Modifier
+) {
+
+    val usedColor = MaterialTheme.colorScheme.primary
+
+    val modifiedColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+
+    val standbyColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+
+    val freeColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+
+    val dividerColor = MaterialTheme.colorScheme.background
+
+    Canvas(
+        modifier = modifier.clip(RoundedCornerShape(5.dp))
+    ) {
+
+        // 底：最右那一段（可用）不填主题色，只铺一层淡底
+        drawRect(color = freeColor, size = size)
+
+        var left = 0f
+
+        parts.take(3).forEachIndexed { index, part ->
+
+            val width = size.width * part
+
+            val color = when (index) {
+                0 -> usedColor
+                1 -> modifiedColor
+                else -> standbyColor
+            }
+
+            drawRect(color = color, topLeft = Offset(left, 0f), size = Size(width, size.height))
+
+            // 每段末尾一条竖线：三条线正好把四段分开
+            drawLine(
+                color = dividerColor,
+
+                start = Offset(left + width, 0f),
+
+                end = Offset(left + width, size.height),
+
+                strokeWidth = 1.dp.toPx()
+            )
+
+            left += width
+        }
     }
 }
 
@@ -1290,7 +1716,7 @@ private fun CpuDetailList(
  * 竖屏 / 窄浮窗底部的硬件选择条：**只有文字**，不带迷你图和数据小字。
  *
  * 为什么另做一套而不是把 [HardwareTab] 压扁：竖屏缺的是横向空间，
- * 一行五个等宽方块只要文字，宽度才够；迷你图在这个尺寸下也读不出信息。
+ * 一行等宽方块只要文字，宽度才够；迷你图在这个尺寸下也读不出信息。
  *
  * 选中项用主色容器着色，和宽屏那一列的视觉语言保持一致。
  */
@@ -1834,17 +2260,23 @@ private fun LogicalCoresChart(
  * 浮窗是 TYPE_APPLICATION_OVERLAY，弹 AlertDialog 会抛 BadTokenException 直接崩进程，
  * 所以改成在当前 Compose 窗口里自己画遮罩 + 卡片。两种观感一致（同项目其它页都是这个做法）。
  *
- * 五项现状：
+ * 四项现状（按硬件裁剪：内核那两项只在 CPU 页出现）：
  * 1) 内核图形口径：选得中、记得住；【逻辑处理器】那条曲线要等逐核数据接到 UI 才真画出来；
  * 2) 显示内核时间：状态留着，画法待定（内核时间还没采集）；
- * 3) 图形摘要视图：整页只剩图表，长按图表退出；
- * 4) 查看：只列出六个目标，点哪个都先关菜单什么也不做 —— 切页接口还没接；
- * 5) 复制：把当前硬件的复制文本写进系统剪贴板。CPU 走 [cpuClipboardText]（与任务管理器
- *    粘贴出来的一致），其余设备暂时是占位文本，等各自数据齐了再补。
+ * 3) 图形摘要视图：整页只剩图表（内存页还会带上「内存组合」分条图），双击图表退出；
+ * 4) 查看：只列出 CPU / 内存两个目标，点哪个都先关菜单什么也不做 —— 切页接口还没接；
+ * 5) 复制：把当前硬件的复制文本写进系统剪贴板。CPU 走 [cpuClipboardText]，
+ *    内存走 [memoryClipboardText]。
+ *
+ * 磁盘 / WLAN / GPU 的入口与它们的菜单项、占位复制文本已整体删除，重新设计时再加回。
+ *
+ * 为什么内存页不摆 1) 和 2)：内存既没有总体利用率 / 逻辑处理器这两个口径，
+ * 也没有内核时间这一说，摆上去只会在点的时候毫无反应。
  */
 @Composable
 private fun PerformanceChartDialog(
     hostedInOverlay: Boolean,
+    kind: HardwareKind,
     kernelGraphMode: String,
     showKernelTime: Boolean,
     onKernelGraphModeChange: (String) -> Unit,
@@ -1865,35 +2297,40 @@ private fun PerformanceChartDialog(
             modifier = Modifier.widthIn(min = 240.dp)
         ) {
 
-            ChartMenuHeading("将内核图形更改为(H)")
+            // 内核图形与内核时间是 CPU 专属：内存没有总体利用率、没有逻辑处理器，
+            // 也没有内核时间，这三行在内存页整组不画
+            if (kind == HardwareKind.CPU) {
 
-            ChartMenuRow(
-                label = "总体利用率(O)",
+                ChartMenuHeading("将图形更改为(H)")
 
-                marked = kernelGraphMode == CPU_KERNEL_GRAPH_TOTAL,
+                ChartMenuRow(
+                    label = "总体利用率(O)",
 
-                indented = true
-            ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_TOTAL) }
+                    marked = kernelGraphMode == CPU_KERNEL_GRAPH_TOTAL,
 
-            ChartMenuRow(
-                label = "逻辑处理器(L)",
+                    indented = true
+                ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_TOTAL) }
 
-                marked = kernelGraphMode == CPU_KERNEL_GRAPH_LOGICAL,
+                ChartMenuRow(
+                    label = "逻辑处理器(L)",
 
-                indented = true
-            ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_LOGICAL) }
+                    marked = kernelGraphMode == CPU_KERNEL_GRAPH_LOGICAL,
 
-            ChartMenuRow(
-                label = "显示内核时间(K)",
+                    indented = true
+                ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_LOGICAL) }
 
-                marked = showKernelTime
-            ) { onShowKernelTimeChange(!showKernelTime) }
+                ChartMenuRow(
+                    label = "显示内核时间(K)",
 
-            HorizontalDivider(
-                modifier = Modifier.padding(vertical = 6.dp),
+                    marked = showKernelTime
+                ) { onShowKernelTimeChange(!showKernelTime) }
 
-                color = MaterialTheme.colorScheme.outlineVariant
-            )
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 6.dp),
+
+                    color = MaterialTheme.colorScheme.outlineVariant
+                )
+            }
 
             ChartMenuRow(
                 label = "图形摘要视图(W)"
@@ -1907,7 +2344,8 @@ private fun PerformanceChartDialog(
 
             if (viewExpanded) {
 
-                // 六个目标排两行三列：这个宽度下再摊一列就挤了
+                // 现在只有 CPU 与内存两页，一行两列就够；
+                // 磁盘 / 网络 / GPU / NPU 那四个目标随各自的硬件入口一起删掉了
                 Row(
                     modifier = Modifier.fillMaxWidth()
                 ) {
@@ -1915,19 +2353,6 @@ private fun PerformanceChartDialog(
                     ChartMenuTarget("CPU(P)", Modifier.weight(1f), onDismiss)
 
                     ChartMenuTarget("内存(M)", Modifier.weight(1f), onDismiss)
-
-                    ChartMenuTarget("磁盘(D)", Modifier.weight(1f), onDismiss)
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-
-                    ChartMenuTarget("网络(N)", Modifier.weight(1f), onDismiss)
-
-                    ChartMenuTarget("GPU(G)", Modifier.weight(1f), onDismiss)
-
-                    ChartMenuTarget("NPU", Modifier.weight(1f), onDismiss)
                 }
             }
 
@@ -2333,5 +2758,25 @@ object ChartViewState {
             ChartViewStore.save(appContext, logical, kernel)
         }
     }
+}
+
+/**
+ * 性能页当前选中的硬件（进程级共享状态）。
+ *
+ * 之前这一项是页面内的 rememberSaveable，只在同一个 Activity 的同一个组合里有效：
+ * 竖屏、横屏、浮窗是三个宿主（浮窗还是另一个 Activity），切页时页面又整个离开组合，
+ * 于是每换一个地方都退回 CPU。挑硬件是用户的选择，不该跟着宿主走。
+ *
+ * 存名字不存 enum：以后加硬件时旧值认不出来，就退回 CPU，不会炸。
+ * 只在本文件的宿主里用，所以是 private，不对外暴露 HardwareKind。
+ */
+private object PerformanceSelection {
+
+    /** 当前选中硬件的枚举名，默认 CPU。 */
+    val kindName = mutableStateOf(HardwareKind.CPU.name)
+
+    /** 取当前选中的硬件；名字对不上（后续版本改了枚举）时退回 CPU。 */
+    val kind: HardwareKind
+        get() = HardwareKind.entries.firstOrNull { it.name == kindName.value } ?: HardwareKind.CPU
 }
 

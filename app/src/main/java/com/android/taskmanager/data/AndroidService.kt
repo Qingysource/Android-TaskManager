@@ -41,6 +41,7 @@ import android.util.Log
 import com.android.taskmanager.UpstreamIdentityMode
 import com.android.taskmanager.service.RootManager
 import com.android.taskmanager.service.ShizukuManager
+import java.io.File
 
 /**
  * 以 Service 形式常驻的数据提供者。
@@ -92,6 +93,17 @@ class AndroidService : Service() {
         /** 隔离进程 uid 段的起止（AID_ISOLATED_START / AID_ISOLATED_END）。 */
         private const val ISOLATED_UID_START = 99000
         private const val ISOLATED_UID_END = 99999
+
+        /**
+         * AVF 的系统特性名（PackageManager.FEATURE_VIRTUALIZATION_FRAMEWORK，API 34 起）。
+         *
+         * 写字面量而不是引用常量：常量只在 API 34 的编译库里存在，
+         * 直接引用会让低版本分支也挂上版本要求。
+         */
+        private const val AVF_FEATURE = "android.software.virtualization_framework"
+
+        /** AVF 组件的 APEX 目录：在就是这套组件已经装进系统镜像里。 */
+        private const val AVF_APEX_PATH = "/apex/com.android.virt"
 
         /** 当前运行的实例；未启动 / 已销毁时为 null。 */
         @Volatile
@@ -356,86 +368,86 @@ class AndroidService : Service() {
     // SYSTEM 设备数据（Android 层）
     //
     // 这一组是"Linux 内核不知道、只有 Android Framework 能回答"的系统级事实，
-    // 对应设备快照里 type=SYSTEM 的那台设备。现在只有 AVF 支持一项。
+    // 对应设备快照里 type=SYSTEM 的那台设备。现在只有 AVF 一项。
     //
-    // 为什么放在 Android 侧：AVF（Android Virtualization Framework）是 Framework
-    // 与 bootloader 共同决定的能力，/proc 与 sysfs 里没有可靠答案。
+    // 为什么分两步：
+    // 1) 有没有 AVF 组件：SDK >= 34 且 AVF 的 APEX 目录存在。
+    //    没有组件就根本不讨论"支持不支持"，界面上整行都不出现；
+    // 2) 组件在的时候才问框架：PackageManager 有没有 virtualization 特性，
+    //    有 = 是，没有 = 否。
+    //
+    // 两步都只与固件有关，各自缓存一次结果，不能每秒都查包管理器。
     // ============================================================
 
     /**
      * 取 Android 层的 SYSTEM 设备字段。
      *
-     * 结果只与设备固件有关，探测一次就缓存，不能每秒都起子进程读属性。
+     * avfComponentPresent 决定这一行出不出来；avfSupported 只在组件存在的设备上才有意义。
      */
-    fun systemFacts(): AndroidSystemFacts = AndroidSystemFacts(
-        avfSupported = avfSupportedOrNull()
-    )
+    fun systemFacts(): AndroidSystemFacts {
+
+        if (!shouldShowAvf()) {
+
+            return AndroidSystemFacts(avfComponentPresent = false, avfSupported = null)
+        }
+
+        return AndroidSystemFacts(
+            avfComponentPresent = true,
+            avfSupported = avfSupportedOrNull()
+        )
+    }
+
+    @Volatile
+    private var cachedShouldShowAvf: Boolean? = null
+
+    /**
+     * 系统里到底有没有 AVF 组件。
+     *
+     * AVF 从 Android 14 起以 APEX 形式独立升级，目录存在就说明这套组件装在机器里；
+     * 低于 14 的系统一律当作没有。
+     */
+    private fun shouldShowAvf(): Boolean {
+
+        cachedShouldShowAvf?.let { return it }
+
+        val result = Build.VERSION.SDK_INT >= 34 && File(AVF_APEX_PATH).exists()
+
+        cachedShouldShowAvf = result
+
+        return result
+    }
 
     @Volatile
     private var cachedAvfSupported: Boolean? = null
 
     @Volatile
-    private var avfProbed: Boolean = false
+    private var avfSupportedProbed: Boolean = false
 
     /**
-     * 这台设备是否支持 AVF。
+     * 这台设备是否支持 AVF（只在组件存在时问）。
      *
-     * 两条独立信号：
-     * 1) API 34 起有 `virtualization` 系统服务 —— 那是 AVF 对外的门面，
-     *    只有真支持 AVF 的设备才会注册它；
-     * 2) 属性 `ro.boot.hypervisor.vm.supported` —— AVF / pKVM 打开时由 bootloader 置 1。
-     *
-     * @return true = 支持；false = 明确不支持；null = 两条都问不出来（按"不提供"处理）
+     * 判据是 PackageManager 的系统特性；查询本身出错时返回 null（界面就不显示结论）。
      */
     private fun avfSupportedOrNull(): Boolean? {
 
-        if (avfProbed) return cachedAvfSupported
+        if (avfSupportedProbed) return cachedAvfSupported
 
         synchronized(uidIndexLock) {
 
-            if (avfProbed) return cachedAvfSupported
+            if (avfSupportedProbed) return cachedAvfSupported
 
-            val result = detectAvf()
+            val result = runCatching {
+                packageManager.hasSystemFeature(AVF_FEATURE)
+            }.getOrNull()
 
             cachedAvfSupported = result
-            avfProbed = true
+            avfSupportedProbed = true
 
-            record("AVF 探测：" + (result?.let { if (it) "支持" else "不支持" } ?: "未取到"))
+            record("AVF 支持：" + (result?.let { if (it) "是" else "否" } ?: "未取到"))
 
             return result
         }
     }
-
-    /** 真正的探测：先问系统服务，再退到 bootloader 属性。 */
-    private fun detectAvf(): Boolean? {
-
-        // 用字符串取名而不是常量：常量是 API 34 才有的，老设备编译期用不到
-        if (Build.VERSION.SDK_INT >= 34) {
-
-            val service = runCatching { getSystemService("virtualization") }.getOrNull()
-
-            if (service != null) return true
-        }
-
-        val property = readSystemProperty("ro.boot.hypervisor.vm.supported")
-
-        if (property != null) return property == "1"
-
-        return null
-    }
-
-    /** 读一条系统属性；读不到（命令不存在、被拦）返回 null，空值也算没读到。 */
-    private fun readSystemProperty(name: String): String? = runCatching {
-
-        val process = Runtime.getRuntime().exec(arrayOf("getprop", name))
-
-        val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
-
-        process.waitFor()
-
-        text.ifEmpty { null }
-
-    }.getOrNull()
 
     /** 最近的输出快照（UIService.upstreamOutput() 调它）。 */
     fun outputSnapshot(): String = synchronized(lineLock) {
@@ -620,9 +632,17 @@ data class ProcessSupplement(
  */
 data class AndroidSystemFacts(
     /**
-     * true = 支持 AVF；false / null = 都不显示这一行。
+     * 系统里有没有 AVF 组件（APEX 目录在，且系统是 Android 14 及以上）。
      *
-     * 用户明确要求：只有"显示"与"不提供"两种状态，界面不存在"AVF 支持：否"。
+     * false = 界面上整行都不出现，连"AVF 支持: 否"也不给；
+     * true  = 显示这一行，结论看 [avfSupported]。
+     */
+    val avfComponentPresent: Boolean = false,
+
+    /**
+     * 是否支持 AVF，只在组件存在时才有意义。
+     *
+     * true = 是，false = 否，null = 查询出错（这一行先不显示结论）。
      */
     val avfSupported: Boolean? = null
 )

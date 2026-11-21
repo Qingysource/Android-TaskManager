@@ -967,7 +967,8 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     //        —— 处理器商品名与虚拟化方案由 ELF 侧后续补实现，这里只负责把值透出去
     //   对外：IPageDataApi.performanceSnapshot() / performanceChartWindowLabel()
     //         / refreshPerformanceNow()
-    //   状态：CPU 这一组已接真实数据；内存 / 磁盘 / WLAN / GPU 仍是页面里的测试值
+    //   状态：CPU 与内存两组已接真实数据（内存曲线另有一份独立的历史队列）；
+    //        磁盘 / WLAN / GPU 的页面入口与占位数据已删除，重新设计时再接。
     //
     //   两个"谁负责"的结论（页面不要抢）：
     //   1) 采集节奏：本服务的定时器（间隔 = 设置页的实时更新速度），页面不自己计时；
@@ -1004,12 +1005,25 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     private val cpuUsageHistory = kotlin.collections.ArrayDeque<CpuUsagePoint>()
 
     /**
+     * 内存使用量的历史队列，规则与 [cpuUsageHistory] 完全一致（同一套点数上限、
+     * 同一个采样时刻、同一份"首点垫 0"的规矩）。
+     *
+     * 为什么另开一份：曲线的纵轴不同（CPU 是利用率，内存是占总量的百分比），
+     * 更重要的是某一帧 CPU 有值而内存没值时，只该让对应那条曲线断开，
+     * 不能把另一条也带断。percent 存的是 0..100，没有值的帧直接不入队。
+     */
+    private val memoryUsageHistory = kotlin.collections.ArrayDeque<CpuUsagePoint>()
+
+    /**
      * 推给页面的那一份（已按当前窗口裁剪）。
      *
      * 用 state 而不是让页面自己去读队列：写一次才重组一次，
      * 和 [performanceSnapshotState] 同拍，两个图的横轴始终对齐。
      */
     private val performanceHistoryState =
+        androidx.compose.runtime.mutableStateOf<List<CpuUsagePoint>>(emptyList())
+
+    private val performanceMemoryHistoryState =
         androidx.compose.runtime.mutableStateOf<List<CpuUsagePoint>>(emptyList())
 
     // ── 页面数据区 · 应用历史记录（ApphistoryScreen）──────────────
@@ -1552,6 +1566,11 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         // 切到性能页：先把后台已经采到的那一帧推上去，别让用户对着一屏破折号等下一拍。
         // 这里 force = true：切页上报与 Activity 的前台状态未必同一时刻到位。
         if (next == PAGE_PERFORMANCE) {
+
+            // 名称缓存只在这一下清：用户刚看这一页，名字值得重探一次；
+            // 其余字段不额外触发刷新，仍按"实时更新速度"的节拍走。
+            LinuxService.instanceOrNull()?.requestCpuNameRefreshOnce()
+
             performanceLastSnapshot?.let { pushPerformanceSnapshot(it, force = true) }
         }
 
@@ -1770,7 +1789,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      *
      * "已暂停"（间隔 0）时一次都不采：暂停就是连后台也别动，别偷偷发请求。
      */
-    private fun refreshPerformanceStatsIfEnabled() {
+    private fun refreshPerformanceStatsIfEnabled(force: Boolean = false) {
 
         if (pollIntervalMs(settingsSnapshot.updateSpeed) <= 0L) return
 
@@ -1785,11 +1804,16 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         // 采样时刻在这里取：ELF 那边只回"当前值"，时间轴由本服务自己的点来排，
         // 不依赖跨进程的时钟，也不受一次往返耗时的抖动影响。
-        appendCpuUsagePoint(merged, SystemClock.elapsedRealtime())
+        val sampleAt = SystemClock.elapsedRealtime()
+
+        appendCpuUsagePoint(merged, sampleAt)
+
+        // 内存曲线与 CPU 曲线共用同一个采样时刻：两条图同拍，横轴才对得上
+        appendMemoryUsagePoint(merged, sampleAt)
 
         performanceLastSnapshot = merged
 
-        pushPerformanceSnapshot(merged)
+        pushPerformanceSnapshot(merged, force = force)
     }
 
     /**
@@ -1798,14 +1822,17 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      * 为什么合并在 UIService：它是唯一聚合点（Linux / Android / 未来的 GPU 都在这里汇合），
      * 页面只该看到"填好的那一帧"，不该自己再去问一遍服务。
      *
-     * 现在只有一个字段（AVF 支持）。AndroidService 没起来 / 探测不到时原样返回，
-     * 帧里的 avfSupported 保持 null，页面据此判断"不显示这一行"。
+     * 现在只有 AVF 两项（组件是否存在、支持与否）。AndroidService 没起来时原样返回，
+     * 帧里 avfComponentPresent 保持 false，页面据此判断"整行不显示"。
      */
     private fun mergeAndroidSystem(snapshot: PerformanceSnapshot): PerformanceSnapshot {
 
         val facts = AndroidService.instanceOrNull()?.systemFacts() ?: return snapshot
 
-        return snapshot.copy(avfSupported = facts.avfSupported)
+        return snapshot.copy(
+            avfComponentPresent = facts.avfComponentPresent,
+            avfSupported = facts.avfSupported
+        )
     }
 
     /**
@@ -1882,6 +1909,51 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     private fun trimmedCpuHistory(): List<CpuUsagePoint> = cpuUsageHistory.toList()
 
     /**
+     * 往内存历史队列追加一个点。
+     *
+     * 纵轴是"占总量的百分比"，分母用 totalBytes（图表顶端那条线的含义），
+     * 与右侧统计区、图上方那行小字用的是同一套量。used 或 total 任一缺失就不入队：
+     * 内存数据是后接上的，首帧可能还没有总量，插一个 0 会在曲线上留一道假谷。
+     *
+     * 队列为空时同样先垫一个 0 起点，规矩与 CPU 那条一模一样。
+     */
+    private fun appendMemoryUsagePoint(snapshot: PerformanceSnapshot, atMs: Long) {
+
+        val memory = snapshot.memory ?: return
+
+        val total = memory.totalBytes ?: return
+
+        val used = memory.usedBytes ?: return
+
+        if (total <= 0L || used < 0L) return
+
+        val percent = (used.toDouble() / total.toDouble() * 100.0)
+            .toFloat()
+            .coerceIn(0f, 100f)
+
+        if (memoryUsageHistory.isEmpty()) {
+
+            memoryUsageHistory.addLast(
+                CpuUsagePoint(timeMs = atMs, percent = 0f)
+            )
+        }
+
+        memoryUsageHistory.addLast(
+            CpuUsagePoint(timeMs = atMs, percent = percent)
+        )
+
+        while (memoryUsageHistory.size > CPU_HISTORY_MAX_POINTS) {
+            memoryUsageHistory.removeFirst()
+        }
+    }
+
+    /**
+     * 交给界面的内存历史点：与 CPU 那份同一个规矩 —— 整段缓存直接给出去，不按时间裁。
+     * 三个更新档位共用同一份缓存，换档只影响新点进来的快慢。
+     */
+    private fun trimmedMemoryHistory(): List<CpuUsagePoint> = memoryUsageHistory.toList()
+
+    /**
      * 把一帧推到界面。
      *
      * @param force true = 不看可见性直接写（用在"用户刚切进性能页"这一下）：
@@ -1898,6 +1970,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         // 历史点与当前值同一拍推：两个图共用这一份，横轴不会错位
         performanceHistoryState.value = trimmedCpuHistory()
+
+        // 内存那一份同期推出去，否则内存曲线会停在"进入页面那一帧"
+        performanceMemoryHistoryState.value = trimmedMemoryHistory()
     }
 
     /** 性能页现在是否看得见：主界面在前台并选中它，或浮窗正停在它上面。 */
@@ -1928,6 +2003,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
     override fun performanceCpuHistory(): List<CpuUsagePoint> = performanceHistoryState.value
 
+    override fun performanceMemoryHistory(): List<CpuUsagePoint> =
+        performanceMemoryHistoryState.value
+
     override fun performanceChartWindowLabel(): String =
         performanceChartWindowLabel(settingsSnapshot.updateSpeed)
 
@@ -1936,14 +2014,19 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         // 已暂停：用户要求不自动更新，这里也别偷偷采一帧
         if (pollIntervalMs(settingsSnapshot.updateSpeed) <= 0L) return false
 
-        if (LinuxService.instanceOrNull() == null) return false
+        val linux = LinuxService.instanceOrNull() ?: return false
+
+        // 这是"用户刚进到本页"的入口，唯一值得重算 CPU 名称的时机；
+        // 只清名称缓存，不改变其它字段的刷新承诺（它们仍按更新速度走）。
+        linux.requestCpuNameRefreshOnce()
 
         // 已经有一轮在跑：那一轮结束时自然会把最新帧推上来，这里不排队
         if (!engineRefreshRunning.compareAndSet(false, true)) return true
 
         linuxPollExecutor.execute {
             try {
-                refreshPerformanceStatsIfEnabled()
+                // force = true：用户此刻就在这一页，不必再等可见性判定成立
+                refreshPerformanceStatsIfEnabled(force = true)
             } catch (e: Exception) {
                 Log.w(TAG, "性能页立即刷新失败：${e.message}")
             } finally {

@@ -1,0 +1,73 @@
+# CPUNAME.txt —— SoC 型号到商品展示名的对照表
+#
+# 格式：一行一条，第一列是型号（不分大小写），第一个空格之后的整段都是展示名。
+#       # 开头是注释，空行忽略，UTF-8 编码。
+# 维护：只加核实过的对应关系。型号与商品名对不上，比显示型号更糟。
+# 加新平台不用改代码，追加一行就行。
+
+# Qualcomm - Snapdragon 8
+sm8450 Qualcomm(R) Snapdragon(R) 8 Gen 1
+sm8475 Qualcomm(R) Snapdragon(R) 8+ Gen 1
+sm8550 Qualcomm(R) Snapdragon(R) 8 Gen 2
+sm8635 Qualcomm(R) Snapdragon(R) 8s Gen 3
+sm8650 Qualcomm(R) Snapdragon(R) 8 Gen 3
+sm8735 Qualcomm(R) Snapdragon(R) 8s Gen 4
+sm8750 Qualcomm(R) Snapdragon(R) 8 Elite
+sm8845 Qualcomm(R) Snapdragon(R) 8 Gen 5
+sm8850 Qualcomm(R) Snapdragon(R) 8 Elite Gen 5
+sm8950 Qualcomm(R) Snapdragon(R) 8 Elite Gen 6
+sm8975 Qualcomm(R) Snapdragon(R) 8 Elite Extreme Gen 6
+
+# Qualcomm - Snapdragon 7
+sm7350 Qualcomm(R) Snapdragon(R) 780G
+sm7450 Qualcomm(R) Snapdragon(R) 7 Gen 1
+sm7475 Qualcomm(R) Snapdragon(R) 7+ Gen 2
+sm7435 Qualcomm(R) Snapdragon(R) 7s Gen 2
+sm7550 Qualcomm(R) Snapdragon(R) 7 Gen 3
+sm7675 Qualcomm(R) Snapdragon(R) 7+ Gen 3
+sm7750 Qualcomm(R) Snapdragon(R) 7 Gen 4
+
+# Qualcomm - Snapdragon 6
+sm6350 Qualcomm(R) Snapdragon(R) 690 5G
+sm6450 Qualcomm(R) Snapdragon(R) 6 Gen 1
+sm6475 Qualcomm(R) Snapdragon(R) 6 Gen 3
+sm6650 Qualcomm(R) Snapdragon(R) 6 Gen 4
+sm6850 Qualcomm(R) Snapdragon(R) 6 Gen 5
+sm6435 Qualcomm(R) Snapdragon(R) 6s Gen 4
+
+# Qualcomm - Snapdragon 4
+sm4375 Qualcomm(R) Snapdragon(R) 4 Gen 1
+sm4450 Qualcomm(R) Snapdragon(R) 4 Gen 2
+
+# Qualcomm - Classic Snapdragon
+msm8916 Qualcomm(R) Snapdragon(R) 410
+msm8939 Qualcomm(R) Snapdragon(R) 615
+msm8952 Qualcomm(R) Snapdragon(R) 617
+msm8953 Qualcomm(R) Snapdragon(R) 625
+msm8976 Qualcomm(R) Snapdragon(R) 652
+msm8998 Qualcomm(R) Snapdragon(R) 835
+sdm660 Qualcomm(R) Snapdragon(R) 660
+sdm670 Qualcomm(R) Snapdragon(R) 670
+sdm710 Qualcomm(R) Snapdragon(R) 710
+sdm712 Qualcomm(R) Snapdragon(R) 712
+sdm730 Qualcomm(R) Snapdragon(R) 730
+sdm730g Qualcomm(R) Snapdragon(R) 730G
+sdm845 Qualcomm(R) Snapdragon(R) 845
+
+# MediaTek
+mt6991 MediaTek Dimensity 9500s
+mt6993 MediaTek Dimensity 9500
+mt6994 MediaTek Dimensity 9600M
+mt6995 MediaTek Dimensity 9600 Pro
+
+# Google
+gs101 Google Tensor G1
+gs201 Google Tensor G2
+gs301 Google Tensor G3
+gs401 Google Tensor G4
+
+# Samsung
+s5e8855 Samsung Exynos 1580
+s5e8865 Samsung Exynos 1680
+s5e9955 Samsung Exynos 2500
+s5e9965 Samsung Exynos 2600

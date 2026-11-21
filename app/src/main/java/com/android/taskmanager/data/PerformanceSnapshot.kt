@@ -83,16 +83,39 @@ data class PerformanceSnapshot(
     val l3CacheKb: Int? = null,
 
     /**
-     * AVF（Android Virtualization Framework）支持。
+     * 是不是虚拟机客人（本程序自己就跑在虚拟机里）。
      *
-     * 这一格属于 Android 层数据（由 UIService 从 AndroidService 的 SYSTEM 数据并进来），
+     * Linux 侧这一版恒报 0（Android 上没有可靠的检测手段，按约定先固定），
+     * 所以正常装机永远是 false。一旦是 true，明细块只留"虚拟机: 是"一行，
+     * 虚拟化与 AVF 两行都让位 —— 虚拟机里讨论这些没有意义。
+     */
+    val isVirtualMachine: Boolean = false,
+
+    /**
+     * 系统里有没有 AVF 组件（SDK >= 34 且 /apex/com.android.virt 存在）。
+     *
+     * 这一格属于 Android 层数据（UIService 从 AndroidService 的 SYSTEM 数据并进来）。
+     * false = 整行都不显示，连"AVF 支持: 否"也不出现；
+     * true  = 显示，值看 [avfSupported]（true 是 / false 否）。
+     */
+    val avfComponentPresent: Boolean = false,
+
+    /**
+     * AVF（Android Virtualization Framework）支持情况。
+     *
+     * 只在 [avfComponentPresent] 为 true 时参与显示：
+     * true = 支持（"是"），false = 不支持（"否"），null = 查不到，不显示。
      * Linux 侧不知道它，所以 [from] 解析设备快照时永远是 null。
-     *
-     * 用法只有两种：true = 支持，页面显示"AVF 支持：是"；
-     * false / null = 一律**不出现这一行** —— 明确不支持与探测不到都按"不提供"处理，
-     * 界面不存在"AVF 支持：否"这种文案。
      */
     val avfSupported: Boolean? = null,
+
+    /**
+     * 内存页要用的那一组字段（一次设备快照里的 MEMORY 设备块）。
+     *
+     * 目前没有数据源，[from] 不填它，恒为 null —— 页面按"读不到"渲染（破折号），
+     * 不拿 0 冒充。接入时只改 [from] 的取值，页面侧不用动。
+     */
+    val memory: MemorySnapshot? = null,
 
     /** 采到这一帧的时刻（SystemClock.elapsedRealtime），只用于判断"是不是新一帧"。 */
     val receivedAtMs: Long = 0L
@@ -109,6 +132,27 @@ data class PerformanceSnapshot(
     fun cpuUsageText(decimals: Int = 0): String =
         cpuUsagePercent?.let { String.format(Locale.US, "%.${decimals.coerceIn(0, 2)}f%%", it) } ?: "—"
 
+    /**
+     * 内存使用率文案：占用 / 总量，0..100，与内存图纵轴同一口径（顶端 = 实际内存大小）。
+     *
+     * 左栏那一行用它。没有内存帧、或总量 / 占用任一缺失就写破折号：
+     * 分母不知道的时候百分比没有意义。
+     */
+    fun memoryUsageText(decimals: Int = 0): String {
+
+        val memory = memory ?: return "—"
+
+        val total = memory.totalBytes ?: return "—"
+
+        val used = memory.usedBytes ?: return "—"
+
+        if (total <= 0L) return "—"
+
+        val percent = used.toDouble() / total.toDouble() * 100.0
+
+        return String.format(Locale.US, "%.${decimals.coerceIn(0, 2)}f%%", percent)
+    }
+
     /** 当前频率：MHz 换成 GHz，两位小数。 */
     fun cpuSpeedText(): String = speedText(cpuSpeedMhz)
 
@@ -124,16 +168,35 @@ data class PerformanceSnapshot(
     /** 三级缓存：没有这一级就说"不支持"，不要说 0 MB。 */
     fun l3Text(): String = l3CacheKb?.let { megabyteText(it) } ?: "不支持"
 
-    /** 虚拟化：后端没报就当不支持。 */
-    fun virtualizationText(): String = virtualization ?: "不支持"
+    /**
+     * 虚拟化：后端给什么就显示什么（"不支持 / 已禁用 / 已启用(KVM)" 整串直出）。
+     *
+     * 返回 null = 整行不出现，只有一种情况：本程序自己跑在虚拟机里。
+     */
+    fun virtualizationText(): String? =
+        if (isVirtualMachine) null else (virtualization ?: "不支持")
+
+    /** 虚拟机：只在确实是虚拟机时给"是"，其余一律整行不出现（没有"否"这个状态）。 */
+    fun virtualMachineText(): String? = if (isVirtualMachine) "是" else null
 
     /**
-     * AVF 支持文案：只有明确支持才给"是"。
+     * AVF 支持文案。
      *
-     * 返回 null = 页面整行不出现（明确不支持与探测不到都归这一类）。
-     * 调用方必须用 nullable 判断，不要拿"否"去凑一行。
+     * 返回 null = 整行不出现：是虚拟机 / 系统里没有 AVF 组件 / 支持情况查不到。
+     * 组件在、且结论明确时给"是"或"否"。
      */
-    fun avfText(): String? = if (avfSupported == true) "是" else null
+    fun avfText(): String? {
+
+        if (isVirtualMachine) return null
+
+        if (!avfComponentPresent) return null
+
+        return when (avfSupported) {
+            true -> "是"
+            false -> "否"
+            null -> null
+        }
+    }
 
     /** 开机时长：天:时:分:秒。 */
     fun uptimeText(): String {
@@ -216,6 +279,11 @@ data class PerformanceSnapshot(
 
                 virtualization = cpuFields.textValueOf("virtualization"),
 
+                // 0 / 1，缺省按"不是虚拟机"处理；1 与 "true" 都认，方便以后换写法
+                isVirtualMachine = cpuFields.textValueOf("is_vm")?.let {
+                    it == "1" || it.equals("true", ignoreCase = true)
+                } ?: false,
+
                 processCount = systemFields.intOf("process_count"),
 
                 threadCount = systemFields.intOf("thread_count"),
@@ -234,7 +302,91 @@ data class PerformanceSnapshot(
 
                 l2CacheKb = cpuFields.intOf("l2_cache_kb"),
 
-                l3CacheKb = cpuFields.intOf("l3_cache_kb")
+                l3CacheKb = cpuFields.intOf("l3_cache_kb"),
+
+                // 内存整块来自 MEMORY 设备；这一版没有该设备（老后端）就留空，页面显示破折号
+                memory = packet.deviceOf(LinuxProtocol.DEVICE_TYPE_MEMORY)?.fields
+                    ?.let { buildMemorySnapshot(it) }
+            )
+        }
+
+        /**
+         * 从 MEMORY 设备的字段拼一帧内存数据。
+         *
+         * 键名与 C 侧逐项一致（都带 _bytes，单位字节）；读不到的项在包里是 `!状态`，
+         * [valueOf] 会折成 null，页面按破折号显示，不拿 0 顶替。
+         *
+         * 分条图四段在这里换算成占总量比例，并把「已修改」从「使用中」里扣掉：
+         * Dirty / Writeback 本来就属于已用，不扣的话两段会重叠，归一化后
+         * 使用中会平白多出一块。
+         */
+        private fun buildMemorySnapshot(fields: Map<String, String>): MemorySnapshot {
+
+            val total = fields.longOf("total_bytes")
+
+            val usedBytes = fields.longOf("used_bytes")
+
+            val modifiedBytes = fields.longOf("modified_bytes")
+
+            val standbyBytes = fields.longOf("standby_bytes")
+
+            val freeBytes = fields.longOf("free_bytes")
+
+            fun partOf(bytes: Long?): Float? {
+
+                val whole = total ?: return null
+
+                if (bytes == null || whole <= 0L) return null
+
+                return (bytes.toDouble() / whole.toDouble()).toFloat()
+            }
+
+            val usedNetBytes = when {
+                usedBytes == null -> null
+                modifiedBytes == null -> usedBytes
+                else -> (usedBytes - modifiedBytes).coerceAtLeast(0L)
+            }
+
+            return MemorySnapshot(
+                totalBytes = total,
+
+                nominalBytes = fields.longOf("nominal_bytes"),
+
+                specText = fields.textValueOf("spec"),
+
+                usedBytes = usedBytes,
+
+                compressedBytes = fields.longOf("compressed_bytes"),
+
+                availableBytes = fields.longOf("available_bytes"),
+
+                committedBytes = fields.longOf("committed_bytes"),
+
+                commitLimitBytes = fields.longOf("commit_limit_bytes"),
+
+                cachedBytes = fields.longOf("cached_bytes"),
+
+                reclaimableKernelBytes = fields.longOf("reclaimable_kernel_bytes"),
+
+                nonReclaimableKernelBytes = fields.longOf("nonreclaimable_kernel_bytes"),
+
+                speedRawText = fields.textValueOf("speed_raw"),
+
+                usedSlots = fields.intOf("used_slots"),
+
+                totalSlots = fields.intOf("total_slots"),
+
+                formFactor = fields.textValueOf("form_factor"),
+
+                reservedBytes = fields.longOf("reserved_bytes"),
+
+                usedPart = partOf(usedNetBytes),
+
+                modifiedPart = partOf(modifiedBytes),
+
+                standbyPart = partOf(standbyBytes),
+
+                freePart = partOf(freeBytes)
             )
         }
 
@@ -300,4 +452,303 @@ data class CpuUsagePoint(
     val corePercents: List<Float> = emptyList(),
     val coreKernels: List<Float> = emptyList()
 )
+
+/**
+ * 内存页要显示的一整份数据。
+ *
+ * 字段全部可空：底层查不到就是 null，页面显示破折号。
+ * **不要用 0 顶替 null** —— "这一项是 0" 与 "这一项没读到" 是两件不同的事，
+ * 前者能参与计算，后者不能。
+ *
+ * 现在还没有数据源：`PerformanceSnapshot.from()` 不解这一块，页面拿到 null 就按空帧渲染。
+ * 接入时只往 from() 里填字段，页面与文案函数都不用改。
+ *
+ * 单位一律用字节存：网络协议、/proc、SMBIOS 出来的都是字节或 KB，
+ * 换算成 GB / MB 是显示层的事（按量级自动选单位，见 [memorySizeText]）。
+ *
+ * @param totalBytes            实际内存大小（MemTotal，内核能用的量，图表顶端刻度）
+ * @param nominalBytes          标称容量（高通 dt 的 ddr_size，商品上写的那个数）；Linux 给不出就是 null
+ * @param specText              内存规格，如 LPDDR5 / LPDDR4X / DDR3（高通 ddr_device_type 枚举换算）
+ * @param usedBytes             使用中
+ * @param compressedBytes       其中已压缩的部分（Windows 的「使用中(已压缩)」括号里那个）
+ * @param availableBytes        可用
+ * @param committedBytes        已提交（已用）
+ * @param commitLimitBytes      提交上限
+ * @param cachedBytes           已缓存
+ * @param reclaimableKernelBytes    可回收内核缓存
+ * @param nonReclaimableKernelBytes 不可回收内核缓存
+ * @param speedRawText          速度的原始文本：底层给纯数字就拼成 "3200 MT/秒"，
+ *                              给 "不支持" / "获取失败" 这类现成话术就原样摆出来，不做二次加工
+ * @param usedSlots             已使用的插槽数（缺省按 1 算）
+ * @param totalSlots            插槽总数（缺省按 1 算）
+ * @param formFactor            外观规格（SODIMM / 板载 …）；底层给不出就是 null，页面写"其他"
+ * @param reservedBytes         为硬件保留的内存
+ * @param usedPart              分条图四段的比例（0..1，不用自己凑成 1，显示时会归一）
+ * @param modifiedPart
+ * @param standbyPart
+ * @param freePart
+ */
+data class MemorySnapshot(
+    val totalBytes: Long? = null,
+    val nominalBytes: Long? = null,
+    val specText: String? = null,
+    val usedBytes: Long? = null,
+    val compressedBytes: Long? = null,
+    val availableBytes: Long? = null,
+    val committedBytes: Long? = null,
+    val commitLimitBytes: Long? = null,
+    val cachedBytes: Long? = null,
+    val reclaimableKernelBytes: Long? = null,
+    val nonReclaimableKernelBytes: Long? = null,
+    val speedRawText: String? = null,
+    val usedSlots: Int? = null,
+    val totalSlots: Int? = null,
+    val formFactor: String? = null,
+    val reservedBytes: Long? = null,
+    val usedPart: Float? = null,
+    val modifiedPart: Float? = null,
+    val standbyPart: Float? = null,
+    val freePart: Float? = null
+) {
+
+    // ---------- 显示文案 ----------
+
+    /** 图表右上角：实际内存大小（这一行同时是图表顶端那条线的含义）。 */
+    fun totalText(): String = memorySizeText(totalBytes)
+
+    /**
+     * 名称行右侧：「标称容量 内存规格」，如 `8.0 GB LPDDR5`；缺哪项就少哪项。
+     *
+     * 容量优先用标称值（商品上写的 8 GB），拿不到才退到 MemTotal ——
+     * 后者被保留区啃过一截，会和标签上的数字对不上。
+     */
+    fun nameText(): String = buildList {
+
+        (nominalBytes ?: totalBytes)?.let { add(memorySizeText(it)) }
+
+        specText?.takeIf { it.isNotBlank() }?.let { add(it.trim()) }
+
+    }.joinToString(" ").ifEmpty { "—" }
+
+    /**
+     * 使用中：主值 + 括号里的已压缩部分。
+     *
+     * 括号里读不到时写破折号，不写 0 MB：0 表示"这台机器没开压缩内存"，是有效值，
+     * 用它顶替"读不到"会把两种情况混成一种。
+     */
+    fun usedText(): String {
+
+        if (usedBytes == null) return "—"
+
+        val compressed = compressedBytes?.let { memorySizeText(it) } ?: "—"
+
+        return "${memorySizeText(usedBytes)} ($compressed)"
+    }
+
+    fun availableText(): String = memorySizeText(availableBytes)
+
+    /**
+     * 已提交：`已用/上限`。
+     *
+     * 两个数统一到同一把尺子 —— 取大的那个定单位，小的换算成它的小数（
+     * 比如 `1.2/0.8 GB`），单位只在末尾写一次：
+     * 一格宽度有限，写两遍单位会把数字挤出去。
+     */
+    fun committedText(): String {
+
+        val used = committedBytes ?: return "—"
+
+        val limit = commitLimitBytes ?: return memorySizeText(used)
+
+        return rangeText(used, limit)
+    }
+
+    /**
+     * 已用/总量，例 `8.4/11.0 GB`：左栏那一行的小字用。
+     *
+     * 与已提交同一套写法（同一把尺子、单位只写一次）；总量拿不到就只报已用。
+     */
+    fun amountText(): String {
+
+        val used = usedBytes ?: return "—"
+
+        val total = totalBytes ?: return memorySizeText(used)
+
+        return rangeText(used, total)
+    }
+
+    /**
+     * 两个字节量并排写成 `a/b 单位`。
+     *
+     * 单位取两个数里大的那个来定（GB 就按 GB 写，都不到 1 GB 就按 MB 写），
+     * 小的那个换算成同一单位的小数，单位只在末尾出现一次：
+     * 一格宽度有限，写两遍单位会把数字挤出去。
+     */
+    private fun rangeText(first: Long, second: Long): String {
+
+        val unitBytes = memoryUnitBytes(maxOf(first, second))
+
+        val digits = if (unitBytes == MEMORY_GB_BYTES) 1 else 0
+
+        val firstText = String.format(
+            Locale.US, "%.${digits}f", first.toDouble() / unitBytes.toDouble()
+        )
+
+        val secondText = String.format(
+            Locale.US, "%.${digits}f", second.toDouble() / unitBytes.toDouble()
+        )
+
+        return "$firstText/$secondText ${memoryUnitName(unitBytes)}"
+    }
+
+    fun cachedText(): String = memorySizeText(cachedBytes)
+
+    fun reclaimableText(): String = memorySizeText(reclaimableKernelBytes)
+
+    fun nonReclaimableText(): String = memorySizeText(nonReclaimableKernelBytes)
+
+    /**
+     * 速度：单位是 MT/秒（每秒百万次传输），不是 MHz，别自作主张换算。
+     *
+     * 底层可能给不出数字。给了纯数字才补单位，给的是别的话术（不支持、获取失败）
+     * 就原样显示 —— 这些也算有效信息，不该被吞掉。
+     *
+     * 只有"底层压根没给这一项"才返回 null，上层据此整行不显示：
+     * 没有数据就别占一行破折号位置。
+     */
+    fun speedText(): String? {
+
+        val raw = speedRawText?.trim()
+
+        if (raw.isNullOrEmpty()) return null
+
+        val numeric = raw.toDoubleOrNull() ?: return raw
+
+        val whole = if (numeric == numeric.toLong().toDouble()) {
+            numeric.toLong().toString()
+        } else {
+            numeric.toString()
+        }
+
+        return "$whole MT/秒"
+    }
+
+    /**
+     * 已使用的插槽：`已用/总数`。
+     *
+     * 没数据时按 1/1 显示（底层不接力时画面也是完整的），
+     * 只有总数缺失这种半截情况才拿已用数兜住总数，免得出现 "2/1"。
+     */
+    fun slotsText(): String {
+
+        val used = usedSlots ?: 1
+
+        val total = totalSlots ?: maxOf(used, 1)
+
+        return "$used/$total"
+    }
+
+    /** 外观规格：底层给不出就写"其他"（比"未知"读起来像正常答案），这同样不是错误状态。 */
+    fun formFactorText(): String = formFactor?.takeIf { it.isNotBlank() } ?: "其他"
+
+    fun reservedText(): String = memorySizeText(reservedBytes)
+
+    /**
+     * 分条图四段的比例，按「使用中 → 已修改 → 备用 → 可用」的顺序。
+     *
+     * 缺失的段用默认值补齐，最后归一成合计 1.0（画布的宽度就是总容量）。
+     * 数据源还没接，所以现在四段全是默认值 —— 图形能先照设计画出来。
+     */
+    fun breakdownParts(): List<Float> {
+
+        val parts = listOf(
+            usedPart ?: DEFAULT_USED_PART,
+            modifiedPart ?: DEFAULT_MODIFIED_PART,
+            standbyPart ?: DEFAULT_STANDBY_PART,
+            freePart ?: DEFAULT_FREE_PART
+        ).map { it.coerceAtLeast(0f) }
+
+        val total = parts.sum()
+
+        if (total <= 0f) return DEFAULT_PARTS
+
+        return parts.map { it / total }
+    }
+
+    companion object {
+
+        /** 还没有数据源时的默认四段比例（只为把图画出来看版式，合计 1）。 */
+        private const val DEFAULT_USED_PART = 0.45f
+
+        private const val DEFAULT_MODIFIED_PART = 0.05f
+
+        private const val DEFAULT_STANDBY_PART = 0.28f
+
+        private const val DEFAULT_FREE_PART = 0.22f
+
+        val DEFAULT_PARTS: List<Float> = listOf(
+            DEFAULT_USED_PART, DEFAULT_MODIFIED_PART, DEFAULT_STANDBY_PART, DEFAULT_FREE_PART
+        )
+    }
+}
+
+/**
+ * 字节数 -> 人能读的长度，**按量级自动挑单位**（不是固定 GB 或固定 MB）。
+ *
+ * 规则与大数字的读法一致：GB 留一位小数（16.0 GB），MB / KB 取整（512 MB），
+ * 不足 1 KB 写字节。null 或负数写破折号，不当成 0。
+ */
+internal fun memorySizeText(bytes: Long?): String {
+
+    if (bytes == null || bytes < 0L) return "—"
+
+    // 0 也按 MB 写：这一格几乎都在 MB 以上量级，写 0 B 会被当成没格式化干净
+    if (bytes == 0L) return "0 MB"
+
+    val kilobytes = 1024.0
+
+    return when {
+
+        bytes >= 1024L * 1024L * 1024L ->
+            String.format(Locale.US, "%.1f GB", bytes / (kilobytes * kilobytes * kilobytes))
+
+        bytes >= 1024L * 1024L ->
+            String.format(Locale.US, "%.0f MB", bytes / (kilobytes * kilobytes))
+
+        bytes >= 1024L -> String.format(Locale.US, "%.0f KB", bytes / kilobytes)
+
+        else -> "$bytes B"
+    }
+}
+
+/** 内存长度的四个尺子，和 [memorySizeText] 用的是同一组 1024 进制。 */
+private const val MEMORY_KB_BYTES = 1024L
+
+private const val MEMORY_MB_BYTES = 1024L * 1024L
+
+private const val MEMORY_GB_BYTES = 1024L * 1024L * 1024L
+
+/** 按参考量级挑一把尺子：参考值够大就用大单位，最小到字节。 */
+private fun memoryUnitBytes(reference: Long): Long = when {
+
+    reference >= MEMORY_GB_BYTES -> MEMORY_GB_BYTES
+
+    reference >= MEMORY_MB_BYTES -> MEMORY_MB_BYTES
+
+    reference >= MEMORY_KB_BYTES -> MEMORY_KB_BYTES
+
+    else -> 1L
+}
+
+/** 尺子对应的单位名，与 [memorySizeText] 输出的那几个写法一致。 */
+private fun memoryUnitName(unitBytes: Long): String = when (unitBytes) {
+
+    MEMORY_GB_BYTES -> "GB"
+
+    MEMORY_MB_BYTES -> "MB"
+
+    MEMORY_KB_BYTES -> "KB"
+
+    else -> "B"
+}
 

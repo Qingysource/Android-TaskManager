@@ -931,6 +931,15 @@ interface IPageDataApi {
     fun performanceCpuHistory(): List<CpuUsagePoint>
 
     /**
+     * 内存使用量的历史采样点，按时间升序，同样**整段缓存交出来，不按窗口裁**。
+     *
+     * 与 CPU 那份是两条独立的队列：内存曲线的纵轴是"占总量的百分比"，
+     * 点数、间隔规则完全一样，但两者不能共用一份数组（一台机器的 CPU 与内存
+     * 采样帧数不一定对得上）。点里只有 percent 有意义，逐核两列恒为空。
+     */
+    fun performanceMemoryHistory(): List<CpuUsagePoint>
+
+    /**
      * 图表窗口那一行文案，例如 60 秒内的利用率 % / 30 秒内的利用率 % / 4 分钟内的利用率 % / 利用率 % (已暂停)。
      *
      * **只在切进性能页时调一次**：用户要改实时更新速度必须回设置页，
