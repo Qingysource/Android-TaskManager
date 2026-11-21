@@ -37,3 +37,6 @@ target_compile_options(task_backend PRIVATE -Os -g0 -Wall -Wextra)
 target_link_options(task_backend PRIVATE -Wl,--gc-sections)
 
 # 预留：新增后端源文件时，在此扩展 add_executable 的源文件列表与链接库。
+
+# 显卡那一节用 dlopen 查 Vulkan 版本，Android 上 dlopen 在 libdl 里。
+target_link_libraries(task_backend dl)

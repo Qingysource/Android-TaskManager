@@ -59,6 +59,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -73,25 +74,15 @@ import com.android.taskmanager.service.SettingsStore
 import com.android.taskmanager.service.UIService
 import com.android.taskmanager.service.ShizukuManager
 import com.android.taskmanager.service.RootManager
+import com.android.taskmanager.manager.PageManagers
 
 // ============================================================
 // Full-screen Chart Summary
 // ============================================================
-
-/**
- * 图形摘要视图开关（进程级共享状态）。
- *
- * 为什么需要一个跨组件的东西：进入摘要视图要求 MainPage 把左侧导航栏、页名行、
- * 窄屏顶栏全部让出来；而退出（长按图表）发生在 PerformanceScreen 内部。
- * 这两个 Composable 不是父子关系，只能靠同一个状态打通。
- *
- * 只在性能页生效：MainPage 判断时同时看开关和当前页，切到别的页不会误伤。
- */
-object ChartSummaryView {
-
-    /** 是否处于图形摘要视图。 */
-    val active = mutableStateOf(false)
-}
+//
+// 图形摘要视图的开关不在本文件：它是性能页的页面状态，由性能页管理器持有
+// （manager/PerformanceManager.kt 的 summaryActive）。本文件只读它来决定
+// 导航栏 / 页名行 / 顶栏让不让位，写它的是性能页自己（双击进入、双击退出）。
 
 // ============================================================
 // Activity Entry
@@ -619,7 +610,8 @@ private fun MainPage(
         // 图形摘要视图：性能页要求整页只剩图表，导航栏 / 页名行 / 顶栏全部让位。
         // 用 if / else if 而不是在页面内部藏，是因为这三块都在本函数里画，
         // 页面没有能力也不该去动别人的导航。
-        val chartSummary = ChartSummaryView.active.value && selectedPage == TaskPage.Performance
+        val chartSummary = PageManagers.performance(LocalContext.current).summaryActive &&
+            selectedPage == TaskPage.Performance
 
         if (chartSummary) {
 

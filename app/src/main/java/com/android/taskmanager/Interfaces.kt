@@ -48,9 +48,8 @@ import com.android.taskmanager.data.LinuxControlCode
 import com.android.taskmanager.data.LinuxField
 import com.android.taskmanager.data.LinuxPacket
 import com.android.taskmanager.data.LinuxProtocol
-import com.android.taskmanager.data.CpuUsagePoint
-import com.android.taskmanager.data.LinuxRequestType
 import com.android.taskmanager.data.PerformanceSnapshot
+import com.android.taskmanager.data.LinuxRequestType
 import com.android.taskmanager.data.ProcessScope
 import kotlinx.coroutines.flow.StateFlow
 
@@ -906,38 +905,9 @@ interface IPageDataApi {
     //
     // 什么时候采：UIService 的定时器，间隔就是设置页的"实时更新速度"
     //            （高 0.5s / 常规 1s / 低 4s；"已暂停"一次都不采）。
-    // 什么时候推 UI：只有性能页看得见（主界面选中它，或浮窗停在它上面）才写可观察状态；
-    //              其余时候只更新内部缓存 —— 后台采集不中断，界面重组不白花。
-
-    /**
-     * 性能页最近一帧（没采过就是各字段为 null 的空帧）。
-     *
-     * 这个值本身是 Compose 的可观察状态：页面直接读它就会随新帧自动重组，
-     * 不需要页面自己计时轮询。
-     */
-    fun performanceSnapshot(): PerformanceSnapshot
-
-    /**
-     * CPU 利用率的历史采样点，按时间升序，**整段缓存交出来，不按窗口裁**。
-     *
-     * 大图表与左列迷你图共用这一份，只是取点不同（大图取尾部固定个数、迷你图再少取几个），
-     * 所以两个图不可能对不上——它们就不是两份数据。
-     *
-     * 点的数量由采样多久产生一个决定（0.5s / 1s / 4s），但**三个档位共用同一份缓存**：
-     * 换更新速度不清数据、不换窗口，图上画多少个点也固定不变，
-     * 变的只有新点进来的快慢和图表标签那行文字。缓存上限受 CPU_HISTORY_MAX_POINTS 约束。
-     * "已暂停"时不再产生新点，已有点照旧返回（暂停前那段曲线还在）。
-     */
-    fun performanceCpuHistory(): List<CpuUsagePoint>
-
-    /**
-     * 内存使用量的历史采样点，按时间升序，同样**整段缓存交出来，不按窗口裁**。
-     *
-     * 与 CPU 那份是两条独立的队列：内存曲线的纵轴是"占总量的百分比"，
-     * 点数、间隔规则完全一样，但两者不能共用一份数组（一台机器的 CPU 与内存
-     * 采样帧数不一定对得上）。点里只有 percent 有意义，逐核两列恒为空。
-     */
-    fun performanceMemoryHistory(): List<CpuUsagePoint>
+    // 帧怎么交给界面：UIService 只负责广播（addPerformanceFrameListener），
+    // 历史队列、当前帧、图表偏好这些页面私有数据都由性能页管理器持有，
+    // 所以这里不再有"取快照 / 取历史"的方法。
 
     /**
      * 图表窗口那一行文案，例如 60 秒内的利用率 % / 30 秒内的利用率 % / 4 分钟内的利用率 % / 利用率 % (已暂停)。

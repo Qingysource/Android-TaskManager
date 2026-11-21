@@ -22,7 +22,7 @@
  *   │                                                 │  ← 主界面竖屏才有这 1 份空白
  *   ├─────────────────────────────────────────────────┤
  *   │  CPU │ 内存            ← 只文字                 │
- *   └─────────────────────────────────────────────────┘
+ *   └──────────────────────────────────────────────┘
  *
  * 窄屏细节：图表与底部空白按 4:1 分高度（空白正好是图表的 1/4）；
  * 统计块与明细块并排套一层数据面板背景（图表不套），统计块贴左、明细块贴右。
@@ -43,11 +43,11 @@
  *
  * 数据现状：CPU 与内存两组都已接真实数据，来源是
  *   ELF 设备快照（typeCode=5）-> LinuxService.deviceSnapshot()
- *   -> UIService 清洗成 PerformanceSnapshot -> IPageDataApi.performanceSnapshot()。
+ *   -> UIService 清洗成 PerformanceSnapshot -> 发布给性能页管理器（每帧一次）。
  * 磁盘 / WLAN / GPU 三个入口与它们的占位数据已整体删除，重新设计时再加回（见 [HardwareKind]）。
  *
  * 图表窗口那一行的文案由 UIService 按"实时更新速度"换算（高 30 / 常规 60 / 低 240 秒，
- * 已暂停时整段换成 利用率 % (已暂停)）；页面只在切进来时取一次，之后跟着帧一起显示。
+ * 已暂停时整段换成 利用率 % (已暂停)）；文案与历史点都由管理器持有，页面只读。
  *
  * 说明：文件位于 ui 目录，但包名为 com.android.taskmanager，与 MainActivity 同包。
  */
@@ -57,9 +57,11 @@ import android.content.ClipData
 import android.content.Context
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -118,13 +120,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 import com.android.taskmanager.data.CpuUsagePoint
+import com.android.taskmanager.data.DiskSnapshot
+import com.android.taskmanager.data.GPU_UNSUPPORTED_TEXT
+import com.android.taskmanager.data.GpuSnapshot
 import com.android.taskmanager.data.MemorySnapshot
+import com.android.taskmanager.data.NETWORK_UNSUPPORTED_TEXT
+import com.android.taskmanager.data.NetworkSnapshot
 import com.android.taskmanager.data.PerformanceSnapshot
+import com.android.taskmanager.manager.GpuChartData
+import com.android.taskmanager.manager.NetworkChartData
+import com.android.taskmanager.manager.DiskChartData
+import com.android.taskmanager.manager.PageManagers
 import com.android.taskmanager.service.UIService
-import java.io.File
-import java.util.concurrent.Executors
 import kotlinx.coroutines.delay
-import org.json.JSONObject
 
 /** 页面实现状态：改成 IMPLEMENTED 后，MainActivity 的 PageContent() 才会渲染本页。 */
 val PerformancePageState: PageState = PageState.IMPLEMENTED
@@ -159,26 +167,114 @@ private const val CPU_KERNEL_GRAPH_LOGICAL = "LOGICAL"
 /** 窄屏底部硬件条的单项高度：一行文字，按压目标够大就行。 */
 private val PERFORMANCE_COMPACT_TAB_HEIGHT = 38.dp
 
-/** 图表时间窗口（秒）的默认值：服务还没回过窗口文案时先用它，避免先闪一屏空字。 */
-private const val TEST_CHART_WINDOW_SECONDS = 60
+/**
+ * 横屏左栏（设备选择菜单）的固定宽度。
+ *
+ * 这里是**一个常数**，不是 `maxWidth × 比例`：只要它跟着可用宽度算，页面导航菜单
+ * 一展开（80dp -> 240dp，正文少 160dp），左栏就会跟着缩几 dp —— 用户看到的就是
+ * "菜单展开后设备列表也被压扁了"。
+ *
+ * 现在宽度写死：导航菜单展开 / 折叠时这一列尺寸一点不变，只是整列跟着往右让位，
+ * 少掉的宽度全部由右边的详情吸收（详情是 weight(1f)，自动吃满剩下的宽度）。
+ *
+ * 140dp 是按"能用但别占地"定的：卡内 12dp 边距 + 6dp 间距 + 40dp 迷你图之后，
+ * 还剩约 80dp 给文字，刚好放下内存那行 "0.0/0.0 GB (0%)"（9sp 约 73dp）。
+ */
+private val PERFORMANCE_SLOT_WIDTH = 140.dp
+
+/** 竖屏底部硬件条每一格的固定宽度；条本身改成横滑，格子不再被平分压缩。 */
+private val PERFORMANCE_COMPACT_TAB_WIDTH = 76.dp
 
 /** 硬件名称占位：CPU 用服务给的处理器商品名，取不到才回落它。 */
 private const val TEST_HARDWARE_NAME = "NAME"
 
+// ==================== WLAN 页的固定文案 ====================
+//
+// WLAN 的入口与页内数值已经跟着快照里的网卡实例走（见 [NetworkSnapshot]）：
+// 明细读不到写"不支持"、速率没有计数写 0 Kbps，都由模型层算好。
+// 这里只留页面自己需要的一份文案：适配器名缺失时的兜底，以及吞吐量图的量程 / 预警线标注。
+
+/** 适配器名没有值时的兜底（与模型层"不支持"同一个字）。 */
+private const val NETWORK_UNSUPPORTED = NETWORK_UNSUPPORTED_TEXT
+
+/** 吞吐量图还没有量程时的兜底文案（有数据后由图表对象自己算）。 */
+private const val NETWORK_SCALE_TEXT = "5 Mbps"
+
 /**
  * 性能页的硬件入口。
  *
- * 现在只有 CPU 与内存两项：两者都接通了真实数据。
- * 磁盘 / WLAN / GPU 三个入口连同它们的占位数据（`0%`、`0.00 MB/s` 那一套）已整体删除，
- * 后面重新设计时在这里加回一项即可 —— 本文件里所有按硬件分发的 when 都是穷举写法，
- * 漏掉哪一处编译器会直接报出来，不会悄悄渲染成别人的数据。
+ * 现在有 CPU、内存、磁盘、WLAN 四项：CPU / 内存 / 磁盘接通真实数据，
+ * WLAN 按快照里的网卡实例出现（有网卡才有入口），明细与速率暂时写 0 或"不支持"，
+ * 等底层真的把网卡计数接上来只替换取值 —— 版式与入口逻辑都已按真实设备走。
+ * 本文件里所有按硬件分发的 when 都是穷举写法，漏掉哪一处编译器会直接报出来，
+ * 不会悄悄渲染成别人的数据。
  */
 private enum class HardwareKind(val displayName: String) {
 
     CPU("CPU"),
 
-    MEMORY("内存")
+    MEMORY("内存"),
+
+    DISK("磁盘"),
+
+    NETWORK("WLAN"),
+
+    GPU("GPU")
 }
+
+/**
+ * 同一类可能装好几台的硬件（"选中哪一台"才有意义）。
+ *
+ * CPU 与内存是单实例，序号不参与选中比较；磁盘与网卡是多实例，
+ * 选中项要带上"第几台"，否则页面上有几台网卡时会永远停在第一台。
+ */
+private val MULTI_DEVICE_KINDS: Set<HardwareKind> =
+    setOf(HardwareKind.DISK, HardwareKind.NETWORK, HardwareKind.GPU)
+
+/**
+ * 左栏 / 底部条上的一个入口。
+ *
+ * CPU 与内存是单实例，各占一项；磁盘 / 网卡按这一帧快照里有几台给几项
+ * （一台都没有就一项都不给）。名字由管理器统一命名（磁盘 0、磁盘 1 … / WLAN、WLAN 1 …），
+ * 这里只搬运文案，不再自己拼。
+ *
+ * [diskIndex] 对多实例硬件是"同类里的第几台"（网卡复用它，避免为同样的语义再开一个字段）。
+ *
+ * 三行文字是统一版式：第一行标题（加粗），第二行数据，第三行留给"多字段设备"
+ * （磁盘活动时间；CPU / 内存保持空白行，保证所有入口的迷你图与文字高度一致）。
+ */
+private data class HardwareSlot(
+    val kind: HardwareKind,
+    val diskIndex: Int,
+    val title: String,
+
+    /** 竖屏底部横条用的短标题（磁盘是"磁盘 0"，不带块设备名：格子窄，写了只剩省略号） */
+    val shortTitle: String = title,
+
+    val line2: String,
+    val line3: String,
+    val history: List<CpuUsagePoint>
+)
+
+/** 磁盘页要传给详情区的数据：设备本身 + 两张图的缓存 + 量程。 */
+private data class DiskPageData(
+    val index: Int,
+    val title: String,
+    val disk: DiskSnapshot,
+    val charts: DiskChartData
+)
+
+/**
+ * GPU 页要传给详情区的数据：显卡本身 + 三张图的缓存。
+ *
+ * 三张图共用同一个 0..100% 的画法，顶端刻度各自不同（100% / 专用总量 / 共享总量）。
+ */
+private data class GpuPageData(
+    val index: Int,
+    val title: String,
+    val gpu: GpuSnapshot,
+    val charts: GpuChartData
+)
 
 /**
  * 右区下半部"统计区"左上角的一个指标：小字标题 + 标题下的大字数据。
@@ -275,12 +371,124 @@ private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, Str
 private fun clipboardTextFor(
     kind: HardwareKind,
     snapshot: PerformanceSnapshot,
-    usageDecimals: Int
+    usageDecimals: Int,
+    disk: DiskSnapshot?,
+    network: NetworkSnapshot?,
+    networkLabel: String,
+    networkScale: String,
+    gpu: GpuSnapshot?
 ): String = when (kind) {
 
     HardwareKind.CPU -> cpuClipboardText(snapshot, usageDecimals)
 
     HardwareKind.MEMORY -> memoryClipboardText(snapshot)
+
+    HardwareKind.DISK -> diskClipboardText(disk)
+
+    HardwareKind.NETWORK -> networkClipboardText(network, networkLabel, networkScale)
+
+    HardwareKind.GPU -> gpuClipboardText(gpu)
+}
+
+/**
+ * 磁盘视图"复制"写进剪贴板的文本（骨架与 CPU / 内存那份一致）：
+ *
+ * 磁盘                         标题行
+ * （空行）
+ * \t名称:\t设备名              规格块：字段名后面带冒号、Tab 分隔
+ * \t容量:\t…
+ * \t已格式化:\t…
+ * \t系统磁盘:\t…
+ * \t页面文件:\t…
+ * \t类型:\t…
+ * （空行）
+ * \t活动时间\t…               实时块：字段名后面不带冒号
+ * \t平均响应时间\t…
+ * \t读取速度\t…
+ * \t写入速度\t…
+ * （末尾空行）
+ *
+ * 数值一律走与页面同一套 xxxText()：读不到的照页面写破折号，不编造 0。
+ */
+private fun diskClipboardText(disk: DiskSnapshot?): String {
+
+    val data = disk ?: DiskSnapshot()
+
+    return buildString {
+
+        appendLine("磁盘")
+
+        appendLine()
+
+        append("\t名称:\t").appendLine(data.nameText())
+
+        append("\t容量:\t").appendLine(data.capacityText())
+
+        append("\t已格式化:\t").appendLine(data.formattedText())
+
+        append("\t系统磁盘:\t").appendLine(data.systemDiskText())
+
+        append("\t页面文件:\t").appendLine(data.pageFileText())
+
+        append("\t类型:\t").appendLine(data.typeText())
+
+        appendLine()
+
+        append("\t活动时间\t").appendLine(data.activityText())
+
+        append("\t平均响应时间\t").appendLine(data.responseText())
+
+        append("\t读取速度\t").appendLine(data.readSpeedText())
+
+        append("\t写入速度\t").appendLine(data.writeSpeedText())
+
+        appendLine()
+    }
+}
+
+/**
+ * WLAN 视图"复制"写进剪贴板的文本。
+ *
+ * 版式与磁盘那份同一个骨架，只是字段换成网卡这一套（发送 / 接收 + 六行明细）。
+ * 数值一律走 [NetworkSnapshot] 上的同一套文案方法：明细读不到写"不支持"、速率写 0。
+ * 底层补了字段后这边不用再改。
+ */
+private fun networkClipboardText(
+    network: NetworkSnapshot?,
+    label: String,
+    scaleText: String
+): String {
+
+    val data = network ?: NetworkSnapshot()
+
+    return buildString {
+
+        appendLine(label)
+
+        appendLine()
+
+        append("\t适配器名称:\t").appendLine(data.nameText())
+
+        append("\tSSID:\t").appendLine(data.ssidText())
+
+        append("\t连接类型:\t").appendLine(data.linkTypeText())
+
+        append("\tIPv4 地址:\t").appendLine(data.ipv4Text())
+
+        append("\tIPv6 地址:\t").appendLine(data.ipv6Text())
+
+        append("\t信号强度:\t").appendLine(data.signalText())
+
+        appendLine()
+
+        append("\t吞吐量\t").appendLine(scaleText)
+
+        append("\t发送\t").appendLine(data.sendText())
+
+        append("\t接收\t").appendLine(data.receiveText())
+
+        appendLine()
+    }
 }
 
 /**
@@ -404,12 +612,23 @@ private fun cpuClipboardText(snapshot: PerformanceSnapshot, usageDecimals: Int):
 @Composable
 fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
-    // 当前选中的硬件放在进程级共享状态里（见 PerformanceSelection）。
+    // 页面私有的数据与视图状态都由性能页管理器持有（见 manager/PerformanceManager.kt）。
     //
-    // 为什么不放在页面里：竖屏 / 横屏 / 浮窗是三个宿主，页面离开组合时
-    // rememberSaveable 的值会一起丢掉，表现就是每换一个宿主、每次切页回来都退回 CPU。
-    // 三处宿主读同一个值时，横竖屏切换、浮窗打开、切页往返都停在原来那一项。
-    val selected = PerformanceSelection.kind
+    // 为什么不放在页面里：竖屏 / 横屏 / 浮窗是三个宿主，页面离开组合时 remember 的值
+    // 会一起丢掉；而 CPU / 内存两条历史更不该跟着组合走（离开页面就断点）。
+    // 管理器是进程级的，三处宿主读同一份：选中项、图表偏好、摘要开关、
+    // 还有一直在攒的历史点，切页往返与浮窗都停在原处。
+    val context = LocalContext.current
+
+    val manager = remember(context) {
+        PageManagers.performance(context.applicationContext)
+    }
+
+    // 管理器里存的选中项是两个字段：硬件类别（名字）+ 磁盘序号。
+    // 类别只有 CPU / MEMORY / DISK 三个名字，磁盘靠序号区分是哪一台。
+    val requestedKindName = manager.selectedKindName
+
+    val requestedDiskIndex = manager.selectedDiskIndex
 
     // 同进程内直连服务；取不到时按空帧显示。
     //
@@ -428,72 +647,212 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         }
     }
 
-    // 图表窗口文案：只在切进本页时取一次。用户改"实时更新速度"必须先回设置页，
-    // 再切回来时这次读取自然拿到新值 —— 不需要每帧都去问设置。
-    // 只有这段文字跟着档位变；图本身（点数、宽度、布局）三个档位完全相同。
-    var windowLabel by remember { mutableStateOf("$TEST_CHART_WINDOW_SECONDS 秒内的利用率 %") }
+    // 窗口文案 / 利用率小数位都由管理器算好了：它们跟着设置页的档位变，
+    // 所以不在页面里缓存 —— 那样改完设置回来还得等一次重组才对上。
+    val windowLabel = manager.windowLabel
 
-    // 利用率显示位数：读设置页的"利用率精确度"（默认 0 位 / 一位 1 位 / 两位 2 位）。
-    // 同样在切进本页时取一次 —— 要改它必须先回设置页，回来自然读到新值。
-    // 它只影响这几个字怎么画，不影响采集精度，也不影响图表曲线（曲线一直按浮点值画）。
-    var usageDecimals by remember { mutableStateOf(0) }
+    val usageDecimals = manager.usageDecimals
 
+    // 服务一出现就接管：读最新设置、补采一帧（第一屏不等一个周期），
+    // 同时也请求服务端重算一次 CPU 名称（只清名称缓存，不动刷新节奏）。
     LaunchedEffect(service) {
 
-        val current = service ?: return@LaunchedEffect
+        if (service == null) return@LaunchedEffect
 
-        windowLabel = current.performanceChartWindowLabel()
-
-        usageDecimals = SettingsCatalog.cpuUsageDecimals(
-            current.settings()?.cpuUsagePrecision ?: SettingsDefaults.cpuUsagePrecision
-        )
-
-        // 立刻补采一帧：后台可能刚采过，但"切进来的第一屏"不该等一个周期。
-        // 这一下同时也请求服务端重算一次 CPU 名称（只清名称缓存，不动别的刷新节奏）。
-        current.refreshPerformanceNow()
+        manager.onScreenEntered()
     }
 
-    // 读可观察状态：服务每采到一帧就会让本页重组一次
-    val snapshot = service?.performanceSnapshot() ?: PerformanceSnapshot.EMPTY
+    // 读管理器里可观察的状态：每采到一帧，快照与两条历史都会更新，本页自动重组
+    val snapshot = manager.snapshot
 
     // 历史点：大图与左列迷你图共用这一份，只有取哪些点、画在哪里不同
-    val history = service?.performanceCpuHistory() ?: emptyList()
+    val history = manager.cpuHistory
 
     // 内存那条曲线有自己的一份队列（纵轴是占总量的百分比），不能拿 CPU 的点顶替
-    val memoryHistory = service?.performanceMemoryHistory() ?: emptyList()
+    val memoryHistory = manager.memoryHistory
 
-    // 明细区 / 摘要区用的历史点：跟着当前选中项走。
-    // 写死 CPU 会让内存页拿到一条空的 CPU 队列 —— 图就只剩进入时那一帧的回落值，之后再也不动。
-    val detailHistory = when (selected) {
+    // 这一帧里有哪些入口：CPU、内存各一个（单实例），磁盘 / 网卡按快照里有几台给几项。
+    // 一台磁盘都没有时列表里就没有磁盘 —— 空设备不画空壳，连入口都不出现。网卡同理。
+    val disks = snapshot.disks
 
-        HardwareKind.CPU -> history
+    val networks = snapshot.networks
 
-        HardwareKind.MEMORY -> memoryHistory
+    val gpus = snapshot.gpus
+
+    // 读一次缓存表：每帧它都会被整体替换，读到它本页就会重组
+    val diskCharts = manager.diskCharts
+
+    val slots = buildList {
+
+        add(
+            HardwareSlot(
+                kind = HardwareKind.CPU,
+                diskIndex = 0,
+                title = "CPU",
+                line2 = "${snapshot.cpuUsageText(usageDecimals)} ${snapshot.cpuSpeedText()}",
+                // 第三行留空：CPU 没有第二个字段，但入口高度要与磁盘对齐
+                line3 = "",
+                history = history
+            )
+        )
+
+        add(
+            HardwareSlot(
+                kind = HardwareKind.MEMORY,
+                diskIndex = 0,
+                title = "内存",
+                line2 = "${snapshot.memory?.amountText() ?: "—"} " +
+                    "(${snapshot.memoryUsageText(usageDecimals)})",
+                line3 = "",
+                history = memoryHistory
+            )
+        )
+
+        disks.forEachIndexed { index, disk ->
+
+            add(
+                HardwareSlot(
+                    kind = HardwareKind.DISK,
+                    diskIndex = index,
+                    // 名字由管理器统一编号，并带上块设备名：磁盘 0 (sda)、磁盘 1 (sdb) …
+                    title = manager.diskTitle(index, disk.node),
+                    // 竖屏横条仍用短标题，保持"磁盘 0 / 磁盘 1"
+                    shortTitle = manager.diskTitle(index),
+                    line2 = disk.typeText(),
+                    line3 = disk.activityText(),
+                    history = manager.diskChart(disks, index)?.activity ?: emptyList()
+                )
+            )
+        }
+
+        // 网卡与磁盘同一套规矩：这一帧里有几块网卡就给几个入口，
+        // 一块都没有（绝大多数手机在飞航模式 / 无 WLAN 时）就连 WLAN 入口都不出现。
+        // 名字由管理器统一编号：第一块叫 WLAN，多块从第二块起 WLAN 1、WLAN 2 …
+        networks.forEachIndexed { index, network ->
+
+            add(
+                HardwareSlot(
+                    kind = HardwareKind.NETWORK,
+                    diskIndex = index,
+                    title = manager.networkTitle(index),
+                    // 第二行是类别，文案按地区：中国 WLAN、其它地区 Wi-Fi
+                    line2 = manager.networkDisplayName,
+                    line3 = "发送: ${network.sendText()}  接收: ${network.receiveText()}",
+                    // 迷你图用接收那一条（与详情页紫色曲线同一个环形缓冲）
+                    history = manager.networkChart(networks, index)?.receive ?: emptyList()
+                )
+            )
+        }
+
+        // 显卡与磁盘 / 网卡同一套规矩：这一帧里有几张卡就给几个入口。
+        // 名字由管理器统一编号（GPU 0、GPU 1 …），第二行是适配器名，第三行是利用率与温度。
+        gpus.forEachIndexed { index, gpu ->
+
+            add(
+                HardwareSlot(
+                    kind = HardwareKind.GPU,
+                    diskIndex = index,
+                    title = manager.gpuTitle(index),
+                    line2 = gpu.nameText(),
+                    line3 = gpu.utilizationText() +
+                        (gpu.temperatureC?.let { " ($it °C)" } ?: ""),
+                    // 迷你图用 3D 利用率那一条
+                    history = manager.gpuChart(gpus, index)?.utilization ?: emptyList()
+                )
+            )
+        }
+    }
+
+    // 选中的那一项：先按类别 + 设备序号找；找不到（比如磁盘被拔掉、旧存档认不出）就退回第一个。
+    //
+    // 序号只对"同类多台"的硬件参与比较（磁盘、网卡）：CPU / 内存只有一台，序号没有意义，
+    // 拿它一起比的话，残留的旧序号会让这一项"查不到"，于是退到 CPU（见 selectKind 的注释）。
+    val selectedSlot = slots.firstOrNull { slot ->
+        slot.kind.name == requestedKindName &&
+            (slot.kind !in MULTI_DEVICE_KINDS || slot.diskIndex == requestedDiskIndex)
+    } ?: slots.first()
+
+    val selected = selectedSlot.kind
+
+    val selectedDiskIndex = selectedSlot.diskIndex
+
+    // 明细区 / 摘要区用的历史点：跟着当前选中项走
+    val detailHistory = selectedSlot.history
+
+    // 磁盘页的整套数据（设备 + 两张图的缓存 + 量程）；当前不是磁盘就是 null
+    val diskPageData: DiskPageData? = if (selected == HardwareKind.DISK) {
+
+        val disk = disks.getOrNull(selectedDiskIndex)
+
+        val charts = manager.diskChart(disks, selectedDiskIndex) ?: DiskChartData.EMPTY
+
+        disk?.let { DiskPageData(selectedDiskIndex, selectedSlot.title, it, charts) }
+
+    } else {
+        null
+    }
+
+    // WLAN 页的数据：当前选中的那块网卡（不是 WLAN 页、或这一帧里没有网卡就是 null，
+    // 详情区按"不支持" + 0 渲染，与截图那一版一致）
+    val selectedNetwork: NetworkSnapshot? =
+        if (selected == HardwareKind.NETWORK) networks.getOrNull(selectedDiskIndex) else null
+
+    // 吞吐量图：两条速率曲线 + 当前量程（由管理器按"超过一半就升档"维护）
+    val selectedNetworkChart: NetworkChartData? =
+        if (selected == HardwareKind.NETWORK) manager.networkChart(networks, selectedDiskIndex) else null
+
+    // GPU 页的整套数据（显卡 + 三张图的缓存）；当前不是 GPU 就是 null
+    val gpuPageData: GpuPageData? = if (selected == HardwareKind.GPU) {
+
+        val gpu = gpus.getOrNull(selectedDiskIndex)
+
+        val charts = manager.gpuChart(gpus, selectedDiskIndex) ?: GpuChartData.EMPTY
+
+        gpu?.let { GpuPageData(selectedDiskIndex, selectedSlot.title, it, charts) }
+
+    } else {
+        null
     }
 
     // 长按图表弹出的菜单
     var chartDialogVisible by remember { mutableStateOf(false) }
 
     // 菜单里的两项画图偏好（图表口径、是否显示内核时间）**不放在本页内部**：
-    // 只在页面里存，竖屏 / 横屏 / 悬浮窗三个宿主各有一份，图形摘要视图又是另一个
-    // 宿主渲染的，结果就是"换一个地方就得重新点一遍"。统一走 ChartViewState，
+    // 页面里的 remember 在竖屏 / 横屏 / 悬浮窗三个宿主各有一份，图形摘要视图又是另一个
+    // 宿主渲染的，结果就是"换一个地方就得重新点一遍"。统一由性能页管理器持有，
     // 三处宿主与摘要视图读同一份值，改动立刻互相可见，并且落盘。
-    val context = LocalContext.current
-
-    // 首次进本页把落盘值读进来；已读过就是空操作（不再产生 IO）
+    // 首次进本页把落盘的图表偏好读进来；已读过就是空操作（不再产生 IO）
     remember(context) {
-        ChartViewState.ensureLoaded(context.applicationContext)
+        manager.ensureLoaded()
     }
 
     // 图表口径（true = 逻辑处理器，false = 总体利用率）与内核时间开关
-    val logicalGraph = ChartViewState.logicalGraph
-    val showKernelTime = ChartViewState.showKernelTime
+    val logicalGraph = manager.logicalGraph
+
+    val showKernelTime = manager.showKernelTime
 
     // 双击图表切进摘要视图。
     // 现在页面上只有 CPU 与内存两项，两者都有真实曲线，所以不需要准入判断；
     // 以后再加没有数据的硬件入口时，这里要恢复"只让有曲线的项进摘要"的过滤。
+    //
+    // 两个入口分开记：摘要里要把被双击的那一张放大（磁盘两张图，主图与速率图各算一张）。
     val enterChartSummary: () -> Unit = {
-        ChartSummaryView.active.value = true
+        manager.summarySecondChart = false
+        manager.summaryActive = true
+    }
+
+    /**
+     * 第二张图双击：磁盘的速率图自己放大；内存的分条图是主图的图例，
+     * 双击它进摘要仍然放大主图（摘要里那块分条图本来就跟着一起画）。
+     */
+    val enterSecondChartSummary: () -> Unit = {
+        manager.summarySecondChart = selected == HardwareKind.DISK
+        manager.summaryActive = true
+    }
+
+    /** 摘要里双击任意一张图都是退出。 */
+    val exitChartSummary: () -> Unit = {
+        manager.summaryActive = false
     }
 
     // 图形摘要视图：整页只剩这一页的头部（名称行 / 标签行）与图表，图表吃满其余高度。
@@ -501,7 +860,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     // 谁让位：主界面的导航栏与标题栏由 MainPage 让出，浮窗的标题栏与页签由 OverlayPageFrame 让出；
     // 本页内部则不再画左栏硬件列表（横屏）与底部硬件条（竖屏 / 浮窗），
     // 也不再画图表下面的统计块、明细块与预留区。
-    if (ChartSummaryView.active.value) {
+    if (manager.summaryActive) {
 
         Column(
             modifier = Modifier
@@ -544,13 +903,26 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 // 摘要里长按不弹菜单：这里只有一张图，弹出来也没处可用
                 onChartLongPress = {},
 
-                onChartDoubleTap = { ChartSummaryView.active.value = false },
+                // 主图与第二张图双击都退出摘要
+                onChartDoubleTap = exitChartSummary,
+
+                onSecondChartDoubleTap = exitChartSummary,
 
                 // 摘要沿用进入前选定的两项：图还是那张图，只是铺满整页。
                 // 值是进程级共享的，所以从浮窗双击进来也是逐核 / 带内核时间的那一版。
                 showKernelTime = showKernelTime,
 
                 logicalGraph = logicalGraph,
+
+                diskData = diskPageData,
+
+                gpuData = gpuPageData,
+
+                networkData = selectedNetwork,
+
+                networkChart = selectedNetworkChart,
+
+                networkLabel = manager.networkDisplayName,
 
                 summary = true,
 
@@ -574,63 +946,71 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
             if (wide) {
 
-                // 横屏 / 宽浮窗：左边硬件列（带迷你图与数据小字）+ 右边详情，保持 1:4
+                // 横屏 / 宽浮窗：左栏固定 140dp（设备选择菜单）+ 右边详情吃满剩下的宽度。
+                //
+                // 宽度是常数、不跟 maxWidth 走：页面导航菜单从 80dp 展开到 240dp 时，
+                // 正文会少 160dp，按比例算的话左栏也会跟着缩（166 -> 134dp），
+                // 内存那行 "0.0/0.0 GB (0%)" 就又挤没了。
+                // 现在展开导航只让这一列整体往右让位、自身尺寸不动，损失由详情吸收。
+
                 Row(
                     modifier = Modifier.fillMaxSize()
                 ) {
 
-                    Column(
-                        modifier = Modifier.weight(1f)
+                    val hardwareScroll = rememberScrollState()
+
+                    Box(
+                        modifier = Modifier
+                            .width(PERFORMANCE_SLOT_WIDTH)
                             .fillMaxHeight()
-                            .verticalScroll(rememberScrollState()),
+                    ) {
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(hardwareScroll),
 
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
 
-                        HardwareKind.entries.forEach { kind ->
+                        slots.forEach { slot ->
 
-                            // 左栏每一格：百分比 + 小字 + 迷你图，三者都按当前硬件取数
+                            // 左栏每一格：标题 / 数据 / 第三行 + 迷你图，都按这一项自己的数据取
                             HardwareTab(
-                                kind = kind,
+                                title = slot.title,
 
-                                percentText = when (kind) {
+                                line2 = slot.line2,
 
-                                    HardwareKind.CPU -> snapshot.cpuUsageText(usageDecimals)
+                                line3 = slot.line3,
 
-                                    HardwareKind.MEMORY -> snapshot.memoryUsageText(usageDecimals)
-                                },
+                                history = slot.history,
 
-                                detailText = when (kind) {
+                                selected = slot.kind == selected && slot.diskIndex == selectedDiskIndex,
 
-                                    HardwareKind.CPU -> snapshot.cpuSpeedText()
-
-                                    HardwareKind.MEMORY -> snapshot.memory?.amountText() ?: "—"
-                                },
-
-                                // 迷你图取的是同一份历史点的尾部，只是画得小
-                                history = when (kind) {
-
-                                    HardwareKind.CPU -> history
-
-                                    HardwareKind.MEMORY -> memoryHistory
-                                },
-
-                                selected = kind == selected,
-
-                                // 内存这一行按"用量在前、百分比收在括号里"排：
-                                // 例 `1.0/2.0 GB (50%)`。CPU 那行仍是"50% 3.20 GHz"。
-                                lineText = when (kind) {
-
-                                    HardwareKind.MEMORY ->
-                                        "${snapshot.memory?.amountText() ?: "—"} " +
-                                            "(${snapshot.memoryUsageText(usageDecimals)})"
-
-                                    HardwareKind.CPU -> null
-                                },
-
-                                onClick = { PerformanceSelection.kindName.value = kind.name }
+                                onClick = {
+                                    when (slot.kind) {
+                                        // 多台同类的硬件要把"第几台"一起记下来
+                                        HardwareKind.DISK -> manager.selectDisk(slot.diskIndex)
+                                        HardwareKind.NETWORK -> manager.selectNetwork(slot.diskIndex)
+                                        HardwareKind.GPU -> manager.selectGpu(slot.diskIndex)
+                                        else -> manager.selectKind(slot.kind.name)
+                                    }
+                                }
                             )
                         }
+                    }
+
+                        // 设备多了才出现的细滚动条：贴在左栏右边缘，横屏专用；
+                        // 竖屏那条（HardwareCompactBar）是横滑、不画滚动条
+                        HardwareScrollbar(
+                            state = hardwareScroll,
+
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .fillMaxHeight()
+                                .width(4.dp)
+                                .padding(vertical = 4.dp)
+                        )
                     }
 
                     Spacer(
@@ -656,9 +1036,21 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         onChartDoubleTap = enterChartSummary,
 
+                        onSecondChartDoubleTap = enterSecondChartSummary,
+
                         showKernelTime = showKernelTime,
 
                         logicalGraph = logicalGraph,
+
+                        diskData = diskPageData,
+
+                        gpuData = gpuPageData,
+
+                        networkData = selectedNetwork,
+
+                        networkChart = selectedNetworkChart,
+
+                        networkLabel = manager.networkDisplayName,
 
                         modifier = Modifier.weight(4f)
                             .fillMaxHeight()
@@ -691,9 +1083,24 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         onChartDoubleTap = enterChartSummary,
 
+                        onSecondChartDoubleTap = enterSecondChartSummary,
+
                         showKernelTime = showKernelTime,
 
                         logicalGraph = logicalGraph,
+
+                        diskData = diskPageData,
+
+                        // 竖屏这一处此前漏传了 gpuData：GPU 页拿到 null，
+                        // 名称、统计格、明细、三条曲线全部退回空值 —— 这正是"竖屏 GPU 页什么都没有、
+                        // 横屏正常"的原因。三个宿主（横屏 / 竖屏 / 摘要）必须都传同一份。
+                        gpuData = gpuPageData,
+
+                        networkData = selectedNetwork,
+
+                        networkChart = selectedNetworkChart,
+
+                        networkLabel = manager.networkDisplayName,
 
                         modifier = Modifier.weight(1f)
                             .fillMaxWidth()
@@ -704,9 +1111,17 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                     )
 
                     HardwareCompactBar(
-                        selected = selected,
-
-                        onSelect = { PerformanceSelection.kindName.value = it.name }
+                        slots = slots,
+                        selectedKind = selected,
+                        selectedDiskIndex = selectedDiskIndex,
+                        onSelect = { slot ->
+                            when (slot.kind) {
+                                HardwareKind.DISK -> manager.selectDisk(slot.diskIndex)
+                                HardwareKind.NETWORK -> manager.selectNetwork(slot.diskIndex)
+                                HardwareKind.GPU -> manager.selectGpu(slot.diskIndex)
+                                else -> manager.selectKind(slot.kind.name)
+                            }
+                        }
                     )
                 }
             }
@@ -727,22 +1142,50 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
             showKernelTime = showKernelTime,
 
             onKernelGraphModeChange = { mode ->
-                ChartViewState.setLogicalGraph(context, mode == CPU_KERNEL_GRAPH_LOGICAL)
+                manager.updateLogicalGraph(mode == CPU_KERNEL_GRAPH_LOGICAL)
             },
 
             onShowKernelTimeChange = { enabled ->
-                ChartViewState.setShowKernelTime(context, enabled)
+                manager.updateShowKernelTime(enabled)
             },
 
             onEnterSummary = {
                 chartDialogVisible = false
 
-                // 现在只有 CPU 与内存两项，两者都有真实曲线，直接进摘要
-                ChartSummaryView.active.value = true
+                // 当前这一项有真实曲线（CPU / 内存 / 磁盘都是），直接进摘要
+                manager.summaryActive = true
+            },
+
+            viewTargets = buildList {
+                add("CPU(P)" to { manager.selectKind("CPU") })
+                add("内存(M)" to { manager.selectKind("MEMORY") })
+                disks.forEachIndexed { index, _ ->
+                    // 菜单同样带块设备名，和左栏、标题行保持一致
+                    add(manager.diskTitle(index, disks[index].node) to { manager.selectDisk(index) })
+                }
+                // WLAN 跟着网卡实例走：一条网卡一项，一块都没有就没有这一项
+                networks.forEachIndexed { index, _ ->
+                    add(manager.networkTitle(index) to { manager.selectNetwork(index) })
+                }
+                // GPU 同样按实例列：GPU 0、GPU 1 …
+                gpus.forEachIndexed { index, _ ->
+                    add(manager.gpuTitle(index) to { manager.selectGpu(index) })
+                }
             },
 
             // 复制内容按当前选中的硬件现算：CPU / 内存各有一整块
-            copyText = clipboardTextFor(kind = selected, snapshot = snapshot, usageDecimals = usageDecimals),
+            copyText = clipboardTextFor(
+                kind = selected,
+                snapshot = snapshot,
+                usageDecimals = usageDecimals,
+                disk = diskPageData?.disk,
+                network = selectedNetwork,
+                networkLabel = manager.networkDisplayName,
+
+                networkScale = selectedNetworkChart?.rangeText() ?: NETWORK_SCALE_TEXT,
+
+                gpu = gpuPageData?.gpu
+            ),
 
             onDismiss = { chartDialogVisible = false }
         )
@@ -768,6 +1211,12 @@ private fun memoryUsageFraction(memory: MemorySnapshot?): Float {
 
     return (used.toFloat() / total.toFloat()).coerceIn(0f, 1f)
 }
+
+/**
+ * 磁盘活动时间换算成 0..1 的绘制比例；没有数据就贴底（与 CPU / 内存同一规矩）。
+ */
+private fun diskActivityFraction(disk: DiskSnapshot?): Float =
+    ((disk?.activityPercent ?: 0f).coerceIn(0f, 100f)) / 100f
 
 /**
  * 内存页的统计区：三行两列，顺序与版式固定（不随数据变）。
@@ -828,24 +1277,344 @@ private fun memoryDetailLines(memory: MemorySnapshot?): List<Pair<String, String
         add("外观规格" to data.formFactorText())
 
         add("为硬件保留的内存" to data.reservedText())
+
+        // 厂商这一行只在底层真报出来时才有：它来自 dt 的 ddr_manufacturer_id，
+        // 读不到或编码不在表里就整行不画（和"速度"同一规矩，不摆破折号占位）
+        data.manufacturer?.takeIf { it.isNotBlank() }?.let { add("厂商" to it.trim()) }
     }
+}
+
+/**
+ * 磁盘页的明细块：固定五行（容量 / 已格式化 / 系统磁盘 / 页面文件 / 类型）。
+ *
+ * 五行都要有位置：没有数据写破折号，不删行 —— 磁盘只有一块时用户也需要看到
+ * "系统磁盘 / 页面文件"这两项是不是读不到，删掉反而像不支持。
+ */
+private fun diskDetailLines(disk: DiskSnapshot?): List<Pair<String, String>> {
+
+    val data = disk ?: DiskSnapshot()
+
+    return listOf(
+        "容量" to data.capacityText(),
+        "已格式化" to data.formattedText(),
+        "系统磁盘" to data.systemDiskText(),
+        "页面文件" to data.pageFileText(),
+        "类型" to data.typeText()
+    )
+}
+
+/**
+ * GPU 页左侧的统计格：**两列、最多三行**，版式与**内存页**那套统计区一致
+ * （没有强调字、格宽贴着内容走、列间距与内存页同为 9dp/10dp）。
+ *
+ *   有专用显存：利用率 / 专用 GPU 内存 → GPU 内存 / 共享 GPU 内存 → 温度
+ *   无专用显存：利用率 / 共享 GPU 内存 → GPU 内存 / 温度
+ *
+ * 字号全部走 CpuStatCell 的"非强调"档（titleMedium + bodySmall 标签），
+ * 也就是说这一页每个数值都和内存页的"使用中 / 可用 / 已提交"一样大。
+ *
+ * 「专用 GPU 内存」是**可选**的：管理器没提供（dedicatedTotalBytes 为空）就整格不画，
+ * 它那张图也一起不画；剩下的格**整体上移一排**补位，不留空行。
+ * 数据下一秒到了，这一格与图会自动长回来，其余的格也跟着下移回去。
+ *
+ * 格宽只是"最小值"，取的是最长取值的宽度（"0.0/11.9 GB" 这种），
+ * 所以数字跳动时格子不抖；因为贴着内容算，两列之间不会空出半屏。
+ */
+private fun gpuSummaryRows(gpu: GpuSnapshot?): List<List<CpuStat>> {
+
+    val data = gpu ?: GpuSnapshot()
+
+    val hasDedicated = data.dedicatedTotalBytes != null
+
+    fun cell(label: String, value: String, wide: Dp, narrow: Dp): CpuStat =
+        CpuStat(label = label, value = value, wideWidth = wide, narrowWidth = narrow)
+
+    val utilization = cell("利用率", data.utilizationText(), 66.dp, 54.dp)
+
+    val dedicated = cell("专用 GPU 内存", data.dedicatedUsageText(), 122.dp, 108.dp)
+
+    val total = cell("GPU 内存", data.totalMemoryUsageText(), 122.dp, 108.dp)
+
+    val shared = cell("共享 GPU 内存", data.sharedUsageText(), 122.dp, 108.dp)
+
+    val temperature = cell("温度", data.temperatureText(), 72.dp, 62.dp)
+
+    return if (hasDedicated) {
+        listOf(
+            listOf(utilization, dedicated),
+            listOf(total, shared),
+            listOf(
+                // 温度是第二列的项目：借一个与上面第一列同宽的空白格把它推过去，
+                // 标题与值都是空串，只占宽不显示任何字
+                CpuStat(label = "", value = "", wideWidth = 122.dp, narrowWidth = 108.dp),
+                temperature
+            )
+        )
+    } else {
+        // 没有专用显存：共享显存补到第一排第二列，温度补到第二排第二列，不留空行
+        listOf(
+            listOf(utilization, shared),
+            listOf(total, temperature)
+        )
+    }
+}
+
+/**
+ * GPU 页右侧的明细块（照截图，五行小字）：
+ *
+ * 驱动程序版本 / 驱动程序日期 / Vulkan/OpenGL 版本 / 物理位置 / 为硬件保留的内存
+ *
+ * 最后一行是**可选**的：底层没给 reservedBytes 时整行不出现，
+ * 与左栏"专用 GPU 内存"同一个口径（没有就不显示，不写 0 MB 冒充）。
+ */
+private fun gpuDetailLines(gpu: GpuSnapshot?): List<Pair<String, String>> {
+
+    val data = gpu ?: GpuSnapshot()
+
+    return buildList {
+
+        add("驱动程序版本" to data.driverVersionText())
+
+        add("驱动程序日期" to data.driverDateText())
+
+        // Vulkan 与 OpenGL 是两行独立字段，按底层报上来的图形库二选一摆：
+        // 支持 Vulkan 就只摆 Vulkan 版本（OpenGL 那行整行不画），
+        // 只有 OpenGL 就只摆 OpenGL ES 版本；两样都没查成才两行都摆"不支持" / "-"。
+        if (data.showsVulkanRow) {
+            add("Vulkan 版本" to data.vulkanVersionText())
+        }
+
+        if (data.showsOpenGlRow) {
+            add("OpenGL ES 版本" to data.openGlVersionText())
+        }
+
+        add("物理位置" to data.locationText())
+
+        // 最后一行是可选的：底层没给 reservedBytes 时整行不出现
+        if (data.reservedBytes != null) {
+            add("为硬件保留的内存" to data.reservedText())
+        }
+    }
+}
+
+/**
+ * GPU 页的三张图：3D 利用率（4 份高）、专用显存（2 份）、共享显存（2 份）。
+ *
+ * 三张都是 0..100% 的区域图，区别只在顶端刻度文案（由调用方的标签行负责）。
+ * 显存两条曲线只有在"总量读得到"时才有点：没有分母就不画线，
+ * 而不是画一条贴底的 0% 曲线骗人。
+ */
+@Composable
+private fun GpuChartsSection(
+    gpu: GpuSnapshot?,
+    charts: GpuChartData,
+    onLongPress: () -> Unit,
+    onDoubleTap: () -> Unit,
+    onSecondChartDoubleTap: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+
+    // 显存两条图是有数据才画的：没有总量（分母）就画不出占用率，
+    // 硬画一张贴底的空图等于告诉用户"显存没用到"，那是假的。
+    val hasDedicated = gpu?.dedicatedTotalBytes != null
+
+    // 共享显存那张图**不隐藏**：没有总量时照样画，线就停在 0 点（空队列 → 贴底直线），
+    // 顶端文案由 sharedTotalText() 给"不支持"，不会拿一张贴底图冒充"已用 0"。
+
+    Column(modifier = modifier) {
+
+        DetailChartPlaceholder(
+            points = charts.utilization,
+
+            fallbackFraction = 0f,
+
+            showKernelTime = false,
+
+            logicalGraph = false,
+
+            onLongPress = onLongPress,
+
+            onDoubleTap = onDoubleTap,
+
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(4f)
+        )
+
+        if (hasDedicated) {
+
+            GpuChartHeader(
+                label = "专用 GPU 内存",
+
+                right = gpu?.dedicatedTotalText() ?: GPU_UNSUPPORTED_TEXT
+            )
+
+            DetailChartPlaceholder(
+                points = charts.dedicated,
+
+                fallbackFraction = 0f,
+
+                showKernelTime = false,
+
+                logicalGraph = false,
+
+                onLongPress = onLongPress,
+
+                // 第二张图双击也能进摘要（摘要里仍放主图，与磁盘那张速率图同一套约定）
+                onDoubleTap = onSecondChartDoubleTap,
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(2f)
+            )
+        }
+
+        run {
+
+            GpuChartHeader(
+                label = "共享 GPU 内存",
+
+                right = gpu?.sharedTotalText() ?: GPU_UNSUPPORTED_TEXT
+            )
+
+            DetailChartPlaceholder(
+                points = charts.shared,
+
+                fallbackFraction = 0f,
+
+                showKernelTime = false,
+
+                logicalGraph = false,
+
+                onLongPress = onLongPress,
+
+                onDoubleTap = onSecondChartDoubleTap,
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(2f)
+            )
+        }
+    }
+}
+
+/** 一张图上面的标尺行：左标签（专用 / 共享 GPU 内存），右刻度（那一类的总量）。 */
+@Composable
+private fun GpuChartHeader(label: String, right: String) {
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp, bottom = 2.dp),
+
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+
+        Text(
+            text = label,
+
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(
+            modifier = Modifier.weight(1f)
+        )
+
+        Text(
+            text = right,
+
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+/**
+ * GPU 视图"复制"写进剪贴板的文本（骨架与磁盘 / 网卡那两份一致）：
+ *
+ * GPU                          标题行
+ * （空行）
+ * \t名称:\t适配器名
+ * \t利用率:\t…
+ * …（所有属性一行都不少，读不到的照页面写「不支持」/「-」）
+ */
+private fun gpuClipboardText(gpu: GpuSnapshot?): String {
+
+    val data = gpu ?: GpuSnapshot()
+
+    return buildString {
+
+        appendLine("GPU")
+
+        appendLine()
+
+        append("\t名称:\t").appendLine(data.nameText())
+
+        append("\t利用率:\t").appendLine(data.utilizationText())
+
+        append("\t专用 GPU 内存:\t").appendLine(data.dedicatedUsageText())
+
+        append("\t共享 GPU 内存:\t").appendLine(data.sharedUsageText())
+
+        append("\tGPU 内存:\t").appendLine(data.totalMemoryUsageText())
+
+        append("\t驱动程序版本:\t").appendLine(data.driverVersionText())
+
+        append("\t驱动程序日期:\t").appendLine(data.driverDateText())
+
+        if (data.showsVulkanRow) {
+            append("\tVulkan 版本:\t").appendLine(data.vulkanVersionText())
+        }
+
+        if (data.showsOpenGlRow) {
+            append("\tOpenGL ES 版本:\t").appendLine(data.openGlVersionText())
+        }
+
+        append("\t物理位置:\t").appendLine(data.locationText())
+
+        append("\t为硬件保留的内存:\t").appendLine(data.reservedText())
+
+        append("\t温度:\t").appendLine(data.temperatureText())
+    }
+}
+
+/**
+ * WLAN 页的明细块：固定六行（适配器名称 / SSID / 连接类型 / IPv4 / IPv6 / 信号强度）。
+ *
+ * 顺序与截图一致；取值一律走 [NetworkSnapshot] 的文案方法 ——
+ * 底层现在只发适配器名，其余读不到就写"不支持"，接了字段以后这边不用改。
+ */
+private fun networkDetailLines(network: NetworkSnapshot?): List<Pair<String, String>> {
+
+    val data = network ?: NetworkSnapshot()
+
+    return listOf(
+        "适配器名称" to data.nameText(),
+        "SSID" to data.ssidText(),
+        "连接类型" to data.linkTypeText(),
+        "IPv4 地址" to data.ipv4Text(),
+        "IPv6 地址" to data.ipv6Text(),
+        "信号强度" to data.signalText()
+    )
 }
 
 /**
  * 左栏的一行：迷你趋势图 + 硬件名大字 + 数据小字。
  *
- * 图形高度只是视觉上"贴着两行字"，所以这里不跟着字体缩放去做精确测量，
- * 固定 22.dp 就已经和 titleMedium + bodySmall 的两行高度相当。
+ * 图形尺寸固定 40 x 22：高度贴着三行字（大字 + 两行小字），横向再拉长一截，
+ * 让折线有足够的横向跨度画出起伏；这里不做字体缩放的精确测量，省得字放大后图变形。
  */
 @Composable
 private fun HardwareTab(
-    kind: HardwareKind,
-    percentText: String,
-    detailText: String,
+    title: String,
+    line2: String,
+    line3: String,
     history: List<CpuUsagePoint>,
     selected: Boolean,
-    onClick: () -> Unit,
-    lineText: String? = null
+    onClick: () -> Unit
 ) {
 
     val container = if (selected) {
@@ -879,33 +1648,37 @@ private fun HardwareTab(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .padding(horizontal = 6.dp, vertical = 4.dp),
 
             verticalAlignment = Alignment.CenterVertically
         ) {
 
+            // 宽高比取 40:22：横向拉长之后走势才看得清起伏，
+            // 原来是 34:30，几乎是个方块，曲线在里面挤成一团
             MiniSparkline(
                 selected = selected,
 
                 history = history,
 
-                modifier = Modifier.size(width = 34.dp, height = 22.dp)
+                modifier = Modifier.size(width = 40.dp, height = 22.dp)
             )
 
             Spacer(
-                modifier = Modifier.width(8.dp)
+                modifier = Modifier.width(6.dp)
             )
 
             Column(
                 modifier = Modifier.weight(1f),
 
-                verticalArrangement = Arrangement.spacedBy(1.dp)
+                verticalArrangement = Arrangement.spacedBy(0.dp)
             ) {
 
                 Text(
-                    text = kind.displayName,
+                    text = title,
 
-                    style = MaterialTheme.typography.titleMedium,
+                    // 左栏在横屏只有 1/5 屏宽，titleMedium 撑不下"磁盘 0 + SSD (NVMe) + 0%"三行，
+                    // 降到 titleSmall（14sp）再配 9sp 的两行小字，信息才排得开
+                    style = MaterialTheme.typography.titleSmall,
 
                     fontWeight = FontWeight.Bold,
 
@@ -917,15 +1690,32 @@ private fun HardwareTab(
                 )
 
                 Text(
-                    // lineText 非空就整行替换：内存那格要"量在前、百分比在括号里"，
-                    // 顺序与 CPU 的"百分比 速度"不同，靠这里换掉拼接方式，别的行不受影响
-                    text = lineText ?: "$percentText $detailText",
+                    // 第二行：CPU 是"利用率 速度"，内存是"用量 (百分比)"，磁盘是类型
+                    text = line2,
 
                     style = MaterialTheme.typography.bodySmall,
 
-                    fontSize = 10.sp,
+                    fontSize = 9.sp,
 
                     color = detailColor,
+
+                    maxLines = 1,
+
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                Text(
+                    // 第三行：磁盘写活动时间；CPU / 内存传空串，用 minLines 保住这一行的高度，
+                    // 这样所有入口的黄框一样高，切换时版面不跳
+                    text = line3,
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    fontSize = 9.sp,
+
+                    color = detailColor,
+
+                    minLines = 1,
 
                     maxLines = 1,
 
@@ -951,7 +1741,7 @@ private fun HardwareTab(
  *
  * 视觉上仍与小图原有外观一致：圆角底衬、无网格、细线；差别只在取值范围统一了。
  *
- * 这里只画总利用率一条线，不跟大图的内核时间 / 逻辑处理器口径走：小图 34dp 宽，
+ * 这里只画总利用率一条线，不跟大图的内核时间 / 逻辑处理器口径走：小图 40dp 宽，
  * 再叠内核色带或拆成每核一格就什么都看不清了。它要表达的是"和大图看的是同一段
  * 时间里的同一条总量曲线"，细节留给大图。
  */
@@ -1078,7 +1868,13 @@ private fun HardwareDetail(
     onChartDoubleTap: () -> Unit,
     showKernelTime: Boolean = false,
     logicalGraph: Boolean = false,
+    diskData: DiskPageData? = null,
+    gpuData: GpuPageData? = null,
+    networkData: NetworkSnapshot? = null,
+    networkChart: NetworkChartData? = null,
+    networkLabel: String = "WLAN",
     summary: Boolean = false,
+    onSecondChartDoubleTap: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
 
@@ -1086,14 +1882,46 @@ private fun HardwareDetail(
 
     val isMemory = kind == HardwareKind.MEMORY
 
+    val isDisk = kind == HardwareKind.DISK
+
+    val isGpu = kind == HardwareKind.GPU
+
+    val disk = diskData?.disk
+
+    // 当前这张显卡（不是 GPU 页就是 null，下面各文案方法都会退回「不支持 / -」）
+    val gpu = gpuData?.gpu
+
+    val gpuChart = gpuData?.charts ?: GpuChartData.EMPTY
+
     val memory = snapshot.memory
+
+    // 当前这块网卡（不是 WLAN 页就是 null，下面各文案方法都会退回"不支持"/0）
+    val network = networkData
+
+    // 逻辑处理器口径是 CPU 专属的画法：它的每一格都靠历史点里的逐核数组 (corePercents)，
+    // 而内存历史点里那一列恒为空（内存没有"核"这个概念）。直接把它交给内存图，
+    // 结果就是一格都画不出来 —— 看起来正是"内存页主图什么都不显示"。
+    // 所以口径在这里收口：只有 CPU 认这个开关，内存永远画整机那条曲线。
+    val logicalChart = isCpu && logicalGraph
 
     // 主界面竖屏：图表下方留出呼吸空间（图表 3 : 留白 1，即图表再缩 1/4 后的比例）。
     // 浮窗不留：窗本来就小，把高度全给图表才好看。
     val reserveBottom = !wide && !hostedInOverlay
 
-    // 有留白时图表 weight 3、留白 weight 1（图表再缩 1/4）；其余情况图表吃满
-    val chartWeight = if (reserveBottom) 3f else 1f
+    // 图表吃"剩下的全部高度"，不再和底部留白按 3 : 1 分 —— 竖屏图表此前就是这么被压小的：
+    // 统计块与明细块是固定高度，图上只剩剩余空间的三分之二，而磁盘那页的明细行更少，
+    // 于是 CPU / 内存的主图反而比磁盘的活动时间图还矮。
+    // 现在：主图 weight 1（唯一可伸缩的子项），底部留白改成固定 8dp，
+    // 图表直接拿到剩余高度；磁盘仍是主图 4、速率图 1，比例 4 : 1 不变。
+    val chartWeight = if (isDisk) 4f else 1f
+
+    // 摘要视图里仍然是主图 4、速率图 1：4 : 1 这条关系在预览里也成立。
+    // 早先的版本会按"被双击的是哪一张"把大头换给那张（3 换 1），
+    // 双击速率图进去就变成下面比上面还高 —— 那正是用户看到的"比例不对"。
+    // 摘要只是把整块区域放大，不改两张图之间的比例。
+    val mainChartWeight = if (isDisk) chartWeight else 1f
+
+    val rateChartWeight = 1f
 
     // 横屏底部明细：CPU 那三行可变内容（虚拟机 / 虚拟化 / AVF 支持）会把明细块撑高，
     // 而图表拿的是"剩余高度"，明细一高图就跟着矮 —— 用户看到的就是图表变小。
@@ -1105,14 +1933,29 @@ private fun HardwareDetail(
         HardwareKind.CPU -> cpuDetailLines(snapshot)
 
         HardwareKind.MEMORY -> memoryDetailLines(memory)
+
+        HardwareKind.DISK -> diskDetailLines(disk)
+
+        HardwareKind.NETWORK -> networkDetailLines(network)
+
+        // GPU 右侧那五行：驱动 / API / 位置 / 保留内存（保留内存没有就不出现）
+        HardwareKind.GPU -> gpuDetailLines(gpu)
     }
 
-    // 统计区的三行指标：CPU 与内存各一套
+    // 统计区的指标：CPU 与内存各一套；磁盘那张是两行四格、且第二行带颜色竖条，
+    // 版式不一样，用专用的 DiskSummaryBlock 画，这里不给它排通用行。
+    // WLAN 同理（发送 / 接收两张竖条格），用 NetworkSummaryBlock 画。
     val summaryRows = when (kind) {
 
         HardwareKind.CPU -> cpuSummaryRows(snapshot, usageDecimals)
 
         HardwareKind.MEMORY -> memorySummaryRows(memory)
+
+        HardwareKind.DISK -> emptyList()
+
+        HardwareKind.NETWORK -> emptyList()
+
+        HardwareKind.GPU -> gpuSummaryRows(gpu)
     }
 
     val extraDetailRows = if (wide) {
@@ -1133,18 +1976,35 @@ private fun HardwareDetail(
     val nameText = when (kind) {
         HardwareKind.CPU -> snapshot.cpuName ?: TEST_HARDWARE_NAME
         HardwareKind.MEMORY -> memory?.nameText() ?: "—"
+        // 设备名由底层给（暂未实现），管理器只管把值搬上来；没值写破折号
+        HardwareKind.DISK -> disk?.nameText() ?: "—"
+        // WLAN 的适配器型号由快照带上来；底层没发就写"不支持"
+        HardwareKind.NETWORK -> network?.nameText() ?: NETWORK_UNSUPPORTED
+
+        // GPU 的适配器名（底层给到厂商级名字）；没有就写破折号
+        HardwareKind.GPU -> gpu?.nameText() ?: "-"
     }
 
     // 图表上方那行小字：CPU 跟着实时更新速度写明统计窗口；内存这里改写成"内存使用量"
     val chartLabel = when (kind) {
         HardwareKind.CPU -> windowLabel
         HardwareKind.MEMORY -> "内存使用量"
+        HardwareKind.DISK -> "活动时间"
+        HardwareKind.NETWORK -> "吞吐量"
+
+        // Windows 那张卡第一张图左上角就是 "3D"（3D 引擎占用）
+        HardwareKind.GPU -> "3D"
     }
 
-    // 同一行右端：CPU 写 100%（图的顶端就是满利用率）；内存写实际容量（顶端刻度）
+    // 同一行右端：CPU 写 100%（图的顶端就是满利用率）；内存写实际容量（顶端刻度）；
+    // WLAN 预留是吞吐量量程（截图里写作 5 Mbps）
     val chartTopRightText = when (kind) {
         HardwareKind.CPU -> "100%"
         HardwareKind.MEMORY -> memory?.totalText() ?: "—"
+        HardwareKind.DISK -> "100%"
+        HardwareKind.NETWORK -> networkChart?.rangeText() ?: NETWORK_SCALE_TEXT
+
+        HardwareKind.GPU -> gpu?.utilizationText() ?: "-"
     }
 
     Column(
@@ -1158,7 +2018,16 @@ private fun HardwareDetail(
         ) {
 
             Text(
-                text = kind.displayName,
+                // 磁盘是多实例设备：标题写"磁盘 0 / 磁盘 1"，由管理器编号
+                text = when {
+                    // 磁盘是多实例设备：标题写"磁盘 0 / 磁盘 1"，由管理器编号
+                    isDisk -> diskData?.title ?: kind.displayName
+                    // 网卡的名字按地区决定：中国写 WLAN、其它地区写 Wi-Fi（管理器算好传进来）
+                    kind == HardwareKind.NETWORK -> networkLabel
+                    // 显卡是多实例设备：标题写"GPU 0 / GPU 1"，序号同样由管理器编号
+                    kind == HardwareKind.GPU -> gpuData?.title ?: kind.displayName
+                    else -> kind.displayName
+                },
 
                 style = MaterialTheme.typography.headlineSmall,
 
@@ -1223,36 +2092,152 @@ private fun HardwareDetail(
         // 3) 趋势图（固定点数铺满全宽，换更新速度不换图）
         //    宽度决定它吃多少高度：宽屏 1 份、竖屏 3 份（留 1 份给底部空白）、浮窗吃满；
         //    摘要视图里下面没有别的块，它直接吃掉整个剩余高度。
-        DetailChartPlaceholder(
-            points = history,
+        //
+        //    WLAN 这张换成"吞吐量"图：横轴同样是固定槽位，但纵轴是速率量程（不是 0..100%），
+        //    并且带一条 60% 预警线 —— 版式照截图来，数据这一版全为 0（不铺假曲线）。
+        if (isGpu) {
 
-            fallbackFraction = when (kind) {
+            // 三张图合起来吃满这一块高度（4 : 2 : 2），与 Windows 那一页的比例一致：
+            // 3D 利用率最高，两张显存图各占它一半。
+            GpuChartsSection(
+                gpu = gpu,
 
-                HardwareKind.CPU -> usageFraction(snapshot)
+                charts = gpuChart,
 
-                HardwareKind.MEMORY -> memoryUsageFraction(memory)
-            },
+                onLongPress = onChartLongPress,
 
-            // 菜单两项直接决定画法：没勾"显示内核时间"就一行都不多画；
-            // 图形口径选了"逻辑处理器"才切成逐核网格，两种口径共用同一份历史。
-            showKernelTime = showKernelTime,
+                onDoubleTap = onChartDoubleTap,
 
-            logicalGraph = logicalGraph,
+                onSecondChartDoubleTap = onSecondChartDoubleTap,
 
-            onLongPress = onChartLongPress,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(mainChartWeight)
+            )
 
-            onDoubleTap = onChartDoubleTap,
+        } else if (kind == HardwareKind.NETWORK) {
 
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(if (summary) 1f else chartWeight)
-        )
+            NetworkThroughputChart(
+                chart = networkChart ?: NetworkChartData.EMPTY,
+
+                onDoubleTap = onChartDoubleTap,
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(mainChartWeight)
+            )
+
+        } else {
+
+            DetailChartPlaceholder(
+                points = history,
+
+                fallbackFraction = when (kind) {
+
+                    HardwareKind.CPU -> usageFraction(snapshot)
+
+                    HardwareKind.MEMORY -> memoryUsageFraction(memory)
+
+                    HardwareKind.DISK -> diskActivityFraction(disk)
+
+                    // 走到这里说明不是 WLAN（WLAN 已在上面分流），这个分支只为了让 when 穷举
+                    HardwareKind.NETWORK -> 0f
+
+                    HardwareKind.GPU -> 0f
+                },
+
+                // 菜单两项直接决定画法：没勾"显示内核时间"就一行都不多画；
+                // 图形口径选了"逻辑处理器"才切成逐核网格，两种口径共用同一份历史。
+                // logicalChart 已经把"内存不认这个口径"收口了（见上面那处），
+                // 所以内存页哪怕 CPU 那边开着逐核视图，这里拿到的仍是整机曲线。
+                showKernelTime = showKernelTime,
+
+                logicalGraph = logicalChart,
+
+                onLongPress = onChartLongPress,
+
+                onDoubleTap = onChartDoubleTap,
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(mainChartWeight)
+            )
+
+        }
+
+        // WLAN 图底两角：左窗口、右起点 0（截图里就是"60 秒 / 0"）。
+        // 其它页的窗口文案在图表标签行的左边（chartLabel），这里标签行写的是"吞吐量"，
+        // 所以窗口长度挪到图底，与磁盘那张图同一套落法。
+        if (kind == HardwareKind.NETWORK) {
+
+            ChartCornerRow(left = shortWindowText(windowLabel))
+        }
+
+        // 磁盘页的第二张图（正式版式与摘要视图都画）：速率图只有主图的 1/4 高。
+        // 主图 weight 3、这张 weight 1 —— 比例固定，不随屏高变化。
+        if (isDisk) {
+
+            // 主图底部的两角小字：左窗口、右起点 0（与内存图同一套落法）
+            ChartCornerRow(left = shortWindowText(windowLabel))
+
+            Spacer(
+                modifier = Modifier.height(4.dp)
+            )
+
+            // 速率图的表头：左"磁盘传输速率"，右当前量程（默认 100 KB/秒）
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+
+                Text(
+                    text = "磁盘传输速率",
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(
+                    modifier = Modifier.weight(1f)
+                )
+
+                Text(
+                    text = diskData?.charts?.rangeText() ?: DiskChartData.EMPTY.rangeText(),
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(
+                modifier = Modifier.height(4.dp)
+            )
+
+            // 读取 = 总利用率那条线的样式；写入 = 内核时间那条线的样式；
+            // 60% 处一条横线，旁边标注"量程的 60% 是多少"。
+            DiskRateChart(
+                charts = diskData?.charts ?: DiskChartData.EMPTY,
+
+                // 第二张图也能双击进摘要（摘要里它自己放大）
+                onDoubleTap = onSecondChartDoubleTap,
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(rateChartWeight)
+            )
+
+            ChartCornerRow(left = shortWindowText(windowLabel))
+        }
 
         // 摘要视图到此为止：统计块 / 明细块 / 底部留白都不画，
         // 名称行与标签行留着，所以画面上仍然是这一页的头部，只是下面全部让给图。
         // 内存是例外：它的分条图（内存组合）跟图一起进摘要 —— 那块是这张图的图例，
         // 删掉之后曲线就只剩一条无从对照的折线。图底两角的小字（窗口 / 起点 0）
         // 仍不进摘要，摘要本来就不显示刻度文字。
+        // 磁盘的两张图已经在上面画完（速率图就是主图的一部分），这里直接收尾。
         if (summary) {
 
             if (isMemory) {
@@ -1261,7 +2246,8 @@ private fun HardwareDetail(
                     modifier = Modifier.height(6.dp)
                 )
 
-                MemoryBreakdownSection(memory)
+                // 摘要里双击它也退出（和双击主图同一个动作）
+                MemoryBreakdownSection(memory, onDoubleTap = onSecondChartDoubleTap)
             }
 
             return
@@ -1305,7 +2291,7 @@ private fun HardwareDetail(
             )
 
             // 标题 + 分条图在完整版式与摘要视图里是同一块，所以抽成一个函数
-            MemoryBreakdownSection(memory)
+            MemoryBreakdownSection(memory, onDoubleTap = onSecondChartDoubleTap)
         }
 
         Spacer(
@@ -1320,7 +2306,11 @@ private fun HardwareDetail(
             // 底部这块的"自然高度"只在第一帧量一次：之后固定成 自然高度 - 多出的明细行，
             // 图表（weight）就能把那一份高度拿回来。超出的行**不裁**：
             // Row 只是占位高度变小，多出来的内容照常往下画，屏幕上能看见多少是多少。
-            var naturalBottomHeight by remember { mutableStateOf<Dp?>(null) }
+            // 基准高度必须按"当前这一页"重新量：remember 不认页面时，
+            // 从内存 / 磁盘切回 CPU 会沿用上一页那个较小的自然高度（内存的明细行少），
+            // 于是图表按 weight 把多出来的高度全吃掉，CPU 那 8 行明细被顶到屏幕外。
+            // kind 与磁盘序号作 key，换页即作废、重新量一次；同一页内数据变化仍沿用首帧基准。
+            var naturalBottomHeight by remember(kind, diskData?.index) { mutableStateOf<Dp?>(null) }
 
             Row(
                 modifier = Modifier
@@ -1349,11 +2339,22 @@ private fun HardwareDetail(
 
                 // 统计块与明细块都按内容取宽：明细紧挨在统计块右边，
                 // 谁也不会把对方推远，剩下的宽度全部给末尾的空白预留区
-                CpuSummaryBlock(
-                    rows = summaryRows,
+                if (isDisk) {
 
-                    wide = true
-                )
+                    DiskSummaryBlock(disk = disk, wide = true)
+
+                } else if (kind == HardwareKind.NETWORK) {
+
+                    NetworkSummaryBlock(network = network, wide = true)
+
+                } else {
+
+                    CpuSummaryBlock(
+                        rows = summaryRows,
+
+                        wide = true
+                    )
+                }
 
                 CpuDetailList(
                     lines = detailLines
@@ -1378,11 +2379,22 @@ private fun HardwareDetail(
 
                 DataPanel {
 
-                    CpuSummaryBlock(
-                        rows = summaryRows,
+                    if (isDisk) {
 
-                        wide = false
-                    )
+                        DiskSummaryBlock(disk = disk, wide = false)
+
+                    } else if (kind == HardwareKind.NETWORK) {
+
+                        NetworkSummaryBlock(network = network, wide = false)
+
+                    } else {
+
+                        CpuSummaryBlock(
+                            rows = summaryRows,
+
+                            wide = false
+                        )
+                    }
                 }
 
                 DataPanel {
@@ -1394,11 +2406,15 @@ private fun HardwareDetail(
             }
         }
 
-        // 底部呼吸空间：与图表的比例是 1 : 3（图表 weight 3、这里 weight 1）
+        // 底部呼吸空间：固定 8dp。
+        //
+        // 原来是 weight 1（与图表 3 : 1），那等于强制把剩余高度再切掉四分之一 ——
+        // 竖屏 CPU / 内存的主图就是因此比磁盘的活动时间图还矮。
+        // 改成一个很小的固定留白后，图表（weight 1）独占剩余高度。
         if (reserveBottom) {
 
             Spacer(
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.height(8.dp)
             )
         }
     }
@@ -1459,7 +2475,10 @@ private fun shortWindowText(windowLabel: String): String {
  * 标题字号与上方「内存使用量」同档（bodySmall），只是定住左端、右边留空。
  */
 @Composable
-private fun MemoryBreakdownSection(memory: MemorySnapshot?) {
+private fun MemoryBreakdownSection(
+    memory: MemorySnapshot?,
+    onDoubleTap: () -> Unit = {}
+) {
 
     Text(
         text = "内存组合",
@@ -1475,6 +2494,8 @@ private fun MemoryBreakdownSection(memory: MemorySnapshot?) {
 
     MemoryBreakdownBar(
         parts = (memory ?: MemorySnapshot()).breakdownParts(),
+
+        onDoubleTap = onDoubleTap,
 
         modifier = Modifier
             .fillMaxWidth()
@@ -1493,6 +2514,7 @@ private fun MemoryBreakdownSection(memory: MemorySnapshot?) {
 @Composable
 private fun MemoryBreakdownBar(
     parts: List<Float>,
+    onDoubleTap: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
 
@@ -1506,8 +2528,15 @@ private fun MemoryBreakdownBar(
 
     val dividerColor = MaterialTheme.colorScheme.background
 
+    // 双击进摘要：分条图是主图的图例，预览里放的仍是主图（摘要会把这一条一起带着画）
+    val gesture = Modifier.pointerInput(Unit) {
+        detectTapGestures(onDoubleTap = { onDoubleTap() })
+    }
+
     Canvas(
-        modifier = modifier.clip(RoundedCornerShape(5.dp))
+        modifier = modifier
+            .clip(RoundedCornerShape(5.dp))
+            .then(gesture)
     ) {
 
         // 底：最右那一段（可用）不填主题色，只铺一层淡底
@@ -1719,27 +2748,35 @@ private fun CpuDetailList(
  * 一行等宽方块只要文字，宽度才够；迷你图在这个尺寸下也读不出信息。
  *
  * 选中项用主色容器着色，和宽屏那一列的视觉语言保持一致。
+ *
+ * 条本身是**横向滚动**、每格固定 76dp：设备一多（CPU + 内存 + 4 块盘），
+ * 平分宽度会把每格压到 50dp 出头，"磁盘 3" 就只剩省略号了。
+ * 横滑之后格子尺寸恒定，多出来的设备往右拖就能看到；按用户要求不画滚动条。
  */
 @Composable
 private fun HardwareCompactBar(
-    selected: HardwareKind,
-    onSelect: (HardwareKind) -> Unit,
+    slots: List<HardwareSlot>,
+    selectedKind: HardwareKind,
+    selectedDiskIndex: Int,
+    onSelect: (HardwareSlot) -> Unit,
     modifier: Modifier = Modifier
 ) {
 
     Row(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
 
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
 
-        HardwareKind.entries.forEach { kind ->
+        slots.forEach { slot ->
 
-            val isSelected = kind == selected
+            val isSelected = slot.kind == selectedKind && slot.diskIndex == selectedDiskIndex
 
             Box(
                 modifier = Modifier
-                    .weight(1f)
+                    .width(PERFORMANCE_COMPACT_TAB_WIDTH)
                     .height(PERFORMANCE_COMPACT_TAB_HEIGHT)
                     .clip(RoundedCornerShape(8.dp))
                     .background(
@@ -1749,13 +2786,14 @@ private fun HardwareCompactBar(
                             Color.Transparent
                         }
                     )
-                    .clickable { onSelect(kind) },
+                    .clickable { onSelect(slot) },
 
                 contentAlignment = Alignment.Center
             ) {
 
                 Text(
-                    text = kind.displayName,
+                    // 竖屏横条用短标题：磁盘仍是"磁盘 0"
+                    text = slot.shortTitle,
 
                     style = MaterialTheme.typography.bodyMedium,
 
@@ -1770,6 +2808,712 @@ private fun HardwareCompactBar(
                     overflow = TextOverflow.Ellipsis
                 )
             }
+        }
+    }
+}
+
+/**
+ * 图底两角的小字：左边写窗口长度（压成"60 秒"），右边写统计起点 0。
+ *
+ * 磁盘页的两张图与内存页用同一套落法，避免同一种信息在三张图上三种位置。
+ */
+/**
+ * 左栏的细滚动条（只在横屏用）。
+ *
+ * Compose 的 `verticalScroll` 在 Android 上不画任何滚动条，设备多了只能靠"拖动试试"，
+ * 所以这里按 [ScrollState] 自己画一条：轨道铺满高度，滑块长度 = 可见比例、位置 = 滚动进度。
+ * 不需要滚动时（`maxValue <= 0`）直接什么都不画，正常两台设备时看不到这条线。
+ */
+@Composable
+private fun HardwareScrollbar(
+    state: ScrollState,
+    modifier: Modifier = Modifier
+) {
+
+    if (state.maxValue <= 0 || state.viewportSize <= 0) return
+
+    val total = state.viewportSize.toFloat() + state.maxValue.toFloat()
+
+    // 滑块最短也留 8%，否则设备特别多时滑块细得点不着
+    val visible = (state.viewportSize.toFloat() / total).coerceIn(0.08f, 1f)
+
+    val progress = (state.value.toFloat() / state.maxValue.toFloat()).coerceIn(0f, 1f)
+
+    val trackColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.10f)
+
+    val thumbColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+
+    Canvas(
+        modifier = modifier.clip(RoundedCornerShape(2.dp))
+    ) {
+
+        drawRoundRect(
+            color = trackColor,
+
+            size = size,
+
+            cornerRadius = CornerRadius(size.width / 2f, size.width / 2f)
+        )
+
+        val thumbHeight = size.height * visible
+
+        drawRoundRect(
+            color = thumbColor,
+
+            topLeft = Offset(0f, (size.height - thumbHeight) * progress),
+
+            size = Size(size.width, thumbHeight),
+
+            cornerRadius = CornerRadius(size.width / 2f, size.width / 2f)
+        )
+    }
+}
+
+/**
+ * 图底两角的小字：左边写窗口长度（压成"60 秒"），右边写统计起点 0。
+ */
+@Composable
+private fun ChartCornerRow(left: String) {
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+
+        Text(
+            text = left,
+
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(
+            modifier = Modifier.weight(1f)
+        )
+
+        Text(
+            text = "0",
+
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+/**
+ * 磁盘传输速率图（主图的 1/4 高）。
+ *
+ * 两条曲线两种样式，和 CPU 那张大图的语言一致：
+ * - 读取 = 总利用率那条线（主色实线 + 淡色填充）；
+ * - 写入 = 内核时间那条线（更暗的线 + 更暗的填充，画在下层）。
+ *
+ * 纵轴不是固定 100%：量程由管理器按"超过一半就升档、5 秒都低于 10% 就降档"维护，
+ * 传进来的点已经按当前量程归一化，所以这里只管按 0..100 画。
+ *
+ * 60% 处画一条横线并标注"量程的 60% 是多少"——这条线是升档的预警线：
+ * 曲线顶到它，下一帧量程就会抬一档。
+ */
+@Composable
+private fun DiskRateChart(
+    charts: DiskChartData,
+    onDoubleTap: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+
+    val gridColor = MaterialTheme.colorScheme.outlineVariant
+    val topLineColor = MaterialTheme.colorScheme.outline
+    val readColor = MaterialTheme.colorScheme.primary
+    val writeColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.75f)
+    val background = MaterialTheme.colorScheme.surfaceVariant
+    val markerColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    // 只有双击：这张图上没有长按菜单（菜单里的两项都是主图的口径）
+    val gesture = Modifier.pointerInput(Unit) {
+        detectTapGestures(onDoubleTap = { onDoubleTap() })
+    }
+
+    Box(modifier = modifier.then(gesture)) {
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+
+            drawRoundRect(
+                color = background.copy(alpha = 0.35f),
+
+                cornerRadius = CornerRadius(8.dp.toPx(), 8.dp.toPx())
+            )
+
+            val rows = 4
+
+            for (index in 0..rows) {
+
+                val isTop = index == 0
+
+                val y = size.height * index / rows
+
+                drawLine(
+                    color = if (isTop) topLineColor else gridColor,
+
+                    start = Offset(0f, y),
+
+                    end = Offset(size.width, y),
+
+                    strokeWidth = if (isTop) 1.5.dp.toPx() else 1.dp.toPx(),
+
+                    cap = StrokeCap.Butt
+                )
+            }
+
+            val inset = 2.dp.toPx()
+
+            val usable = size.height - inset * 2
+
+            val yOf: (Float) -> Float = { percent ->
+                size.height - inset - usable * (percent.coerceIn(0f, 100f) / 100f)
+            }
+
+            val slotWidth = size.width / (PERFORMANCE_CHART_POINTS - 1).toFloat()
+
+            val readVisible = charts.read.takeLast(PERFORMANCE_CHART_POINTS)
+
+            val writeVisible = charts.write.takeLast(PERFORMANCE_CHART_POINTS)
+
+            // 两条曲线是同一时刻成对入队的，槽位由读取那条来定，写入沿用同一个起点
+            val startSlot = PERFORMANCE_CHART_POINTS - readVisible.size
+
+            if (readVisible.size < 2 && writeVisible.size < 2) {
+
+                // 还没攒够线：两条都只点一个点（贴右边缘），不铺一条假线
+                drawCircle(
+                    color = readColor,
+                    radius = 2.dp.toPx(),
+                    center = Offset(
+                        size.width - 2.dp.toPx(),
+                        yOf(readVisible.lastOrNull()?.percent ?: 0f)
+                    )
+                )
+
+                drawCircle(
+                    color = writeColor,
+                    radius = 2.dp.toPx(),
+                    center = Offset(
+                        size.width - 2.dp.toPx(),
+                        yOf(writeVisible.lastOrNull()?.percent ?: 0f)
+                    )
+                )
+
+                return@Canvas
+            }
+
+            // 写入先画（下层色带），读取后画（上层曲线）
+            if (writeVisible.size >= 2) {
+
+                drawKernelBand(
+                    percents = writeVisible.map { it.percent },
+
+                    startSlot = startSlot,
+
+                    slotWidth = slotWidth,
+
+                    left = 0f,
+
+                    bottom = size.height - inset,
+
+                    yOf = yOf,
+
+                    fill = writeColor.copy(alpha = 0.28f),
+
+                    stroke = writeColor
+                )
+            }
+
+            if (readVisible.size >= 2) {
+
+                val path = Path()
+
+                readVisible.forEachIndexed { index, point ->
+
+                    val x = (startSlot + index) * slotWidth
+
+                    val y = yOf(point.percent)
+
+                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+
+                // 淡填充：与内核色带区分开，同时让两条线在 1/4 高度的小图里也能分清
+                val fillPath = Path()
+
+                fillPath.addPath(path)
+
+                fillPath.lineTo(
+                    (startSlot + readVisible.size - 1) * slotWidth,
+                    size.height - inset
+                )
+
+                fillPath.lineTo(startSlot * slotWidth, size.height - inset)
+
+                fillPath.close()
+
+                drawPath(fillPath, color = readColor.copy(alpha = 0.16f))
+
+                drawPath(
+                    path = path,
+
+                    color = readColor,
+
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 1.5.dp.toPx(),
+
+                        cap = StrokeCap.Round,
+
+                        join = androidx.compose.ui.graphics.StrokeJoin.Round
+                    )
+                )
+            }
+        }
+
+        // 60% 预警线：0.4 的顶部空白 = 60% 处（0 在底、100 在顶）
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+
+            Spacer(
+                modifier = Modifier.weight(0.4f)
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+
+                HorizontalDivider(
+                    modifier = Modifier.weight(1f),
+
+                    thickness = 1.dp,
+
+                    color = markerColor.copy(alpha = 0.45f)
+                )
+
+                Text(
+                    text = charts.sixtyPercentText(),
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    fontSize = 9.sp,
+
+                    color = markerColor,
+
+                    maxLines = 1,
+
+                    modifier = Modifier.padding(start = 4.dp, end = 2.dp)
+                )
+            }
+
+            Spacer(
+                modifier = Modifier.weight(0.6f)
+            )
+        }
+    }
+}
+
+/**
+ * 磁盘页的统计块：两行四格。
+ *
+ * 第一行是"忙不忙"（活动时间 / 平均响应时间）；第二行是吞吐（读取 / 写入速度），
+ * 两格左边各有一条竖线，颜色直接借用两张曲线的颜色：读取 = 主色，写入 = 内核线的暗色。
+ * 竖线让"这格数值对应图上哪条线"一眼就能对上，不用再去看图例。
+ */
+@Composable
+private fun DiskSummaryBlock(
+    disk: DiskSnapshot?,
+    wide: Boolean
+) {
+
+    val data = disk ?: DiskSnapshot()
+
+    val readColor = MaterialTheme.colorScheme.primary
+
+    val writeColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.75f)
+
+    Column(
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(if (wide) 18.dp else 12.dp),
+
+            verticalAlignment = Alignment.Top
+        ) {
+
+            DiskStatCell("活动时间", data.activityText(), wide)
+
+            DiskStatCell("平均响应时间", data.responseText(), wide)
+        }
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(if (wide) 18.dp else 12.dp),
+
+            verticalAlignment = Alignment.Top
+        ) {
+
+            DiskStatCell("读取速度", data.readSpeedText(), wide, readColor)
+
+            DiskStatCell("写入速度", data.writeSpeedText(), wide, writeColor)
+        }
+    }
+}
+
+/** 统计块里的一格：可选的一条竖色线 + 小字标题 + 正文数据。 */
+@Composable
+private fun DiskStatCell(
+    label: String,
+    value: String,
+    wide: Boolean,
+    barColor: Color? = null
+) {
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+
+        if (barColor != null) {
+
+            // 竖线横跨"标题 + 正文"高度，看得见但不抢字
+            Box(
+                modifier = Modifier
+                    .width(2.dp)
+                    .height(26.dp)
+                    .background(barColor, RoundedCornerShape(1.dp))
+            )
+
+            Spacer(
+                modifier = Modifier.width(6.dp)
+            )
+        }
+
+        Column(
+            modifier = Modifier.widthIn(min = if (wide) 104.dp else 86.dp)
+        ) {
+
+            Text(
+                text = label,
+
+                style = MaterialTheme.typography.bodySmall,
+
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Text(
+                text = value,
+
+                style = MaterialTheme.typography.bodyMedium,
+
+                color = MaterialTheme.colorScheme.onSurface,
+
+                maxLines = 1,
+
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
+ * WLAN 页的统计块：发送 / 接收两格竖排，每格左边一条竖色线（颜色对应后续图里的两条曲线）。
+ *
+ * 版式照截图：小字标签在上、大字号数值在下；取值走 [NetworkSnapshot] 的 sendText / receiveText ——
+ * 当前底层没有计数，两者都是 `0 Kbps`，接了计数以后这边不用改。
+ * 竖线让"这格数对应图里哪条线"一眼能对上，和磁盘统计块同一套语言。
+ */
+@Composable
+private fun NetworkSummaryBlock(network: NetworkSnapshot?, wide: Boolean) {
+
+    val data = network ?: NetworkSnapshot()
+
+    val sendColor = MaterialTheme.colorScheme.error
+
+    val receiveColor = MaterialTheme.colorScheme.primary
+
+    Column(
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+
+        NetworkStatCell("发送", data.sendText(), sendColor, wide)
+
+        NetworkStatCell("接收", data.receiveText(), receiveColor, wide)
+    }
+}
+
+/** WLAN 统计块里的一格：竖色线 + 小字标签 + 大字号数值。 */
+@Composable
+private fun NetworkStatCell(
+    label: String,
+    value: String,
+    barColor: Color,
+    wide: Boolean
+) {
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(30.dp)
+                .background(barColor, RoundedCornerShape(1.5.dp))
+        )
+
+        Spacer(
+            modifier = Modifier.width(8.dp)
+        )
+
+        Column(
+            modifier = Modifier.widthIn(min = if (wide) 96.dp else 78.dp)
+        ) {
+
+            Text(
+                text = label,
+
+                style = MaterialTheme.typography.bodySmall,
+
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Text(
+                text = value,
+
+                style = MaterialTheme.typography.titleMedium,
+
+                color = MaterialTheme.colorScheme.onSurface,
+
+                maxLines = 1,
+
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
+ * 无线网卡的吞吐量图（本页的主图表）。
+ *
+ * 版式照任务管理器的网络页：横轴与其它图共用 [PERFORMANCE_CHART_POINTS] 个固定槽位
+ * （新点从右进、老点从左挤出，所以换更新速度不会换图的宽度）；
+ * 纵轴不是 0..100%，而是"速率量程"—— 右上角那行写的就是当前量程，
+ * 图里 60% 处一条预警线并标出该处的速率（都是管理器算好的文案）。
+ *
+ * 两条曲线：
+ * - 接收 = 主色（紫），画在上层，带淡填充；
+ * - 发送 = 错误色（粉），画在下层，带淡填充。
+ * 与左栏统计块那两条竖线是同一组颜色，看一眼就能把"哪个数对应哪条线"对上。
+ *
+ * 数据为空（刚进页面 / 这一帧还没基准）时只画网格与预警线，不铺假曲线。
+ */
+@Composable
+private fun NetworkThroughputChart(
+    chart: NetworkChartData,
+    onDoubleTap: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+
+    val gridColor = MaterialTheme.colorScheme.outlineVariant
+    val topLineColor = MaterialTheme.colorScheme.outline
+    val markerColor = MaterialTheme.colorScheme.error
+    val background = MaterialTheme.colorScheme.surfaceVariant
+    val receiveColor = MaterialTheme.colorScheme.primary
+    val sendColor = MaterialTheme.colorScheme.error
+
+    // 只有双击（这张图上没有长按菜单：菜单里的两项都是 CPU 主图的口径）
+    val gesture = Modifier.pointerInput(Unit) {
+        detectTapGestures(onDoubleTap = { onDoubleTap() })
+    }
+
+    Box(modifier = modifier.then(gesture)) {
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+
+            drawRoundRect(
+                color = background.copy(alpha = 0.35f),
+
+                cornerRadius = CornerRadius(8.dp.toPx(), 8.dp.toPx())
+            )
+
+            // 横向网格：最上面那条是量程顶端，画得更深一点（与其它两张图同一套语言）
+            val rows = 4
+
+            for (index in 0..rows) {
+
+                val isTop = index == 0
+
+                val y = size.height * index / rows
+
+                drawLine(
+                    color = if (isTop) topLineColor else gridColor,
+
+                    start = Offset(0f, y),
+
+                    end = Offset(size.width, y),
+
+                    strokeWidth = if (isTop) 1.5.dp.toPx() else 1.dp.toPx(),
+
+                    cap = StrokeCap.Butt
+                )
+            }
+
+            val inset = 2.dp.toPx()
+
+            val usable = size.height - inset * 2
+
+            val yOf: (Float) -> Float = { percent ->
+                size.height - inset - usable * (percent.coerceIn(0f, 100f) / 100f)
+            }
+
+            val slotWidth = size.width / (PERFORMANCE_CHART_POINTS - 1).toFloat()
+
+            val receiveVisible = chart.receive.takeLast(PERFORMANCE_CHART_POINTS)
+
+            val sendVisible = chart.send.takeLast(PERFORMANCE_CHART_POINTS)
+
+            // 两条曲线同一时刻成对入队：槽位由接收那条定，发送沿用同一个起点
+            val startSlot = PERFORMANCE_CHART_POINTS - receiveVisible.size
+
+            if (receiveVisible.isEmpty() && sendVisible.isEmpty()) {
+                return@Canvas
+            }
+
+            // 发送先画（下层），接收后画（上层）
+            if (sendVisible.size >= 2) {
+
+                val path = Path()
+
+                sendVisible.forEachIndexed { index, point ->
+
+                    val x = (startSlot + index) * slotWidth
+
+                    val y = yOf(point.percent)
+
+                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+
+                val fillPath = Path()
+
+                fillPath.addPath(path)
+
+                fillPath.lineTo(
+                    (startSlot + sendVisible.size - 1) * slotWidth,
+                    size.height - inset
+                )
+
+                fillPath.lineTo(startSlot * slotWidth, size.height - inset)
+
+                fillPath.close()
+
+                drawPath(fillPath, color = sendColor.copy(alpha = 0.14f))
+
+                drawPath(
+                    path = path,
+
+                    color = sendColor.copy(alpha = 0.85f),
+
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 1.2.dp.toPx(),
+
+                        cap = StrokeCap.Round,
+
+                        join = androidx.compose.ui.graphics.StrokeJoin.Round
+                    )
+                )
+            }
+
+            if (receiveVisible.size >= 2) {
+
+                val path = Path()
+
+                receiveVisible.forEachIndexed { index, point ->
+
+                    val x = (startSlot + index) * slotWidth
+
+                    val y = yOf(point.percent)
+
+                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+
+                val fillPath = Path()
+
+                fillPath.addPath(path)
+
+                fillPath.lineTo(
+                    (startSlot + receiveVisible.size - 1) * slotWidth,
+                    size.height - inset
+                )
+
+                fillPath.lineTo(startSlot * slotWidth, size.height - inset)
+
+                fillPath.close()
+
+                drawPath(fillPath, color = receiveColor.copy(alpha = 0.18f))
+
+                drawPath(
+                    path = path,
+
+                    color = receiveColor,
+
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 1.5.dp.toPx(),
+
+                        cap = StrokeCap.Round,
+
+                        join = androidx.compose.ui.graphics.StrokeJoin.Round
+                    )
+                )
+            }
+        }
+
+        // 60% 预警线：0.4 的顶部空白 = 60% 处（0 在底、量程顶端在顶）
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+
+            Spacer(
+                modifier = Modifier.weight(0.4f)
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+
+                HorizontalDivider(
+                    modifier = Modifier.weight(1f),
+
+                    thickness = 1.dp,
+
+                    color = markerColor.copy(alpha = 0.55f)
+                )
+
+                Text(
+                    text = chart.sixtyPercentText(),
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    fontSize = 9.sp,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+
+                    maxLines = 1,
+
+                    modifier = Modifier.padding(start = 4.dp, end = 2.dp)
+                )
+            }
+
+            Spacer(
+                modifier = Modifier.weight(0.6f)
+            )
         }
     }
 }
@@ -2282,6 +4026,7 @@ private fun PerformanceChartDialog(
     onKernelGraphModeChange: (String) -> Unit,
     onShowKernelTimeChange: (Boolean) -> Unit,
     onEnterSummary: () -> Unit,
+    viewTargets: List<Pair<String, () -> Unit>>,
     copyText: String,
     onDismiss: () -> Unit
 ) {
@@ -2344,15 +4089,29 @@ private fun PerformanceChartDialog(
 
             if (viewExpanded) {
 
-                // 现在只有 CPU 与内存两页，一行两列就够；
-                // 磁盘 / 网络 / GPU / NPU 那四个目标随各自的硬件入口一起删掉了
-                Row(
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                // 一行两列：CPU / 内存固定两项，磁盘有几台就有几项（没有就一项都不出现）。
+                // 点一项是真的切过去，不是只关菜单。
+                viewTargets.chunked(2).forEach { pair ->
 
-                    ChartMenuTarget("CPU(P)", Modifier.weight(1f), onDismiss)
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
 
-                    ChartMenuTarget("内存(M)", Modifier.weight(1f), onDismiss)
+                        pair.forEach { (label, select) ->
+
+                            ChartMenuTarget(label, Modifier.weight(1f)) {
+                                select()
+                                onDismiss()
+                            }
+                        }
+
+                        // 奇数项时补一个空位，避免最后一项被拉成整行宽
+                        if (pair.size == 1) {
+                            Spacer(
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
                 }
             }
 
@@ -2559,224 +4318,3 @@ private fun copyChartMenuText(context: Context, text: String) {
 
     clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
 }
-
-// ============================================================
-// 性能页图表的画图偏好：一份全应用共享的状态 + 一份落盘
-// ============================================================
-//
-// 这两项只决定"怎么画"：不动采样、不动历史、不动槽位，所以来回切既不丢数据，
-// 也不改变图覆盖的时间范围。
-//
-// 为什么状态必须提到进程级：同一份性能页会在三个地方各实例化一次——主界面竖屏、
-// 主界面宽屏（横屏）、悬浮窗，Composable 实例彼此独立；图形摘要视图又是另一个宿主
-// 渲染的。状态若只放在页面内部，在浮窗里把口径改成逻辑处理器、回到主界面就又是
-// 总体利用率，用户感知就是每个宿主都得重新点一遍。
-
-/**
- * 图表画图偏好的落盘（files/config/chart_view.json）。
- *
- * 存两项：
- * - logical_graph     图表口径：true = 逻辑处理器（每核一格），false = 总体利用率；
- * - show_kernel_time  是否在曲线下方叠内核时间色带。
- *
- * 为什么单独一个文件而不是塞进 settings.json：
- * 1. 这是页面的视图状态，不是设置项：设置页不显示、不管理，重置所有设置也不该抹掉它；
- * 2. settings.json 有严格字段表（SettingKey / diagnose 缺项校验），为两项画图偏好
- *    改整条设置管线不划算；
- * 3. 这份文件坏了只影响图表默认画法，不牵连设置本身的启动与修复流程。
- *
- * 写入方式与 settings.json 一致（.tmp -> rename），失败只返回 false，绝不抛异常。
- */
-object ChartViewStore {
-
-    private const val CONFIG_DIR = "config"
-
-    private const val FILE_NAME = "chart_view.json"
-
-    private const val TMP_SUFFIX = ".tmp"
-
-    /** 存档字段：图表口径（true = 逻辑处理器）。 */
-    private const val KEY_LOGICAL_GRAPH = "logical_graph"
-
-    /** 存档字段：是否显示内核时间。 */
-    private const val KEY_SHOW_KERNEL_TIME = "show_kernel_time"
-
-    /** 一次读出来的两项画图偏好。 */
-    class Preferences(
-
-        /** 图表口径：true = 逻辑处理器，false = 总体利用率。 */
-        val logicalGraph: Boolean,
-
-        /** 是否叠内核时间色带。 */
-        val showKernelTime: Boolean
-    )
-
-    fun filePath(context: Context): File = File(File(context.filesDir, CONFIG_DIR), FILE_NAME)
-
-    /**
-     * 读两项画图偏好。
-     *
-     * 承诺：永远给出一份可用的值。没有存档 / 文件损坏 / 字段类型不对，一律退回默认
-     * （总体利用率、不画内核时间）——图表默认长什么样，不能因为存档坏了就变个样。
-     */
-    fun load(context: Context): Preferences {
-
-        val json = try {
-            val file = filePath(context)
-
-            if (file.exists()) JSONObject(file.readText(Charsets.UTF_8)) else null
-        } catch (e: Exception) {
-            null
-        }
-
-        return Preferences(
-            logicalGraph = json?.optBoolean(KEY_LOGICAL_GRAPH, false) ?: false,
-            showKernelTime = json?.optBoolean(KEY_SHOW_KERNEL_TIME, false) ?: false
-        )
-    }
-
-    /**
-     * 写两项画图偏好。
-     *
-     * 调用方负责线程：这是几十字节的写盘，但仍然是一次 IO，不放 UI 线程上。
-     * 失败只返回 false（磁盘满 / 目录不可写），不抛异常——偏好丢了不该让页面崩。
-     */
-    fun save(
-        context: Context,
-        logicalGraph: Boolean,
-        showKernelTime: Boolean
-    ): Boolean {
-
-        val target = filePath(context)
-
-        val dir = target.parentFile ?: return false
-
-        return try {
-
-            if (!dir.exists() && !dir.mkdirs()) return false
-
-            val json = JSONObject()
-                .put(KEY_LOGICAL_GRAPH, logicalGraph)
-                .put(KEY_SHOW_KERNEL_TIME, showKernelTime)
-
-            val tmp = File(dir, FILE_NAME + TMP_SUFFIX)
-
-            tmp.writeText(json.toString(2), Charsets.UTF_8)
-
-            if (!tmp.renameTo(target)) {
-                tmp.copyTo(target, overwrite = true)
-
-                tmp.delete()
-            }
-
-            true
-        } catch (e: Exception) {
-            false
-        }
-    }
-}
-
-/**
- * 图表画图偏好：全应用唯一一份。
- *
- * 三处宿主、菜单、图形摘要视图都读同一个 object，任何一处改动会立刻在其余几处生效。
- * 进程重启后第一次进性能页调用 [ensureLoaded] 读回来；之后只动内存，异步写盘。
- */
-object ChartViewState {
-
-    /** 图表口径：true = 逻辑处理器（每核一格），false = 总体利用率（默认）。 */
-    var logicalGraph by mutableStateOf(false)
-        private set
-
-    /** 是否在曲线下方叠内核时间色带；默认不画，菜单里勾了才画。 */
-    var showKernelTime by mutableStateOf(false)
-        private set
-
-    /** 是否已从磁盘读过一次。 */
-    @Volatile
-    private var loaded = false
-
-    /** 写盘线程：连续点几下也只排队，不一次点出一个线程。 */
-    private val writer = Executors.newSingleThreadExecutor()
-
-    /**
-     * 首次读取落盘值（幂等）。
-     *
-     * 为什么读了就直接改状态、而不是先给默认再异步替换：两项都是布尔，读盘只有
-     * 几十字节，同步读一次最省事，也不会出现第一帧画总体利用率、下一帧跳成逐核的闪动。
-     * 三处宿主谁先组合谁触发，后到的直接命中 [loaded]。
-     */
-    @Synchronized
-    fun ensureLoaded(context: Context) {
-
-        if (loaded) return
-
-        val preferences = ChartViewStore.load(context.applicationContext)
-
-        logicalGraph = preferences.logicalGraph
-
-        showKernelTime = preferences.showKernelTime
-
-        loaded = true
-    }
-
-    /** 改图表口径：内存先改（界面这一帧就重画），再异步写盘。 */
-    fun setLogicalGraph(context: Context, value: Boolean) {
-
-        if (logicalGraph == value) return
-
-        logicalGraph = value
-
-        persist(context)
-    }
-
-    /** 改显示内核时间：同上。 */
-    fun setShowKernelTime(context: Context, value: Boolean) {
-
-        if (showKernelTime == value) return
-
-        showKernelTime = value
-
-        persist(context)
-    }
-
-    /**
-     * 落盘。
-     *
-     * 取快照而不是在子线程里读属性：连续两次点击时，让写下的值就是最后一次的值，
-     * 也避免读写跨线程的歧义。
-     */
-    private fun persist(context: Context) {
-
-        val appContext = context.applicationContext
-
-        val logical = logicalGraph
-
-        val kernel = showKernelTime
-
-        writer.execute {
-            ChartViewStore.save(appContext, logical, kernel)
-        }
-    }
-}
-
-/**
- * 性能页当前选中的硬件（进程级共享状态）。
- *
- * 之前这一项是页面内的 rememberSaveable，只在同一个 Activity 的同一个组合里有效：
- * 竖屏、横屏、浮窗是三个宿主（浮窗还是另一个 Activity），切页时页面又整个离开组合，
- * 于是每换一个地方都退回 CPU。挑硬件是用户的选择，不该跟着宿主走。
- *
- * 存名字不存 enum：以后加硬件时旧值认不出来，就退回 CPU，不会炸。
- * 只在本文件的宿主里用，所以是 private，不对外暴露 HardwareKind。
- */
-private object PerformanceSelection {
-
-    /** 当前选中硬件的枚举名，默认 CPU。 */
-    val kindName = mutableStateOf(HardwareKind.CPU.name)
-
-    /** 取当前选中的硬件；名字对不上（后续版本改了枚举）时退回 CPU。 */
-    val kind: HardwareKind
-        get() = HardwareKind.entries.firstOrNull { it.name == kindName.value } ?: HardwareKind.CPU
-}
-

@@ -2219,3 +2219,63 @@ private fun NeutralOutlinedButton(
         )
     }
 }
+
+// ============================================================
+// 用户凭据的界面状态（UIService <-> 设置页的实时通道）
+// ============================================================
+//
+// 这一小段原来在 ui/UserCredentials.kt 里单独成文件，但它并不是一个页面，
+// 也不是什么通用组件：唯一读它的是本文件的"用户凭据"分组，唯一写它的是 UIService
+// （每次 credentialSnapshot() 时用 apply 推一份最新状态下来）。所以并回本文件。
+//
+// 为什么状态必须放在页面外面、进程级：主界面和浮窗里的设置页是两处 Composition，
+// 各自 remember 一份就会出现"浮窗里点了授权，主界面那边还是旧按钮"。
+// 授权成功是服务先知道，它推下来，两个宿主读到同一份值，按钮自己就变成已授权。
+
+/**
+ * 当前生效的凭据状态。
+ *
+ * 字段都是 Compose 可变状态：读它们的界面会在服务推新值时自动重组，
+ * 不需要页面轮询 —— 这也是"按钮能自己变成已授权"的实现方式。
+ */
+internal object UserCredentialState {
+
+    /** 当前生效的用户身份（[SettingsCatalog.CREDENTIAL_IDENTITIES] 之一）。 */
+    val identity = mutableStateOf(SettingsCatalog.CREDENTIAL_NORMAL)
+
+    /** Shizuku 是否已授权（决定 Shizuku 一栏的按钮是"请求权限"还是灰掉的"已授权"）。 */
+    val shizukuGranted = mutableStateOf(false)
+
+    /** 是否具备 Root 能力（同上，决定 Root 一栏的按钮）。 */
+    val rootGranted = mutableStateOf(false)
+
+    /** Shizuku 服务端是否以 root 运行（决定 Shizuku 一行怎么描述自己的能力）。 */
+    val shizukuRoot = mutableStateOf(false)
+
+    /** Shell(adb) 身份是否真的可用（Shizuku 已授权且服务端是 uid 2000）。 */
+    val shellAvailable = mutableStateOf(false)
+
+    /** Shizuku 管理器装没装（未安装时按钮改成"请求权限"并在失败框里提示去装）。 */
+    val shizukuInstalled = mutableStateOf(false)
+
+    /** Shizuku 服务在不在跑（装了但没启动时按钮改成"打开 Shizuku"）。 */
+    val shizukuRunning = mutableStateOf(false)
+
+    /** 把 UIService 给的最新快照整份盖到界面上。 */
+    fun apply(snapshot: UserCredentialSnapshot) {
+
+        identity.value = snapshot.identity
+
+        shizukuGranted.value = snapshot.shizukuGranted
+
+        rootGranted.value = snapshot.rootGranted
+
+        shizukuRoot.value = snapshot.shizukuRoot
+
+        shellAvailable.value = snapshot.shellAvailable
+
+        shizukuInstalled.value = snapshot.shizukuInstalled
+
+        shizukuRunning.value = snapshot.shizukuRunning
+    }
+}

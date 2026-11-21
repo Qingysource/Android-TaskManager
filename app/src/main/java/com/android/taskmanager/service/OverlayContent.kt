@@ -49,11 +49,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 import com.android.taskmanager.ApphistoryScreen
-import com.android.taskmanager.ChartSummaryView
 import com.android.taskmanager.DebugScreen
 import com.android.taskmanager.DetailsScreen
 import com.android.taskmanager.PerformanceScreen
@@ -63,6 +63,7 @@ import com.android.taskmanager.StartupAppScreen
 import com.android.taskmanager.SettingKey
 import com.android.taskmanager.SettingsScreen
 import com.android.taskmanager.SettingsValues
+import com.android.taskmanager.manager.PageManagers
 import com.android.taskmanager.TaskManagerTheme
 import com.android.taskmanager.UsersScreen
 
@@ -115,8 +116,11 @@ internal fun OverlayPageFrame(
 
                 Column(Modifier.fillMaxSize()) {
 
-                    // 性能页进摘要视图时，本浮窗只留标题栏与图表（开关在主界面与浮窗之间共享）
-                    val chartSummary = ChartSummaryView.active.value && pageName == "性能"
+                    // 性能页进摘要视图时，本浮窗只留标题栏与图表。
+                    // 开关是性能页管理器的页面状态：主界面、浮窗、横竖屏读的都是同一份。
+                    val chartSummary =
+                        PageManagers.performance(LocalContext.current).summaryActive &&
+                            pageName == "性能"
 
                     // ---------- 标题栏：唯一拖动区 ----------
                     // 摘要视图里不隐藏：这一条是浮窗唯一能拖的地方，藏了窗口就挪不动。

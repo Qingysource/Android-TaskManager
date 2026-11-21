@@ -189,13 +189,27 @@
  *
  * 设备快照（typeCode=5）按设备集合发送：每个设备一行 D 头（id + type），
  * 后面跟若干行 F 字段。当前实现 CPU（每个插槽一块：利用率 / 频率 / 拓扑 / 三级缓存）、
- * MEMORY（总量与可用量）、DISK / NETWORK / GPU（位置与名字）、SYSTEM（进程线程句柄与开机时长）。
+ * MEMORY（总量与可用量）、DISK（每块物理盘一块：型号 / 介质 / 总线 / 容量 / 已格式化 /
+ * 系统盘 / 页面文件 / 活动时间 / 平均响应 / 读写速率）、NETWORK / GPU（位置与名字）、
+ * SYSTEM（进程线程句柄与开机时长）。
  * 处理器商品名、虚拟化方案、外部缓存容量三个位置留在 query_*_external，现在回 UNSUPPORTED。
+ *
+ * 线程模型：主线程只跑"读 stdin -> 分发 -> 回包"；另有一条**常驻采样线程**
+ * （main() 里 disk_sampler_start() 起，detached）每 250 ms 读一遍各盘 stat，
+ * 用最近 1 秒的滑动窗口结算磁盘四项实时指标，结果放在互斥保护的表里。
+ * 快照请求只查这张表 —— UI 的更新档位（0.5 / 1 / 4 秒）不再决定采样窗口，只决定读表频率。
+ * 线程起不来或结果过期时，请求侧退回"用相邻两次请求差值现算"，功能降级但不失效。
  */
 
 #include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <limits.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -203,6 +217,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -3194,7 +3209,14 @@ static long long read_uptime_seconds(void)
 
 /** 磁盘 / 网卡 / GPU 各自最多发多少台：再多对页面没有意义，还会挤掉别的设备。 */
 #define TM_OUT_DISK_MAX 16
-#define TM_OUT_NETWORK_MAX 16
+
+/**
+ * 网卡上限 24：Android 的 /sys/class/net 能列出十几个到二十几个接口
+ * （rmnet_ 一大家子 + wlan0 + 隧道）。现在底层"全收、只排序不过滤"，
+ * 名额给足才不会把真网卡挤掉；排序保证无线 / 有线 / 移动网络排在虚拟接口前面。
+ */
+#define TM_OUT_NETWORK_MAX 24
+
 #define TM_OUT_GPU_MAX 4
 
 /** 内存实例上限：/proc/meminfo 只有全局一份，留几个位置给以后的多个内存控制器。 */
@@ -3450,17 +3472,20 @@ static void ensure_device_name(char *name, int capacity)
 }
 
 /**
- * 这几类接口是内核或厂商造的虚拟网卡，不是硬件，枚举实例时跳过。
+ * 块设备里这几类不是"用户理解的磁盘"，枚举时跳过。
  *
- * 为什么要过滤：Android 上 /sys/class/net 里 rmnet_data0 / rmnet_ipa0 这类
- * 接口有十几个，不过滤会把 16 个实例名额占满，真实网卡反而枚举不到。
+ *   loop / ram / zram : 回环文件与内存盘，没有物理介质
+ *   dm- / md / nbd    : 设备映射 / 软 RAID / 网络块设备，底层另有真盘
+ *   sr                : 光驱（没有盘片时容量 0）
+ *   mtd               : 裸 flash 分区，不是块寻址磁盘
+ *   *boot*            : MMC 的 boot0 / boot1 硬件启动区，容量小且不承载文件系统
+ *
+ * 只按名字过滤还不够（厂商命名的虚拟盘不在这一列），真正的判据在
+ * enumerate_disk_devices 里：必须在 sysfs 拓扑中有 device 节点。
  */
-static bool is_virtual_network_name(const char *name)
+static bool is_pseudo_block_name(const char *name)
 {
-    static const char *const prefixes[] = {
-        "rmnet", "r_rmnet", "rev_rmnet", "dummy", "ifb", "veth", "sit",
-        "ip6", "tunl", "gre", "erspan", "p2p", "hwsim", "radio", "clat", "v4-"
-    };
+    static const char *const prefixes[] = { "loop", "ram", "zram", "dm-", "sr", "md", "nbd", "mtd" };
 
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
 
@@ -3469,26 +3494,22 @@ static bool is_virtual_network_name(const char *name)
         if (strncmp(name, prefixes[i], length) == 0) {
             return true;
         }
+    }
+
+    if (strstr(name, "boot") != NULL) {
+        return true;
     }
 
     return false;
 }
 
-/** 块设备里这几类是伪设备（回环 / 内存盘 / 加密映射 / 光驱），不当作真实磁盘。 */
-static bool is_pseudo_block_name(const char *name)
+/** 按块名排序：/sys/block 的 readdir 顺序不保证稳定，编号必须建立在名字排序之上。 */
+static int compare_disk_name(const void *left, const void *right)
 {
-    static const char *const prefixes[] = { "loop", "ram", "zram", "dm-", "sr" };
+    const TmDeviceRef *a = (const TmDeviceRef *) left;
+    const TmDeviceRef *b = (const TmDeviceRef *) right;
 
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-
-        size_t length = strlen(prefixes[i]);
-
-        if (strncmp(name, prefixes[i], length) == 0) {
-            return true;
-        }
-    }
-
-    return false;
+    return strcmp(a->name, b->name);
 }
 
  /**
@@ -3626,9 +3647,25 @@ static int enumerate_memory_devices(TmDeviceRef *out, int capacity)
     return 1;
 }
 
-/** 枚举块设备：扫 /sys/block，跳过伪设备；name 是块名（sda / sdf ...）。 */
+/**
+ * 枚举磁盘：扫 /sys/block，只留物理盘。
+ *
+ * 两道判据，缺一不可：
+ * 1. 名字过滤（见 is_pseudo_block_name），先挡掉回环 / zram / dm / md 这类；
+ * 2. 拓扑判据：/sys/block/<dev>/device 必须存在。这个节点是内核把块设备
+ *    挂到真实控制器上的链接，虚拟块设备（dm-* / loop / zram）没有它。
+ *    厂商自己起的虚拟盘名字不在前缀表里，只能靠这一条挡下来。
+ * 另外容量为 0 的空槽（读卡器没插卡）不算一台磁盘，免得页面上多一个 0 MB 的空壳。
+ *
+ * 编号在**排序之后**给：readdir 顺序不保证跨帧一致，先把名字排序，
+ * 再依次编 disk0 / disk1，客户端的"磁盘 0 / 磁盘 1"才不会两帧之间换位置。
+ */
 static int enumerate_disk_devices(TmDeviceRef *out, int capacity)
 {
+    if (out == NULL || capacity <= 0) {
+        return 0;
+    }
+
     DIR *dir = opendir("/sys/block");
 
     if (dir == NULL) {
@@ -3652,71 +3689,103 @@ static int enumerate_disk_devices(TmDeviceRef *out, int capacity)
             break;
         }
 
-        snprintf(out[count].id, sizeof(out[count].id), "disk%d", count);
+        char probe[TM_PATH_MAX];
+        struct stat info;
+
+        // 物理盘判据：控制器链接存在
+        snprintf(probe, sizeof(probe), "/sys/block/%s/device", entry->d_name);
+
+        if (stat(probe, &info) != 0) {
+            continue;
+        }
+
+        // 容量为 0 的空槽不算磁盘（读卡器 / 光驱位没有介质）
+        double sectors = 0.0;
+
+        snprintf(probe, sizeof(probe), "/sys/block/%s/size", entry->d_name);
+
+        if (!read_first_number(probe, &sectors) || sectors <= 0.0) {
+            continue;
+        }
 
         snprintf(out[count].path, sizeof(out[count].path),
                  "/sys/block/%s", entry->d_name);
 
         snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
 
-        ensure_device_name(out[count].name, (int) sizeof(out[count].name));
-
         count++;
     }
 
     closedir(dir);
 
+    // 按块名排序后再编号：序号与名字的对应关系跨帧稳定
+    if (count > 1) {
+        qsort(out, (size_t) count, sizeof(TmDeviceRef), compare_disk_name);
+    }
+
+    for (int i = 0; i < count; i++) {
+
+        snprintf(out[i].id, sizeof(out[i].id), "disk%d", i);
+
+        ensure_device_name(out[i].name, (int) sizeof(out[i].name));
+    }
+
     return count;
 }
 
-/** 枚举网卡：扫 /sys/class/net，回环与虚拟接口都不是硬件，跳过。 */
-static int enumerate_network_devices(TmDeviceRef *out, int capacity)
+/** 枚举网卡：实现见文件后面的"网卡设备"一节（全接口枚举 + 角色分类）。 */
+
+/**
+ * DRM 显卡的厂商名：读 device/uevent 里的 PCI_ID=VVVV:DDDD，只看厂商号。
+ *
+ * 拿不到真正的型号（Android 内核不导出 marketing name），所以写成
+ * "Intel Graphics" 这类厂商级名字 —— 页面右上角那一行至少能看出是哪一家。
+ */
+static void gpu_drm_vendor_name(const char *device_path, char *out, int capacity)
 {
-    DIR *dir = opendir("/sys/class/net");
+    snprintf(out, (size_t) capacity, "%s", "GPU");
 
-    if (dir == NULL) {
-        return 0;
+    char path[256];
+
+    snprintf(path, sizeof(path), "%s/device/uevent", device_path);
+
+    char text[512];
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return;
     }
 
-    int count = 0;
-    struct dirent *entry;
+    const char *cursor = strstr(text, "PCI_ID=");
 
-    while ((entry = readdir(dir)) != NULL) {
-
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        if (strcmp(entry->d_name, "lo") == 0) {
-            continue;
-        }
-
-        if (is_virtual_network_name(entry->d_name)) {
-            continue;
-        }
-
-        if (count >= capacity) {
-            break;
-        }
-
-        snprintf(out[count].id, sizeof(out[count].id), "network%d", count);
-
-        snprintf(out[count].path, sizeof(out[count].path),
-                 "/sys/class/net/%s", entry->d_name);
-
-        snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
-
-        ensure_device_name(out[count].name, (int) sizeof(out[count].name));
-
-        count++;
+    if (cursor == NULL) {
+        return;
     }
 
-    closedir(dir);
+    cursor += strlen("PCI_ID=");
 
-    return count;
+    if (strlen(cursor) < 4) {
+        return;
+    }
+
+    if (strncasecmp(cursor, "8086", 4) == 0) {
+        snprintf(out, (size_t) capacity, "%s", "Intel Graphics");
+    } else if (strncasecmp(cursor, "10de", 4) == 0) {
+        snprintf(out, (size_t) capacity, "%s", "NVIDIA Graphics");
+    } else if (strncasecmp(cursor, "1002", 4) == 0) {
+        snprintf(out, (size_t) capacity, "%s", "AMD Graphics");
+    } else if (strncasecmp(cursor, "5143", 4) == 0) {
+        snprintf(out, (size_t) capacity, "%s", "Qualcomm Adreno GPU");
+    } else if (strncasecmp(cursor, "1af4", 4) == 0) {
+        snprintf(out, (size_t) capacity, "%s", "Virtio GPU");
+    }
 }
 
-/** 枚举图形设备：按几个常见厂商的 sysfs 位置探测，找到哪个用哪个。 */
+/**
+ * 枚举图形设备：按几个常见厂商的 sysfs 位置探测，找到哪个用哪个。
+ *
+ * 名字按节点类型区分：kgsl = 高通 Adreno、mali = ARM Mali、
+ * DRM 节点再按 PCI 厂商号给一个厂商级名字（Intel / NVIDIA / AMD …）。
+ */
 static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
 {
     static const char *const candidates[] = {
@@ -3743,7 +3812,13 @@ static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
 
         snprintf(out[count].path, sizeof(out[count].path), "%s", candidates[i]);
 
-        name_from_path(candidates[i], out[count].name, (int) sizeof(out[count].name));
+        if (i == 0) {
+            snprintf(out[count].name, sizeof(out[count].name), "%s", "Qualcomm Adreno GPU");
+        } else if (i == 1) {
+            snprintf(out[count].name, sizeof(out[count].name), "%s", "ARM Mali GPU");
+        } else {
+            gpu_drm_vendor_name(candidates[i], out[count].name, (int) sizeof(out[count].name));
+        }
 
         ensure_device_name(out[count].name, (int) sizeof(out[count].name));
 
@@ -3754,13 +3829,19 @@ static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
 }
 
 /**
+ * 网卡枚举的实现在文件后面的"网卡设备"一节（全接口枚举 + 角色分类）：
+ * 这里先声明，registry_refresh 才敢在这里先调。
+ */
+static int enumerate_network_devices(TmDeviceRef *out, int capacity);
+
+/**
  * 枚举全部设备实例，填进这张表。
  *
  * 一次请求只调一次：决定一次采集周期里 DeviceId 与硬件的对应关系，
  * 采集过程中不允许重枚举，否则第 0 台 CPU 可能中途变成另一颗芯片。
  *
- * 非 CPU 的几类这一版只报名称：总量、读写、流量、利用率这些统计字段还没定义，
- * 等定了再从这张表里取值、在 build_named_devices 里补字段。
+ * 非 CPU 的几类：磁盘 / 网卡各自有专门的 build_* 函数补字段，
+ * GPU 这一版只报名称（温度 / 显存还没定口径）。
  *
  * @param registry 输出实例表（调用方一般给 static，避免占栈）
  */
@@ -5112,20 +5193,636 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
     return 1;
 }
 
+// ============================================================
+// 网卡设备：Linux 通用接口
+//
+// 整件事分两个过程，这一节只做第一个，第二个在客户端（PerformanceManager）：
+//   1) 底层（本节）：把 /sys/class/net 下的接口**全部**收上来（虚拟网卡也收），
+//      按 sysfs 拓扑与接口名分类成 WIFI / ETHERNET / CELLULAR / OTHER，
+//      再采它们的地址与收发字节。协议里只报"事实"，不替上层决定"哪一类要显示"。
+//   2) 上层：按角色决定把哪些注册成性能页设备 —— 现在只注册 WIFI（WLAN / Wi-Fi 页），
+//      以太网、移动网络以后放开时，客户端只改过滤条件，底层不用动。
+//
+// 数据来源（每一项都能指到具体文件，页面上不猜）：
+//   /sys/class/net/<if>                         接口存在
+//   /sys/class/net/<if>/wireless                存在 = 无线接口（cfg80211 打的标记）
+//   /sys/class/net/<if>/phy80211                存在 = 有 802.11 物理层（同上，有的内核只建这个）
+//   /sys/class/net/<if>/statistics/rx_bytes     累计接收字节（两轮差值算速率）
+//   /sys/class/net/<if>/statistics/tx_bytes     累计发送字节（同上）
+//   /sys/class/net/<if>/device                  存在 = 挂在真实总线上的硬件网卡
+//   /proc/net/wireless                          信号强度（第 3 列 level，单位 dBm）
+//   iw dev <if> link                            SSID / 频段 / 信号 / 协商速率（root 才有，读不到就置空）
+//   getifaddrs()                                IPv4 / IPv6 地址（不需要 root）
+//
+// 接口名归一：内核给 wlan0 / wifi0 / wl* 都算同一种无线接口，不看名字猜类型，
+// 只看 wireless / phy80211 这两个标记 —— 名字只用来给移动网络这类没有标记的分型。
+// ============================================================
+
+/** 收发字节的上次采样表：按接口名对齐，够放这类机器上全部接口。 */
+#define TM_NET_SAMPLE_MAX 32
+
+/** 接口名缓冲：Linux 接口名上限 15 字符，留足余量。 */
+#define TM_NET_IFACE_MAX 32
+
+/** 网卡角色的协议取值（客户端按同一批字符串匹配，不按大小写折叠）。 */
+#define TM_NET_ROLE_WIFI "WIFI"
+#define TM_NET_ROLE_ETHERNET "ETHERNET"
+#define TM_NET_ROLE_CELLULAR "CELLULAR"
+#define TM_NET_ROLE_OTHER "OTHER"
+
+/** 一次网卡采样：累计字节 + 时刻，速率靠相邻两轮差值。 */
+typedef struct {
+    char iface[TM_NET_IFACE_MAX];
+    unsigned long long rx_bytes;
+    unsigned long long tx_bytes;
+    long long at_ms;
+    bool valid;
+} TmNetSample;
+
+static TmNetSample g_net_prev[TM_NET_SAMPLE_MAX];
+
+/** 单调时钟毫秒（速率窗口用，不受系统时间跳变影响）。 */
+static long long net_now_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1;
+    }
+
+    return (long long) now.tv_sec * 1000LL + (long long) (now.tv_nsec / 1000000L);
+}
+
+/** 路径存在（目录 / 符号链接都算；无线标记有的内核只建链接，不能用 stat 判目录）。 */
+static bool net_path_exists(const char *path)
+{
+    struct stat info;
+
+    return lstat(path, &info) == 0;
+}
+
+/** 接口是不是无线（802.11）：wireless 目录或 phy80211 链接任一存在就算。 */
+static bool net_is_wireless(const char *iface_path)
+{
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/wireless", iface_path);
+
+    if (net_path_exists(path)) {
+        return true;
+    }
+
+    snprintf(path, sizeof(path), "%s/phy80211", iface_path);
+
+    return net_path_exists(path);
+}
+
+/** 接口名是否以某一组前缀开头（移动网络这类没有 sysfs 标记，只能按名字分）。 */
+static bool net_name_has_prefix(const char *name, const char *const *prefixes, size_t count)
+{
+    if (name == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+
+        size_t length = strlen(prefixes[i]);
+
+        if (strncmp(name, prefixes[i], length) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /**
- * 把一类"这一版只报名称"的设备实例填进包。
+ * 接口角色：只按"能不能在 sysfs 上找到硬件证据"分，不按名字猜。
  *
- * 为什么只发 name：内存总量、磁盘读写、网卡流量、GPU 利用率这些统计口径
- * 还没定，先发一个没有含义的 0 比不发更糟；先把实例与名称报出去，
- * 上层就能先看到"这台机器有几块盘、几张网卡"，等统计字段定了一处补一列即可。
+ *   WIFI      : wireless / phy80211 标记存在（wlan0 / wifi0 / wl* 都归这里）
+ *   CELLULAR  : 名字命中 rmnet / ccmni / pdp / wwan 这类移动网络接口
+ *   ETHERNET  : 挂在真实总线上（有 device 链接）且不是无线
+ *   OTHER     : 其余 —— tun / vpn / docker0 / veth / dummy 这类虚拟接口
  *
- * @param devices 实例数组（registry 里的 memory / disk / network / gpu）
- * @param count   实例条数
- * @param type    协议里的设备类型串（MEMORY / DISK / NETWORK / GPU）
- * @return 填了几台（受 capacity 限制）
+ * 注意 OTHER 不等于"虚拟"：判断虚拟要看 device 链接，这里只负责分型，
+ * "要不要显示"由上层决定（现在只显示 WIFI）。
  */
-static int build_named_devices(TmOutDevice *out, int capacity,
-                               const TmDeviceRef *devices, int count, const char *type)
+static const char *net_role_of(const char *iface_path, const char *iface)
+{
+    static const char *const cellular_prefixes[] = {
+        "rmnet", "ccmni", "pdp", "wwan", "seth", "sr-mham", "v4-rmnet"
+    };
+
+    if (net_is_wireless(iface_path)) {
+        return TM_NET_ROLE_WIFI;
+    }
+
+    if (net_name_has_prefix(iface, cellular_prefixes,
+                            sizeof(cellular_prefixes) / sizeof(cellular_prefixes[0]))) {
+        return TM_NET_ROLE_CELLULAR;
+    }
+
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/device", iface_path);
+
+    if (net_path_exists(path)) {
+        return TM_NET_ROLE_ETHERNET;
+    }
+
+    return TM_NET_ROLE_OTHER;
+}
+
+/**
+ * 读度的入口：把 /sys/class/net 下的**全部**接口枚举出来（只跳过 lo）。
+ *
+ * 与旧版不同：这里不再过滤 rmnet / tun 这类名字。底层只负责"报事实"，
+ * 上层按角色挑要显示的类别；过滤放在这里的话，上层永远拿不到以太网 / 移动网络，
+ * 以后要放开就得改底层。
+ *
+ * 但顺序要保证"真网卡排在前面"：先按角色优先级（WIFI > ETHERNET > CELLULAR > OTHER），
+ * 同角色再按接口名字典序，这样 16 个名额（TM_OUT_NETWORK_MAX）不会被 rmnet_ 一大家子占满。
+ */
+static int compare_network_ref(const void *left, const void *right)
+{
+    const TmDeviceRef *a = (const TmDeviceRef *) left;
+    const TmDeviceRef *b = (const TmDeviceRef *) right;
+
+    int rank_a = 3;
+    int rank_b = 3;
+
+    if (strncmp(a->path, "/sys/class/net/", 15) == 0) {
+
+        const char *role_a = net_role_of(a->path, a->name);
+        const char *role_b = net_role_of(b->path, b->name);
+
+        rank_a = (strcmp(role_a, TM_NET_ROLE_WIFI) == 0) ? 0
+               : (strcmp(role_a, TM_NET_ROLE_ETHERNET) == 0) ? 1
+               : (strcmp(role_a, TM_NET_ROLE_CELLULAR) == 0) ? 2 : 3;
+
+        rank_b = (strcmp(role_b, TM_NET_ROLE_WIFI) == 0) ? 0
+               : (strcmp(role_b, TM_NET_ROLE_ETHERNET) == 0) ? 1
+               : (strcmp(role_b, TM_NET_ROLE_CELLULAR) == 0) ? 2 : 3;
+    }
+
+    if (rank_a != rank_b) {
+        return (rank_a < rank_b) ? -1 : 1;
+    }
+
+    return strcmp(a->name, b->name);
+}
+
+/**
+ * 枚举网卡：扫 /sys/class/net，只跳过回环。
+ *
+ * 虚拟接口也枚举（上层要靠角色字段判断），但排序把无线 / 有线 / 移动网络
+ * 放在虚拟接口前面，限流时先保住真网卡。
+ */
+static int enumerate_network_devices(TmDeviceRef *out, int capacity)
+{
+    DIR *dir = opendir("/sys/class/net");
+
+    if (dir == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        // 回环不是网卡：它没有硬件，也没有"发送 / 接收"这回事
+        if (strcmp(entry->d_name, "lo") == 0) {
+            continue;
+        }
+
+        if (count >= capacity) {
+            break;
+        }
+
+        snprintf(out[count].path, sizeof(out[count].path),
+                 "/sys/class/net/%s", entry->d_name);
+
+        snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
+
+        count++;
+    }
+
+    closedir(dir);
+
+    if (count > 1) {
+        qsort(out, (size_t) count, sizeof(TmDeviceRef), compare_network_ref);
+    }
+
+    for (int i = 0; i < count; i++) {
+
+        snprintf(out[i].id, sizeof(out[i].id), "network%d", i);
+
+        ensure_device_name(out[i].name, (int) sizeof(out[i].name));
+    }
+
+    return count;
+}
+
+/** 在 "键: 值" 形式的文本里取值，允许行首有空白（iw 的输出每行前面都有制表符）。 */
+static bool net_find_value(const char *text, const char *key, char *out, int capacity)
+{
+    if (text == NULL || text[0] == '\0' || capacity <= 0) {
+        return false;
+    }
+
+    size_t key_length = strlen(key);
+
+    const char *cursor = text;
+
+    while (*cursor != '\0') {
+
+        const char *line = cursor;
+
+        while (*line == ' ' || *line == '\t') {
+            line++;
+        }
+
+        if (strncmp(line, key, key_length) == 0) {
+
+            const char *value = line + key_length;
+
+            while (*value == ' ' || *value == '\t') {
+                value++;
+            }
+
+            int index = 0;
+
+            while (*value != '\0' && *value != '\n' && index < capacity - 1) {
+                out[index++] = *value++;
+            }
+
+            while (index > 0 && (out[index - 1] == ' ' || out[index - 1] == '\t')) {
+                index--;
+            }
+
+            out[index] = '\0';
+
+            return index > 0;
+        }
+
+        const char *newline = strchr(cursor, '\n');
+
+        if (newline == NULL) {
+            break;
+        }
+
+        cursor = newline + 1;
+    }
+
+    return false;
+}
+
+/**
+ * 一次无线链路信息（iw dev <if> link 的输出）。
+ *
+ * 为什么要跑外部命令：SSID / 频段 / 协商速率这三项内核没有统一 sysfs 文件，
+ * 只有 cfg80211 的 netlink 接口能给；iw 就是那个接口的命令行壳子。
+ * 后台以 root / shell 跑，读得到就读，读不到（没 iw / 没权限 / 没连上）就一律留空，
+ * 不拿"未知"这种假值糊页面。
+ */
+typedef struct {
+    char ssid[64];
+    char freq_mhz[16];
+    char link_standard[16];
+    bool has_signal;
+    double signal_dbm;
+} TmNetLink;
+
+static void net_read_iw_link(const char *iface, TmNetLink *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    char command[128];
+
+    snprintf(command, sizeof(command), "iw dev %s link 2>/dev/null", iface);
+
+    FILE *file = popen(command, "r");
+
+    if (file == NULL) {
+        return;
+    }
+
+    char text[2048];
+
+    int total = 0;
+
+    while (total < (int) sizeof(text) - 1) {
+
+        size_t got = fread(text + total, 1, (size_t) (sizeof(text) - 1 - total), file);
+
+        if (got == 0) {
+            break;
+        }
+
+        total += (int) got;
+    }
+
+    text[total] = '\0';
+
+    pclose(file);
+
+    // 没连上时输出是 "Not connected."，三个字段自然都取不到
+    net_find_value(text, "SSID:", out->ssid, (int) sizeof(out->ssid));
+
+    net_find_value(text, "freq:", out->freq_mhz, (int) sizeof(out->freq_mhz));
+
+    char signal[64];
+
+    if (net_find_value(text, "signal:", signal, (int) sizeof(signal))) {
+
+        double dbm = 0.0;
+
+        if (sscanf(signal, "%lf", &dbm) == 1) {
+            out->has_signal = true;
+            out->signal_dbm = dbm;
+        }
+    }
+
+    /*
+     * 连接类型（802.11 代际）藏在这一行的调制名里：
+     *   tx bitrate: 866.7 MBit/s 80MHz HE MCS9    -> HE   = 802.11ax（Wi-Fi 6 / 6E）
+     *   tx bitrate: 433.3 MBit/s 80MHz VHT MCS9   -> VHT  = 802.11ac（Wi-Fi 5）
+     *   tx bitrate: 144.4 MBit/s MCS13 short GI   -> HT   = 802.11n（Wi-Fi 4）
+     *   tx bitrate: 54.0 MBit/s OFDM              -> OFDM = 802.11a/g
+     * 这是内核唯一会把"当前链路用的是哪一代"写出来的地方。
+     */
+    char tx[96];
+
+    if (net_find_value(text, "tx bitrate:", tx, (int) sizeof(tx))) {
+
+        if (strstr(tx, "EHT") != NULL) {
+
+            snprintf(out->link_standard, sizeof(out->link_standard), "802.11be");
+
+        } else if (strstr(tx, "HE") != NULL) {
+
+            snprintf(out->link_standard, sizeof(out->link_standard), "802.11ax");
+
+        } else if (strstr(tx, "VHT") != NULL) {
+
+            snprintf(out->link_standard, sizeof(out->link_standard), "802.11ac");
+
+        } else if (strstr(tx, "HT") != NULL) {
+
+            snprintf(out->link_standard, sizeof(out->link_standard), "802.11n");
+
+        } else if (strstr(tx, "OFDM") != NULL || strstr(tx, "ERP") != NULL) {
+
+            snprintf(out->link_standard, sizeof(out->link_standard), "802.11g");
+        }
+    }
+}
+
+/**
+ * 信号强度百分比：优先用 iw 给的 dBm，退回 /proc/net/wireless 的 level 列。
+ *
+ * 换算口径与 Windows 一致：percent = 2 × (dBm + 100)，夹到 0..100。
+ * （-50 dBm ≈ 100%，-70 dBm ≈ 60%，-90 dBm ≈ 20%。）
+ */
+static bool net_signal_percent(const char *iface, const TmNetLink *link, double *out)
+{
+    double dbm = 0.0;
+
+    bool has = false;
+
+    if (link != NULL && link->has_signal) {
+
+        dbm = link->signal_dbm;
+
+        has = true;
+
+    } else {
+
+        char text[4096];
+
+        if (read_text_file("/proc/net/wireless", text, (int) sizeof(text)) > 0) {
+
+            char line[256];
+
+            snprintf(line, sizeof(line), "%s:", iface);
+
+            const char *cursor = text;
+
+            while (*cursor != '\0') {
+
+                const char *start = cursor;
+
+                const char *newline = strchr(cursor, '\n');
+
+                size_t length = (newline != NULL) ? (size_t) (newline - cursor) : strlen(cursor);
+
+                if (strncmp(start, line, strlen(line)) == 0 && length < sizeof(line)) {
+
+                    char row[256];
+
+                    memcpy(row, start, length);
+
+                    row[length] = '\0';
+
+                    // 形如 "wlan0: 0000   51.  -56.   0   0   0   0   0   0"，
+                    // 第 2 个数是链路质量，第 3 个是信号电平（dBm）
+                    double status = 0.0;
+                    double quality = 0.0;
+                    double level = 0.0;
+
+                    if (sscanf(row + strlen(line), "%lf %lf %lf", &status, &quality, &level) >= 3) {
+
+                        if (level < 0.0) {
+                            dbm = level;
+                            has = true;
+                        } else if (quality >= 0.0) {
+                            *out = quality;
+                            return true;
+                        }
+                    }
+
+                    break;
+                }
+
+                if (newline == NULL) {
+                    break;
+                }
+
+                cursor = newline + 1;
+            }
+        }
+    }
+
+    if (!has) {
+        return false;
+    }
+
+    double percent = (dbm + 100.0) * 2.0;
+
+    if (percent < 0.0) {
+        percent = 0.0;
+    }
+
+    if (percent > 100.0) {
+        percent = 100.0;
+    }
+
+    *out = percent;
+
+    return true;
+}
+
+/** 接口的 IPv4 / IPv6 各取第一个（getifaddrs 不需要 root，比跑 ip 命令稳）。 */
+static void net_read_addresses(const char *iface, char *ipv4, int ipv4_capacity,
+                               char *ipv6, int ipv6_capacity)
+{
+    ipv4[0] = '\0';
+    ipv6[0] = '\0';
+
+    struct ifaddrs *list = NULL;
+
+    if (getifaddrs(&list) != 0) {
+        return;
+    }
+
+    for (struct ifaddrs *item = list; item != NULL; item = item->ifa_next) {
+
+        if (item->ifa_addr == NULL || item->ifa_name == NULL) {
+            continue;
+        }
+
+        if (strcmp(item->ifa_name, iface) != 0) {
+            continue;
+        }
+
+        if (item->ifa_addr->sa_family == AF_INET && ipv4[0] == '\0') {
+
+            inet_ntop(AF_INET, &((struct sockaddr_in *) item->ifa_addr)->sin_addr,
+                      ipv4, (size_t) ipv4_capacity);
+
+        } else if (item->ifa_addr->sa_family == AF_INET6 && ipv6[0] == '\0') {
+
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *) item->ifa_addr)->sin6_addr,
+                      ipv6, (size_t) ipv6_capacity);
+        }
+    }
+
+    freeifaddrs(list);
+}
+
+/** 按接口名找（或占）一格采样槽。 */
+static TmNetSample *net_sample_slot(const char *iface)
+{
+    static int next = 0;
+
+    for (int i = 0; i < TM_NET_SAMPLE_MAX; i++) {
+
+        if (g_net_prev[i].valid && strcmp(g_net_prev[i].iface, iface) == 0) {
+            return &g_net_prev[i];
+        }
+    }
+
+    TmNetSample *slot = &g_net_prev[next % TM_NET_SAMPLE_MAX];
+
+    next++;
+
+    memset(slot, 0, sizeof(*slot));
+
+    snprintf(slot->iface, sizeof(slot->iface), "%s", iface);
+
+    return slot;
+}
+
+/**
+ * 收发速率：读统计计数，与上一轮相除得到字节/秒。
+ *
+ * 与磁盘的 measure_disk_io 同一个口径：首帧没有基准 → has=false（不发 0，发 NO_BASELINE）；
+ * 计数器倒退（接口重建）→ 当轮作废并重记基准。
+ * 两次请求的间隔就是窗口（UI 更新档位 0.5 / 1 / 4 秒），所以窗口抖动不影响速率本身。
+ */
+static bool net_measure_rate(const char *iface_path, const char *iface,
+                             double *rx_rate, double *tx_rate)
+{
+    char path[TM_PATH_MAX];
+
+    double rx = 0.0;
+    double tx = 0.0;
+
+    snprintf(path, sizeof(path), "%s/statistics/rx_bytes", iface_path);
+
+    bool has_rx = read_first_number(path, &rx);
+
+    snprintf(path, sizeof(path), "%s/statistics/tx_bytes", iface_path);
+
+    bool has_tx = read_first_number(path, &tx);
+
+    if (!has_rx && !has_tx) {
+        return false;
+    }
+
+    long long now = net_now_ms();
+
+    TmNetSample *slot = net_sample_slot(iface);
+
+    bool had = slot->valid && slot->at_ms > 0 && now > slot->at_ms;
+
+    bool regressed = had && ((has_rx && (unsigned long long) rx < slot->rx_bytes) ||
+                             (has_tx && (unsigned long long) tx < slot->tx_bytes));
+
+    if (had && !regressed) {
+
+        double seconds = (double) (now - slot->at_ms) / 1000.0;
+
+        if (seconds > 0.05) {
+
+            if (has_rx) {
+                *rx_rate = ((double) (unsigned long long) rx - (double) slot->rx_bytes) / seconds;
+            }
+
+            if (has_tx) {
+                *tx_rate = ((double) (unsigned long long) tx - (double) slot->tx_bytes) / seconds;
+            }
+
+            slot->rx_bytes = (unsigned long long) rx;
+            slot->tx_bytes = (unsigned long long) tx;
+            slot->at_ms = now;
+            slot->valid = true;
+
+            return true;
+        }
+    }
+
+    // 首帧 / 计数倒退 / 两次采样贴得太近：只重记基准，本轮不给速率
+    slot->rx_bytes = (unsigned long long) rx;
+    slot->tx_bytes = (unsigned long long) tx;
+    slot->at_ms = now;
+    slot->valid = true;
+
+    return false;
+}
+
+/**
+ * 拼一帧里的网卡设备：每块一块，带类型、型号、SSID、地址、信号、收发速率。
+ *
+ * 字段清单（键名与客户端 buildNetworkSnapshot 一一对应）：
+ *   iface          接口名（wlan0 / eth0 / rmnet_data0 …）
+ *   role           WIFI / ETHERNET / CELLULAR / OTHER（上层按它决定显不显示）
+ *   name           网卡型号；读不到就用接口名（不写占位符 NAME）
+ *   ssid           无线 SSID（没连上 / 读不到就不发）
+ *   link_type      无线代际（802.11ax / 802.11ac …，同上）
+ *   ipv4 / ipv6    地址各取第一个
+ *   signal_percent 信号强度百分比（没连上不发）
+ *   freq_mhz       当前频段（没连上不发）
+ *   receive_bytes_per_sec / send_bytes_per_sec  收发速率（首帧 NO_BASELINE）
+ */
+static int build_network_devices(TmOutDevice *out, int capacity,
+                                 const TmDeviceRef *devices, int count)
 {
     if (out == NULL || devices == NULL || capacity <= 0 || count <= 0) {
         return 0;
@@ -5139,10 +5836,1596 @@ static int build_named_devices(TmOutDevice *out, int capacity,
 
     for (int i = 0; i < limit; i++) {
 
-        device_begin(&out[i], devices[i].id, type);
+        device_begin(&out[i], devices[i].id, TM_DEV_TYPE_NETWORK);
 
-        // 枚举阶段已经用 NAME 兜过底，这里一定有值
-        device_put(&out[i], "name", devices[i].name);
+        const char *role = net_role_of(devices[i].path, devices[i].name);
+
+        device_put(&out[i], "role", role);
+
+        device_put(&out[i], "iface", devices[i].name);
+
+        // 型号：/sys/class/net/<if>/device/model 只有挂在真实总线上的网卡才有；
+        // 没有就用接口名顶上，页面上至少看得出是哪一块
+        char model[96];
+
+        model[0] = '\0';
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "%s/device/model", devices[i].path);
+
+        if (read_text_file(path, model, (int) sizeof(model)) > 0) {
+
+            // 去掉行尾换行与首尾空白
+            int length = (int) strlen(model);
+
+            while (length > 0 && (model[length - 1] == '\n' || model[length - 1] == '\r' ||
+                                  model[length - 1] == ' ' || model[length - 1] == '\t')) {
+                model[--length] = '\0';
+            }
+
+            char *head = model;
+
+            while (*head == ' ' || *head == '\t') {
+                head++;
+            }
+
+            if (head != model) {
+                memmove(model, head, strlen(head) + 1);
+            }
+        }
+
+        device_put(&out[i], "name", (model[0] != '\0') ? model : devices[i].name);
+
+        // 地址
+        char ipv4[64];
+        char ipv6[96];
+
+        net_read_addresses(devices[i].name, ipv4, (int) sizeof(ipv4), ipv6, (int) sizeof(ipv6));
+
+        if (ipv4[0] != '\0') {
+            device_put(&out[i], "ipv4", ipv4);
+        }
+
+        if (ipv6[0] != '\0') {
+            device_put(&out[i], "ipv6", ipv6);
+        }
+
+        // 无线三项：只有无线接口才有意义（有线 / 移动网络不去跑 iw）
+        TmNetLink link;
+
+        memset(&link, 0, sizeof(link));
+
+        double signal = 0.0;
+
+        if (strcmp(role, TM_NET_ROLE_WIFI) == 0) {
+
+            net_read_iw_link(devices[i].name, &link);
+
+            if (link.ssid[0] != '\0') {
+                device_put(&out[i], "ssid", link.ssid);
+            }
+
+            if (link.link_standard[0] != '\0') {
+                device_put(&out[i], "link_type", link.link_standard);
+            }
+
+            if (link.freq_mhz[0] != '\0') {
+                device_put(&out[i], "freq_mhz", link.freq_mhz);
+            }
+
+            if (net_signal_percent(devices[i].name, &link, &signal)) {
+                device_put_value(&out[i], "signal_percent",
+                                 query_value_float(true, signal, 0, TM_QUERY_NOT_AVAILABLE));
+            }
+        }
+
+        // 收发速率
+        double rx_rate = 0.0;
+        double tx_rate = 0.0;
+
+        bool has_rate = net_measure_rate(devices[i].path, devices[i].name, &rx_rate, &tx_rate);
+
+        device_put_int(&out[i], "receive_bytes_per_sec",
+                       has_rate ? (long long) rx_rate : -1, TM_FIELD_STATUS_NO_BASELINE);
+
+        device_put_int(&out[i], "send_bytes_per_sec",
+                       has_rate ? (long long) tx_rate : -1, TM_FIELD_STATUS_NO_BASELINE);
+    }
+
+    return limit;
+}
+
+
+//
+// 每一项都能指到具体文件，页面不猜：
+//   /sys/block/<dev>/stat              活动时间 / 平均响应 / 读写速率（两轮差值）
+//   /sys/block/<dev>/size               容量（单位是 512 字节扇区）
+//   /sys/block/<dev>/queue/rotational   1 = 旋转介质，0 = 非旋转
+//   /sys/block/<dev>/device             指向控制器目录的链接：判 NVMe / SCSI / UFS / MMC
+//   /sys/block/<dev>/device/model       型号串，页面上右侧那个设备名
+//   /proc/self/mountinfo                已格式化容量 / 系统盘（按 major:minor 反查块名）
+//   /proc/swaps                         页面文件（Android 上就是 Swap 分区）
+//
+// 两个容易踩的点：
+// 1. stat 里的扇区按 512 字节算，与设备实际 logical_block_size 无关；
+// 2. dm-* / md 这类映射设备必须跟着 slaves 走到物理盘，只看挂载点会认错盘。
+// ============================================================
+
+/** stat 里扇区计数的换算：内核固定按 512 字节一个扇区统计。 */
+#define TM_DISK_SECTOR_BYTES 512LL
+
+/** 每帧最多记多少台盘的上次采样：比 TM_OUT_DISK_MAX 留一点余量，编号变了也不丢基准。 */
+#define TM_DISK_SAMPLE_MAX 32
+
+/** 一次挂载扫描最多认多少个块设备号（去重用）。 */
+#define TM_DISK_DEVNUM_MAX 24
+
+/** 系统盘候选挂载点：先找系统镜像所在的分区，再退到数据分区。 */
+#define TM_DISK_SYSTEM_MOUNT_MAX 4
+
+/** /sys/block/<dev>/stat 的 11 列累积计数器。 */
+typedef struct {
+    unsigned long long reads;
+    unsigned long long reads_merged;
+    unsigned long long sectors_read;
+    unsigned long long read_ms;
+    unsigned long long writes;
+    unsigned long long writes_merged;
+    unsigned long long sectors_written;
+    unsigned long long write_ms;
+    unsigned long long in_flight;
+    unsigned long long busy_ms;
+    unsigned long long weighted_ms;
+} TmBlockStat;
+
+/** 读一行的块层计数器；少于 11 列（老内核 / 解析失败）按没有值处理。 */
+static bool read_block_stat(const char *path, TmBlockStat *out)
+{
+    if (path == NULL || out == NULL) {
+        return false;
+    }
+
+    char text[512];
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return false;
+    }
+
+    TmBlockStat stat;
+
+    memset(&stat, 0, sizeof(stat));
+
+    int got = sscanf(text,
+                     "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                     &stat.reads, &stat.reads_merged, &stat.sectors_read, &stat.read_ms,
+                     &stat.writes, &stat.writes_merged, &stat.sectors_written,
+                     &stat.write_ms, &stat.in_flight, &stat.busy_ms, &stat.weighted_ms);
+
+    if (got < 11) {
+        return false;
+    }
+
+    *out = stat;
+
+    return true;
+}
+
+/** 一台盘的上一次采样：块名 + 计数器 + 采样时刻（单调时钟毫秒）。 */
+typedef struct {
+    char name[64];
+    TmBlockStat stat;
+    long long at_ms;
+    bool valid;
+} TmDiskPrev;
+
+/** 进程内的基准表：本进程常驻，两次请求之间的差值就在这里算。 */
+static TmDiskPrev g_disk_prev[TM_DISK_SAMPLE_MAX];
+
+static int g_disk_prev_count = 0;
+
+/** 取（没有就新建）某块盘的基准槽；表满时返回 NULL，这一帧不外扩、也不覆盖别人的基准。 */
+static TmDiskPrev *disk_prev_slot(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+
+    for (int i = 0; i < g_disk_prev_count; i++) {
+
+        if (strcmp(g_disk_prev[i].name, name) == 0) {
+            return &g_disk_prev[i];
+        }
+    }
+
+    if (g_disk_prev_count >= TM_DISK_SAMPLE_MAX) {
+        return NULL;
+    }
+
+    TmDiskPrev *slot = &g_disk_prev[g_disk_prev_count++];
+
+    memset(slot, 0, sizeof(*slot));
+
+    snprintf(slot->name, sizeof(slot->name), "%s", name);
+
+    return slot;
+}
+
+/** 一帧里由 stat 差值算出来的四项实时指标；has_xxx = false 表示这一帧没有基准。 */
+typedef struct {
+    bool has_activity;
+    bool has_response;
+    bool has_read;
+    bool has_write;
+    double activity_percent;
+    double avg_response_ms;
+    double read_bytes_per_sec;
+    double write_bytes_per_sec;
+} TmDiskIo;
+
+/**
+ * 用两轮 stat 差值算实时指标。
+ *
+ * 口径（与页面的四个实时字段一一对应）：
+ *   读取速度   = 读取扇区增量 * 512 / 间隔秒
+ *   写入速度   = 写入扇区增量 * 512 / 间隔秒
+ *   活动时间   = 设备繁忙毫秒增量 / 间隔毫秒 * 100，夹到 0..100
+ *   平均响应   = 加权 I/O 毫秒增量 /（读完成 + 写完成）增量；这一帧没有完成量时记 0
+ *
+ * 首帧（或计数器倒退）不发数值：上层显示占位符，等下一帧再出数据，不编 0。
+ */
+static TmDiskIo measure_disk_io(const char *block_name, const char *stat_path)
+{
+    TmDiskIo io;
+
+    memset(&io, 0, sizeof(io));
+
+    TmBlockStat current;
+
+    if (!read_block_stat(stat_path, &current)) {
+        return io;
+    }
+
+    long long at_ms = monotonic_ms();
+
+    if (at_ms <= 0) {
+        return io;
+    }
+
+    TmDiskPrev *prev = disk_prev_slot(block_name);
+
+    if (prev == NULL) {
+        return io;
+    }
+
+    bool has_baseline = prev->valid && prev->at_ms > 0 && at_ms > prev->at_ms;
+
+    // 计数器倒退 = 设备重插 / 内核重置，这一帧不当基准用，重新起算
+    if (has_baseline &&
+        (current.sectors_read < prev->stat.sectors_read ||
+         current.sectors_written < prev->stat.sectors_written ||
+         current.reads < prev->stat.reads ||
+         current.writes < prev->stat.writes ||
+         current.busy_ms < prev->stat.busy_ms ||
+         current.weighted_ms < prev->stat.weighted_ms)) {
+
+        has_baseline = false;
+    }
+
+    if (has_baseline) {
+
+        double elapsed_ms = (double) (at_ms - prev->at_ms);
+
+        unsigned long long sector_read_delta =
+            current.sectors_read - prev->stat.sectors_read;
+
+        unsigned long long sector_write_delta =
+            current.sectors_written - prev->stat.sectors_written;
+
+        io.read_bytes_per_sec =
+            (double) sector_read_delta * (double) TM_DISK_SECTOR_BYTES / (elapsed_ms / 1000.0);
+
+        io.write_bytes_per_sec =
+            (double) sector_write_delta * (double) TM_DISK_SECTOR_BYTES / (elapsed_ms / 1000.0);
+
+        io.has_read = true;
+        io.has_write = true;
+
+        double busy_delta = (double) (current.busy_ms - prev->stat.busy_ms);
+
+        double activity = busy_delta * 100.0 / elapsed_ms;
+
+        if (activity < 0.0) {
+            activity = 0.0;
+        }
+
+        if (activity > 100.0) {
+            activity = 100.0;
+        }
+
+        io.activity_percent = activity;
+        io.has_activity = true;
+
+        unsigned long long completed =
+            (current.reads - prev->stat.reads) + (current.writes - prev->stat.writes);
+
+        double weighted_delta = (double) (current.weighted_ms - prev->stat.weighted_ms);
+
+        io.avg_response_ms = (completed > 0)
+                             ? (weighted_delta / (double) completed)
+                             : 0.0;
+
+        io.has_response = true;
+    }
+
+    prev->stat = current;
+    prev->at_ms = at_ms;
+    prev->valid = true;
+
+    return io;
+}
+
+// ============================================================
+// 磁盘四项指标的常驻高频采样
+//
+// 为什么不能"请求来了现算"：
+//   现算的差值窗口 = 两次快照请求的间隔，而那个间隔由用户选的更新速度决定
+//   （高 0.5 秒 / 常规 1 秒 / 低 4 秒）。常规档 1 秒窗口下，一次几百毫秒的突发读写
+//   被摊进整整一秒，读出来的是平均值而不是"此刻多快"；低档 4 秒更粗。所以同一个
+//   动作只有高档看着准 —— 问题不在 UI 画得快慢，而在采样窗口被 UI 节拍绑住了。
+//
+// 现在的做法（把采样与上报解耦）：
+//   进程自己起一条后台线程，固定每 TM_DISK_TICK_MS 读一次 /sys/block/<dev>/stat，
+//   用**最近 1 秒**的滑动窗口结算四项指标，结果放进互斥保护的表里；
+//   快照请求（REQ typeCode=5）只查表，把最新结算值原样发出去。
+//   于是：UI 想 4 秒刷一次也行，拿到的仍是"最近 1 秒"的真实速率。
+//
+// 为什么后台线程能跑起来：
+//   本进程是常驻的（main -> run_message_loop），绝大部分时间阻塞在 fgets(stdin)
+//   等命令，这段时间完全空着。pthread 起来之后与主循环互不干扰：主循环读管道、线程
+//   读 sysfs，两者只在这张结果表上相遇，用一把互斥锁保护。
+//
+// 取不到值时的退路：线程没起来（创建失败）或结果已过期（>3 拍没更新，比如设备卡住），
+//   build_disk_devices 会退回原来的 measure_disk_io()，功能降级但不失效。
+// ============================================================
+
+/** 采样节拍：250 ms。四拍 = 1 秒窗口，与 UI 任何一档刷新速度都无关。 */
+#define TM_DISK_TICK_MS 250
+
+/**
+ * 环形缓冲能留多少拍的原始采样。
+ *
+ * 速率与活动时间只用最近 1 秒（见 TM_DISK_RATE_SPAN）；留 17 拍（4 秒）是为了
+ * **平均响应时间**能自适应拉长窗口 —— 原因见 TM_DISK_RESPONSE_TARGET_IOS。
+ */
+#define TM_DISK_WINDOW_SAMPLES 17
+
+/** 速率 / 活动时间固定用最近 4 个间隔 = 1 秒。 */
+#define TM_DISK_RATE_SPAN 4
+
+/**
+ * 平均响应时间的精度目标：窗口里至少要有这么多个"已完成 I/O"。
+ *
+ * 精度天花板在协议本身：/sys/block/<dev>/stat 的 time_in_queue（第 11 列）是
+ * **整数毫秒**，而且底层按 jiffy 累加（HZ=100 时一格就是 10 ms）。单个 I/O 的真实
+ * 0.4 ms 在计数器里可能是 +0 也可能是 +10，永远看不出来。
+ *
+ * 但**平均**能救：N 个 I/O 的总误差不超过一格（G 毫秒），平均值的最小刻度就是
+ * G / N。要 0.1 ms 的刻度，就需要 N ≥ G / 0.1 = 100（按最差的 10 ms 一格算）。
+ * 所以这里以"攒够 100 个完成量"为窗口选择依据：
+ *   - 盘忙时 1 秒就有几百上千个 I/O → 窗口就停在 1 秒附近，值也不钝；
+ *   - 盘闲时（每秒只有几个 I/O）才把窗口拉到最多 4 秒，宁可慢一点也别给出
+ *     只有 0 / 1 / 2 ms 这种一级一跳的假精度。
+ */
+#define TM_DISK_RESPONSE_TARGET_IOS 100
+
+/** 结算最少要跨多少毫秒：太短的窗口里 busy_ms 只有几个 tick，噪声比信号大。 */
+#define TM_DISK_MIN_SPAN_MS 100
+
+/** 结果的有效期：超过这个时长没被线程更新，就当没有值（设备卡死时不发陈旧数据）。 */
+#define TM_DISK_STALE_MS (TM_DISK_TICK_MS * 3)
+
+/** 一次原始采样：11 列计数器 + 采样时刻。 */
+typedef struct {
+    TmBlockStat stat;
+    long long at_ms;
+    bool valid;
+} TmDiskSample;
+
+/** 一台盘的上次采样表：环形缓冲里最近 17 拍 + 最近一次结算结果。 */
+typedef struct {
+    char name[64];
+    TmDiskSample ring[TM_DISK_WINDOW_SAMPLES];
+    int count;                 // 已攒了几个点，最大 TM_DISK_WINDOW_SAMPLES
+    int next;                  // 下一个写入位置
+    TmDiskIo io;               // 最近一次结算的四项指标
+    bool io_valid;             // false = 还没攒够两个点，或计数器刚倒退
+    long long updated_ms;      // 最近一次成功采样的时刻
+} TmDiskRuntime;
+
+/** 结果表：按块名索引，进程内常驻。 */
+static TmDiskRuntime g_disk_rt[TM_DISK_SAMPLE_MAX];
+
+static int g_disk_rt_count = 0;
+
+/** 保护整张 g_disk_rt：线程写，请求线程读，两边都只持有极短时间。 */
+static pthread_mutex_t g_disk_rt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/** 采样线程是否已在跑（只用于避免重复启动）。 */
+static bool g_disk_rt_thread_on = false;
+
+/** 取（没有就新建）某块盘的运行时槽；表满时返回 NULL。调用方必须已持锁。 */
+static TmDiskRuntime *disk_rt_slot_locked(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+
+    for (int i = 0; i < g_disk_rt_count; i++) {
+
+        if (strcmp(g_disk_rt[i].name, name) == 0) {
+            return &g_disk_rt[i];
+        }
+    }
+
+    if (g_disk_rt_count >= TM_DISK_SAMPLE_MAX) {
+        return NULL;
+    }
+
+    TmDiskRuntime *slot = &g_disk_rt[g_disk_rt_count++];
+
+    memset(slot, 0, sizeof(*slot));
+
+    snprintf(slot->name, sizeof(slot->name), "%s", name);
+
+    return slot;
+}
+
+/** 找已有的运行时槽（不新建）。调用方必须已持锁。 */
+static TmDiskRuntime *disk_rt_find_locked(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+
+    for (int i = 0; i < g_disk_rt_count; i++) {
+
+        if (strcmp(g_disk_rt[i].name, name) == 0) {
+            return &g_disk_rt[i];
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * 取"往回第 age 拍"的采样：age = 0 是最新，1 是上一个，依此类推。
+ * 越界（这批数据还没攒够）返回 NULL。调用方必须已持锁。
+ */
+static const TmDiskSample *disk_rt_age(const TmDiskRuntime *slot, int age)
+{
+    if (slot == NULL || age < 0 || age >= slot->count) {
+        return NULL;
+    }
+
+    int index = (slot->next + TM_DISK_WINDOW_SAMPLES - 1 - age) % TM_DISK_WINDOW_SAMPLES;
+
+    return &slot->ring[index];
+}
+
+/** 计数器是否倒退（设备重插 / 内核重置）：任何一项变小都算。 */
+static bool disk_stat_regressed(const TmBlockStat *before, const TmBlockStat *after)
+{
+    if (before == NULL || after == NULL) {
+        return true;
+    }
+
+    return after->sectors_read < before->sectors_read ||
+           after->sectors_written < before->sectors_written ||
+           after->reads < before->reads ||
+           after->writes < before->writes ||
+           after->busy_ms < before->busy_ms ||
+           after->weighted_ms < before->weighted_ms;
+}
+
+/**
+ * 用环形缓冲里两个采样点结算四项实时指标（两端取差，不逐段累加）。
+ *
+ * 为什么两端取差：所有计数器都是单调累加的，两端之差就是整段总量，
+ * 逐段累加只会多一层舍入误差，结果一样。
+ *
+ * 口径（两段窗口长度不同，这是本函数与早期版本唯一的区别）：
+ *   读取速度 / 写入速度 / 活动时间 → 固定用**最近 1 秒**（TM_DISK_RATE_SPAN 拍），
+ *     与任务管理器一致，也保证图表上的抖动不会被拉平；
+ *   平均响应 → 用**自适应窗口**（见 TM_DISK_RESPONSE_TARGET_IOS）：
+ *     从"最近 250 ms"开始往前找，找到第一个完成量 ≥ 100 的窗口就用它，
+ *     最远拉到环形缓冲的 4 秒。这样"平均"的分辨率能压到 0.1 ms 一档，
+ *     而不是被 time_in_queue 的整毫秒 / 一格 jiffy 卡死在 0 / 1 / 2 ms。
+ *
+ * 窗口内没有完成的 I/O 时平均响应记 0 —— 空转时的平均响应本来就是 0，不是"没有值"。
+ * 计数器倒退 = 整轮作废，只留最新点重新起算。
+ * 调用方必须已持锁。
+ */
+static void disk_rt_settle(TmDiskRuntime *slot)
+{
+    if (slot == NULL || slot->count < 2) {
+        return;
+    }
+
+    const TmDiskSample *newest = disk_rt_age(slot, 0);
+
+    if (newest == NULL || !newest->valid) {
+        return;
+    }
+
+    int max_age = slot->count - 1;
+
+    // ---- 第一段：最近 1 秒的速率与活动时间 ----
+    int rate_age = max_age > TM_DISK_RATE_SPAN ? TM_DISK_RATE_SPAN : max_age;
+
+    const TmDiskSample *rate_base = disk_rt_age(slot, rate_age);
+
+    if (rate_base == NULL || !rate_base->valid) {
+        return;
+    }
+
+    // 倒退只查真正要用的那 1 秒窗口：4 秒窗口里 3 秒前有过一次重插，
+    // 不该把现在这一秒的正常数据也一起作废。
+    if (disk_stat_regressed(&rate_base->stat, &newest->stat)) {
+
+        slot->io_valid = false;
+
+        return;
+    }
+
+    long long rate_span_ms = newest->at_ms - rate_base->at_ms;
+
+    if (rate_span_ms < TM_DISK_MIN_SPAN_MS) {
+        return;
+    }
+
+    const TmBlockStat *rate_before = &rate_base->stat;
+    const TmBlockStat *after = &newest->stat;
+
+    TmDiskIo io;
+
+    memset(&io, 0, sizeof(io));
+
+    double seconds = (double) rate_span_ms / 1000.0;
+
+    unsigned long long sector_read = after->sectors_read - rate_before->sectors_read;
+    unsigned long long sector_write = after->sectors_written - rate_before->sectors_written;
+
+    io.read_bytes_per_sec = (double) sector_read * (double) TM_DISK_SECTOR_BYTES / seconds;
+    io.write_bytes_per_sec = (double) sector_write * (double) TM_DISK_SECTOR_BYTES / seconds;
+
+    io.has_read = true;
+    io.has_write = true;
+
+    // 设备忙时 = 窗口内真正在处理 I/O 的毫秒数；两个 I/O 重叠时内核只算一次，
+    // 所以这个比例天然落在 0..100，夹一下只是防四舍五入越界。
+    double busy = (double) (after->busy_ms - rate_before->busy_ms);
+
+    double activity = busy * 100.0 / (double) rate_span_ms;
+
+    if (activity < 0.0) {
+        activity = 0.0;
+    }
+
+    if (activity > 100.0) {
+        activity = 100.0;
+    }
+
+    io.activity_percent = activity;
+    io.has_activity = true;
+
+    // ---- 第二段：自适应窗口的平均响应 ----
+    // 先看最近 1 秒：一个 I/O 都没完成 = 此刻根本没有"正在被响应"的 I/O，直接给 0。
+    // 不能因为窗口里还留着几秒前的旧账就继续显示（负载一停数字再挂 4 秒，看着像假数据）。
+    unsigned long long recent_completed =
+        (after->reads - rate_before->reads) + (after->writes - rate_before->writes);
+
+    int response_age = 0;
+
+    if (recent_completed > 0) {
+
+        // 有 I/O 才需要精度：从 1 秒开始往前找，找到第一个攒够目标完成量的窗口；
+        // 一直不够就用环形缓冲里最长的一段（最多 4 秒）。
+        response_age = max_age;
+
+        for (int age = rate_age; age <= max_age; age++) {
+
+            const TmDiskSample *base = disk_rt_age(slot, age);
+
+            if (base == NULL || !base->valid) {
+                continue;
+            }
+
+            // 这一段里有过计数器倒退（重插 / 内核重置）就跳过它，换更短的一段：
+            // 差分会变成无意义的大数
+            if (disk_stat_regressed(&base->stat, &newest->stat)) {
+                continue;
+            }
+
+            unsigned long long done =
+                (after->reads - base->stat.reads) + (after->writes - base->stat.writes);
+
+            if (done >= (unsigned long long) TM_DISK_RESPONSE_TARGET_IOS) {
+
+                response_age = age;
+
+                break;
+            }
+        }
+    }
+
+    if (response_age == 0) {
+
+        io.avg_response_ms = 0.0;
+        io.has_response = true;
+
+    } else {
+
+        const TmDiskSample *response_base = disk_rt_age(slot, response_age);
+
+        // 兜底选中的最长一段里也可能夹着倒退：那就退回干净的 1 秒窗口
+        if (response_base != NULL &&
+            disk_stat_regressed(&response_base->stat, &newest->stat)) {
+
+            response_base = rate_base;
+        }
+
+        if (response_base != NULL && response_base->valid) {
+
+            unsigned long long completed =
+                (after->reads - response_base->stat.reads) +
+                (after->writes - response_base->stat.writes);
+
+            // weighted_ms 是每个 I/O 在队列里排队等待的毫秒数之和，除以完成量 = 单个 I/O
+            // 的平均队列时间。整数毫秒的量化误差在除法里被完成量稀释，这就是精度来源。
+            io.avg_response_ms = (completed > 0)
+                                 ? ((double) (after->weighted_ms - response_base->stat.weighted_ms)
+                                    / (double) completed)
+                                 : 0.0;
+
+            io.has_response = true;
+        }
+    }
+
+    slot->io = io;
+    slot->io_valid = true;
+}
+
+/**
+ * 采样线程主体：每 TM_DISK_TICK_MS 枚举一次物理盘、读一遍 stat、结算一次。
+ *
+ * 每轮都重新枚举，是为了热插拔：插上的盘立刻有数据，拔掉的盘只是不再更新
+ * （它的槽留在表里，请求侧按"过期"处理，不会再对外发陈旧值）。
+ *
+ * 全程不碰 stdout：那是主循环的协议通道，线程往里写会污染回包。
+ */
+static void *disk_sample_thread(void *arg)
+{
+    (void) arg;
+
+    while (true) {
+
+        TmDeviceRef refs[TM_DISK_SAMPLE_MAX];
+
+        int count = enumerate_disk_devices(refs, TM_DISK_SAMPLE_MAX);
+
+        long long at_ms = monotonic_ms();
+
+        for (int i = 0; i < count; i++) {
+
+            char stat_path[TM_PATH_MAX];
+
+            snprintf(stat_path, sizeof(stat_path), "%s/stat", refs[i].path);
+
+            TmBlockStat stat;
+
+            // 读文件在锁外做：sysfs 偶尔会慢，不能让别人排队等
+            if (!read_block_stat(stat_path, &stat)) {
+                continue;
+            }
+
+            pthread_mutex_lock(&g_disk_rt_lock);
+
+            TmDiskRuntime *slot = disk_rt_slot_locked(refs[i].name);
+
+            if (slot != NULL) {
+
+                slot->ring[slot->next].stat = stat;
+                slot->ring[slot->next].at_ms = at_ms;
+                slot->ring[slot->next].valid = true;
+
+                slot->next = (slot->next + 1) % TM_DISK_WINDOW_SAMPLES;
+
+                if (slot->count < TM_DISK_WINDOW_SAMPLES) {
+                    slot->count++;
+                }
+
+                disk_rt_settle(slot);
+
+                slot->updated_ms = at_ms;
+            }
+
+            pthread_mutex_unlock(&g_disk_rt_lock);
+        }
+
+        usleep(TM_DISK_TICK_MS * 1000);
+    }
+
+    return NULL;
+}
+
+/** 起采样线程（传 detached，退出时不需要 join）。起不来就算了，请求侧会自动退回现算。 */
+static void disk_sampler_start(void)
+{
+    if (g_disk_rt_thread_on) {
+        return;
+    }
+
+    g_disk_rt_thread_on = true;
+
+    pthread_t thread;
+
+    if (pthread_create(&thread, NULL, disk_sample_thread, NULL) != 0) {
+
+        g_disk_rt_thread_on = false;
+
+        return;
+    }
+
+    pthread_detach(thread);
+}
+
+/**
+ * 查一块盘最近一次结算结果。
+ *
+ * @param name  块名（sda / nvme0n1 …）
+ * @param found 出参：true = 拿到的是新鲜值，false = 没起来 / 还没攒够点 / 已过期
+ * @return 四项指标；found=false 时内容全 0，调用方应改用 measure_disk_io 兜底
+ */
+static TmDiskIo disk_runtime_io(const char *name, bool *found)
+{
+    TmDiskIo io;
+
+    memset(&io, 0, sizeof(io));
+
+    if (found != NULL) {
+        *found = false;
+    }
+
+    if (name == NULL || name[0] == '\0') {
+        return io;
+    }
+
+    long long now = monotonic_ms();
+
+    if (now <= 0) {
+        return io;
+    }
+
+    pthread_mutex_lock(&g_disk_rt_lock);
+
+    TmDiskRuntime *slot = disk_rt_find_locked(name);
+
+    if (slot != NULL && slot->io_valid && slot->updated_ms > 0 &&
+        (now - slot->updated_ms) <= TM_DISK_STALE_MS) {
+
+        io = slot->io;
+
+        if (found != NULL) {
+            *found = true;
+        }
+    }
+
+    pthread_mutex_unlock(&g_disk_rt_lock);
+
+    return io;
+}
+
+/** 去掉 sysfs 文本尾部的换行与首尾空白（model / vendor 这类一行小文件都要过一遍）。 */
+static void trim_disk_text(char *text)
+{
+    if (text == NULL) {
+        return;
+    }
+
+    size_t length = strlen(text);
+
+    while (length > 0) {
+
+        char tail = text[length - 1];
+
+        if (tail != '\n' && tail != '\r' && tail != ' ' && tail != '\t') {
+            break;
+        }
+
+        text[length - 1] = '\0';
+        length--;
+    }
+
+    size_t start = 0;
+
+    while (text[start] == ' ' || text[start] == '\t') {
+        start++;
+    }
+
+    if (start > 0) {
+        memmove(text, text + start, strlen(text + start) + 1);
+    }
+}
+
+/** 不区分大小写地找子串（只用于 sysfs 链接路径里的 nvme / ufs / mmc 这些关键字）。 */
+static bool text_contains_ci(const char *text, const char *needle)
+{
+    if (text == NULL || needle == NULL || needle[0] == '\0') {
+        return false;
+    }
+
+    size_t need = strlen(needle);
+
+    for (const char *cursor = text; cursor[0] != '\0'; cursor++) {
+
+        size_t matched = 0;
+
+        while (matched < need && cursor[matched] != '\0' &&
+               tolower((unsigned char) cursor[matched]) == tolower((unsigned char) needle[matched])) {
+            matched++;
+        }
+
+        if (matched == need) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 读厂商名：`/sys/block/<dev>/device/vendor`。
+ *
+ * 这是 SCSI 家族的通用节点 —— UFS / SATA / USB 存储都挂在 SCSI 子系统下，都有这个文件
+ * （Redmi Turbo 3 上是 SAMSUNG）。NVMe 的设备目录里没有名字型 vendor，
+ * 那个位置给的是 PCI 厂商号（0x144d 这种），所以读到 `0x` 开头的值一律丢掉，
+ * 宁可页面上只显示型号，也不把十六进制编号当成厂商名摆出来。
+ *
+ * @param block_path `/sys/block/<dev>` 目录
+ * @param out        输出（空串 = 没读到）
+ */
+static void read_disk_vendor(const char *block_path, char *out, size_t capacity)
+{
+    if (out == NULL || capacity == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+
+    if (block_path == NULL || block_path[0] == '\0') {
+        return;
+    }
+
+    char path[TM_PATH_MAX];
+    char text[TM_OUT_VALUE_MAX];
+
+    text[0] = '\0';
+
+    snprintf(path, sizeof(path), "%s/device/vendor", block_path);
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return;
+    }
+
+    trim_disk_text(text);
+
+    // 0x144d / 0X144D：PCI 厂商号，不是名字，直接用它是错的
+    if (text[0] == '\0' || (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))) {
+        return;
+    }
+
+    snprintf(out, capacity, "%s", text);
+}
+
+/**
+ * 存储接口类型：NVMe / UFS / 其他（其他返回空串，调用方就不加前缀）。
+ *
+ * 判据是**设备拓扑**，不是块名。要读的是 `/sys/block/<dev>` **自己**那条链接：
+ *
+ *   ../../devices/platform/soc/1d84000.ufshc/host0/target0:0:0/0:0:0:0
+ *                                   ^^^^^^ 高通把 UFS 主机控制器叫 ufshc
+ *
+ * NVMe 的路径长这样：
+ *
+ *   ../../devices/pci0000:00/0000:00:06.0/nvme/nvme0
+ *
+ * 所以顺着这条链接的文本找控制器名就够，不用一层层往上退目录：
+ *   - 含 nvme                  → NVMe
+ *   - 含 ufshc / ufshcd / ufs  → UFS
+ *
+ * **不能**拿 `subsystem = scsi` 当 UFS 判据：UFS / SATA / USB 存储都呈现为 SCSI 设备，
+ * 只看子系统会把 SATA 硬盘也认成 UFS。
+ *
+ * 链接读不到（老内核 / 权限）时退回块名前缀：nvme0n1 这种一眼就是 NVMe。
+ *
+ * @param block_path `/sys/block/<dev>` 目录
+ * @param block_name 块名（sda / nvme0n1 / mmcblk0 …）
+ * @param out        输出前缀（空串 = 不加）
+ */
+static void disk_interface_type(const char *block_path, const char *block_name,
+                                char *out, size_t capacity)
+{
+    if (out == NULL || capacity == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+
+    char path[TM_PATH_MAX];
+    char block_link[TM_PATH_MAX];
+    char device_link[TM_PATH_MAX];
+
+    block_link[0] = '\0';
+    device_link[0] = '\0';
+
+    if (block_path != NULL && block_path[0] != '\0') {
+
+        // 关键证据在这里：/sys/block/<dev> 自己就是一条链接，文本带着整条控制器路径，
+        // 例如 Android 上 UFS 盘的
+        //   ../devices/platform/soc/1d84000.ufshc/host0/target0:0:0/0:0:0:0/block/sda
+        //                                          ^^^^^^ 就是 UFS Host Controller
+        //
+        // 而 <dev>/device 只是"在同一层里指回自己"：文本是 ../../../0:0:0:0，
+        // 里面没有控制器名 —— 上一版只查那条链接，所以 UFS 永远认不出来。
+        // （NVMe 的 <dev>/device 恰好指向 ../nvme0，才碰巧能认出来。）
+        read_link_text(block_path, block_link, (int) sizeof(block_link));
+
+        snprintf(path, sizeof(path), "%s/device", block_path);
+
+        read_link_text(path, device_link, (int) sizeof(device_link));
+    }
+
+    // 两条链接一起查：块链接给控制器路径，device 链接给 SCSI 家族 / NVMe 的那一层
+    bool nvme = text_contains_ci(block_link, "nvme") || text_contains_ci(device_link, "nvme");
+
+    bool ufs = text_contains_ci(block_link, "ufshc") || text_contains_ci(block_link, "ufshcd") ||
+               text_contains_ci(device_link, "ufshc") || text_contains_ci(device_link, "ufshcd") ||
+               text_contains_ci(block_link, "ufs") || text_contains_ci(device_link, "ufs");
+
+    if (nvme) {
+
+        snprintf(out, capacity, "NVMe");
+        return;
+    }
+
+    if (ufs) {
+
+        snprintf(out, capacity, "UFS");
+        return;
+    }
+
+    if (block_name != NULL && strncmp(block_name, "nvme", 4) == 0) {
+        snprintf(out, capacity, "NVMe");
+    }
+}
+
+/** 不区分大小写地判断 text 是否以 prefix 开头（拼名字时用来防重复厂商名）。 */
+static bool starts_with_ci(const char *text, const char *prefix)
+{
+    if (text == NULL || prefix == NULL) {
+        return false;
+    }
+
+    size_t index = 0;
+
+    for (; prefix[index] != '\0'; index++) {
+
+        if (text[index] == '\0') {
+            return false;
+        }
+
+        if (tolower((unsigned char) text[index]) != tolower((unsigned char) prefix[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * 这块盘是不是 USB 总线接的（就是类型文案里那对括号的 (USB)）。
+ *
+ * 为什么不能只看 device 链接：链到哪一层取决于内核拓扑，部分 USB 桥 / UAS 设备
+ * 的链接落在 scsi_host 那一层，路径里根本没有 "usb" 这一段，于是只按链接判的话
+ * 移动硬盘会被写成 (SCSI)。这里补三条兜底，任意一条命中就算 USB：
+ *   1) device 链接的文本里有 usb（最常见，保留原有判据）；
+ *   2) 把链接解析成绝对路径后再查一次（相对路径有时要在解析后才露出 usb1 那一段）；
+ *   3) device/uevent 里的驱动程序名是 usb-storage / uas / usb 一类。
+ * 三条都不中才算"不是 USB"，交给上层继续判 SCSI / 其它。
+ */
+static bool disk_is_usb_attached(const char *block_path, const char *device_target)
+{
+    if (block_path == NULL || block_path[0] == '\0') {
+        return false;
+    }
+
+    if (device_target != NULL && text_contains_ci(device_target, "usb")) {
+        return true;
+    }
+
+    char path[TM_PATH_MAX];
+
+    // realpath 的 buffer 必须 >= PATH_MAX，否则强化的 libc 会在编译期直接报错
+
+    char resolved[PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/device", block_path);
+
+    resolved[0] = '\0';
+
+    if (realpath(path, resolved) != NULL && text_contains_ci(resolved, "usb")) {
+        return true;
+    }
+
+    snprintf(path, sizeof(path), "%s/device/uevent", block_path);
+
+    char uevent[512];
+
+    if (read_text_file(path, uevent, (int) sizeof(uevent)) > 0) {
+
+        if (text_contains_ci(uevent, "usb-storage") ||
+            text_contains_ci(uevent, "driver=uas") ||
+            text_contains_ci(uevent, "driver=usb")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/** 往名字缓冲区尾部追加一段，段间自动补一个空格；越界就截断，不越界写。 */
+static void disk_name_append(char *buffer, size_t capacity, size_t *used, const char *part)
+{
+    if (buffer == NULL || used == NULL || part == NULL || part[0] == '\0' || capacity == 0) {
+        return;
+    }
+
+    if (*used >= capacity - 1) {
+        return;
+    }
+
+    int written = snprintf(buffer + *used, capacity - *used, (*used == 0) ? "%s" : " %s", part);
+
+    if (written <= 0) {
+        return;
+    }
+
+    size_t added = (size_t) written;
+
+    *used = (*used + added >= capacity) ? (capacity - 1) : (*used + added);
+}
+
+/** 由 /proc/self/mountinfo 的 major:minor 反查块名（dm-1 / sda5 / mmcblk0p2 …）。 */
+static bool block_name_of_devnum(const char *devnum, char *out, int capacity)
+{
+    if (devnum == NULL || devnum[0] == '\0' || capacity <= 0) {
+        return false;
+    }
+
+    char path[TM_PATH_MAX];
+    char link[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "/sys/dev/block/%s", devnum);
+
+    if (read_link_text(path, link, (int) sizeof(link)) <= 0) {
+        return false;
+    }
+
+    name_from_path(link, out, capacity);
+
+    return out[0] != '\0';
+}
+
+/**
+ * 把一个块名归到某台物理盘。
+ *
+ * 三级匹配：
+ * 1. 名字就是物理盘（sda / nvme0n1 / mmcblk0）；
+ * 2. 是某台盘的分区（/sys/block/<disk>/<part>/dev 存在即成立）；
+ * 3. dm-* / md 这类映射设备，跟着 slaves 递归到底层（限 4 层，防环）。
+ *
+ * @return 磁盘下标；-1 = 这个块设备不归任何一台物理盘（loop / zram / OTA 映射等）
+ */
+static int disk_index_of_block(const char *block_name,
+                               const TmDeviceRef *disks, int disk_count, int depth)
+{
+    if (block_name == NULL || block_name[0] == '\0' || disks == NULL || disk_count <= 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < disk_count; i++) {
+
+        if (strcmp(disks[i].name, block_name) == 0) {
+            return i;
+        }
+    }
+
+    for (int i = 0; i < disk_count; i++) {
+
+        char dir[TM_PATH_MAX];
+
+        snprintf(dir, sizeof(dir), "/sys/block/%s", disks[i].name);
+
+        DIR *parent = opendir(dir);
+
+        if (parent == NULL) {
+            continue;
+        }
+
+        int found = 0;
+
+        struct dirent *entry;
+
+        while ((entry = readdir(parent)) != NULL) {
+
+            if (entry->d_name[0] == '.' || strcmp(entry->d_name, block_name) != 0) {
+                continue;
+            }
+
+            // 只认分区目录：同名文件（size / stat）不算分区
+            char probe[TM_PATH_MAX];
+            struct stat info;
+
+            snprintf(probe, sizeof(probe), "%s/%s/dev", dir, entry->d_name);
+
+            if (stat(probe, &info) == 0) {
+                found = 1;
+            }
+
+            break;
+        }
+
+        closedir(parent);
+
+        if (found) {
+            return i;
+        }
+    }
+
+    if (depth < 4 &&
+        (strncmp(block_name, "dm-", 3) == 0 || strncmp(block_name, "md", 2) == 0)) {
+
+        char dir[TM_PATH_MAX];
+
+        snprintf(dir, sizeof(dir), "/sys/block/%s/slaves", block_name);
+
+        DIR *slaves = opendir(dir);
+
+        if (slaves == NULL) {
+            return -1;
+        }
+
+        int resolved = -1;
+
+        struct dirent *entry;
+
+        while ((entry = readdir(slaves)) != NULL) {
+
+            if (entry->d_name[0] == '.') {
+                continue;
+            }
+
+            resolved = disk_index_of_block(entry->d_name, disks, disk_count, depth + 1);
+
+            if (resolved >= 0) {
+                break;
+            }
+        }
+
+        closedir(slaves);
+
+        return resolved;
+    }
+
+    return -1;
+}
+
+/**
+ * 扫一遍挂载表与 swap 表，填三件只有"整机视角"才知道的事。
+ *
+ * 已格式化容量：把每个已挂载文件系统的总容量（statvfs 的 blocks * frsize）
+ * 累加到它所属的物理盘。同一块设备挂多次（/data 与 /data/user/0 这种）只算一次，
+ * 否则容量会被重复累加。没有任何挂载命中时该盘记 -1，页面显示破折号。
+ *
+ * 系统盘：按 /system -> /vendor -> /data -> / 的顺序找第一个能落到物理盘的挂载。
+ * Android 的 / 常常是 overlay（匿名块设备），所以把系统 / 厂商 / 数据分区排在前面。
+ *
+ * 页面文件：/proc/swaps 里的 swap 分区如果落在某台盘上就是它；zram 不归任何物理盘，
+ * 所以纯 zram 的机器这一项是"否"，这才是实情。
+ *
+ * @param formatted       每台盘累加出来的字节数（调用方先清零）
+ * @param formatted_known 每台盘是否有挂载命中（0/1）
+ * @param system_disk     输出系统盘下标；-1 = 认不出来
+ * @param page_file       每台盘是否承载 swap（0/1）
+ */
+static void collect_disk_mounts(const TmDeviceRef *disks, int disk_count,
+                                long long *formatted, int *formatted_known,
+                                int *system_disk, int *page_file)
+{
+    *system_disk = -1;
+
+    static const char *const system_mounts[TM_DISK_SYSTEM_MOUNT_MAX] = {
+        "/system", "/vendor", "/data", "/"
+    };
+
+    char system_dev[TM_DISK_SYSTEM_MOUNT_MAX][32];
+
+    memset(system_dev, 0, sizeof(system_dev));
+
+    // 同一个块设备（dm-3 / sda5 …）只累加一次容量
+    char seen[TM_DISK_DEVNUM_MAX][32];
+
+    memset(seen, 0, sizeof(seen));
+
+    int seen_count = 0;
+
+    FILE *file = fopen("/proc/self/mountinfo", "r");
+
+    if (file != NULL) {
+
+        char line[TM_LINE_MAX];
+
+        while (fgets(line, (int) sizeof(line), file) != NULL) {
+
+            char devnum[32];
+            char mountpoint[TM_PATH_MAX];
+
+            // 前两列是 mount id 与 parent id，第三列 major:minor，第五列挂载点
+            if (sscanf(line, "%*s %*s %31s %*s %511s", devnum, mountpoint) != 2) {
+                continue;
+            }
+
+            // 0:xx 是匿名块设备：overlay / tmpfs / proc / sysfs 全在这里，都不是磁盘
+            if (strncmp(devnum, "0:", 2) == 0) {
+                continue;
+            }
+
+            for (int k = 0; k < TM_DISK_SYSTEM_MOUNT_MAX; k++) {
+
+                if (system_dev[k][0] == '\0' && strcmp(mountpoint, system_mounts[k]) == 0) {
+                    snprintf(system_dev[k], sizeof(system_dev[k]), "%s", devnum);
+                }
+            }
+
+            int already = 0;
+
+            for (int s = 0; s < seen_count; s++) {
+
+                if (strcmp(seen[s], devnum) == 0) {
+                    already = 1;
+                    break;
+                }
+            }
+
+            if (already) {
+                continue;
+            }
+
+            if (seen_count < TM_DISK_DEVNUM_MAX) {
+                snprintf(seen[seen_count], sizeof(seen[0]), "%s", devnum);
+                seen_count++;
+            }
+
+            char block_name[64];
+
+            if (!block_name_of_devnum(devnum, block_name, (int) sizeof(block_name))) {
+                continue;
+            }
+
+            int index = disk_index_of_block(block_name, disks, disk_count, 0);
+
+            if (index < 0) {
+                continue;
+            }
+
+            struct statvfs vfs;
+
+            if (statvfs(mountpoint, &vfs) != 0) {
+                continue;
+            }
+
+            long long unit = (vfs.f_frsize > 0) ? (long long) vfs.f_frsize : (long long) vfs.f_bsize;
+
+            if (unit <= 0) {
+                continue;
+            }
+
+            long long total = (long long) vfs.f_blocks * unit;
+
+            if (total <= 0) {
+                continue;
+            }
+
+            formatted[index] += total;
+            formatted_known[index] = 1;
+        }
+
+        fclose(file);
+    }
+
+    for (int k = 0; k < TM_DISK_SYSTEM_MOUNT_MAX && *system_disk < 0; k++) {
+
+        if (system_dev[k][0] == '\0') {
+            continue;
+        }
+
+        char block_name[64];
+
+        if (!block_name_of_devnum(system_dev[k], block_name, (int) sizeof(block_name))) {
+            continue;
+        }
+
+        *system_disk = disk_index_of_block(block_name, disks, disk_count, 0);
+    }
+
+    file = fopen("/proc/swaps", "r");
+
+    if (file != NULL) {
+
+        char line[TM_LINE_MAX];
+
+        while (fgets(line, (int) sizeof(line), file) != NULL) {
+
+            // 表头是 Filename...，数据行一定是设备路径或文件路径
+            if (line[0] != '/') {
+                continue;
+            }
+
+            char filename[TM_PATH_MAX];
+
+            if (sscanf(line, "%511s", filename) != 1) {
+                continue;
+            }
+
+            char block_name[64];
+
+            name_from_path(filename, block_name, (int) sizeof(block_name));
+
+            int index = disk_index_of_block(block_name, disks, disk_count, 0);
+
+            if (index >= 0) {
+                page_file[index] = 1;
+            }
+        }
+
+        fclose(file);
+    }
+}
+
+/**
+ * 把磁盘实例填进包：每台盘一块，字段与页面一一对应。
+ *
+ * 字段（键名与客户端 PerformanceSnapshot 的解析逐项一致）：
+ *   name              型号串（读不到退回块名，不发空串）
+ *   media             介质：HDD / SSD / UFS / eMMC
+ *   bus               总线：NVMe / SCSI / MMC / VIRTIO / USB
+ *   capacity_bytes    容量（字节）
+ *   formatted_bytes   已格式化容量（该盘上已挂载文件系统的容量之和）
+ *   system_disk       1/0；整机认不出系统盘时这一格不发，页面显示破折号
+ *   page_file         1/0
+ *   activity_percent  活动时间 0..100
+ *   avg_response_ms   平均响应毫秒
+ *   read_bytes_per_sec / write_bytes_per_sec 读写速度（字节/秒）
+ */
+static int build_disk_devices(TmOutDevice *out, int capacity,
+                              const TmDeviceRef *devices, int count)
+{
+    if (out == NULL || devices == NULL || capacity <= 0 || count <= 0) {
+        return 0;
+    }
+
+    int limit = count;
+
+    if (limit > capacity) {
+        limit = capacity;
+    }
+
+    if (limit > TM_OUT_DISK_MAX) {
+        limit = TM_OUT_DISK_MAX;
+    }
+
+    long long formatted[TM_OUT_DISK_MAX];
+    int formatted_known[TM_OUT_DISK_MAX];
+    int page_file[TM_OUT_DISK_MAX];
+
+    for (int i = 0; i < TM_OUT_DISK_MAX; i++) {
+        formatted[i] = 0;
+        formatted_known[i] = 0;
+        page_file[i] = 0;
+    }
+
+    int system_disk = -1;
+
+    collect_disk_mounts(devices, limit, formatted, formatted_known, &system_disk, page_file);
+
+    for (int i = 0; i < limit; i++) {
+
+        TmOutDevice *device = &out[i];
+
+        device_begin(device, devices[i].id, TM_DEV_TYPE_DISK);
+
+        char path[TM_PATH_MAX];
+
+        // 介质与总线分开报：只看块名前缀会把 UFS（挂在 SCSI 子系统下）当成 SATA SSD，
+        // 所以判据是 device 链接指向的控制器目录 + queue/rotational。
+        char target[TM_PATH_MAX];
+
+        target[0] = '\0';
+
+        snprintf(path, sizeof(path), "%s/device", devices[i].path);
+
+        read_link_text(path, target, (int) sizeof(target));
+
+        // 接口类型（NVMe / UFS / 其他）：判据同样落在这条链接上，
+        // 具体规则集中在 disk_interface_type() 里，免得介质判定和名字前缀各写一套
+        char interface_type[TM_OUT_VALUE_MAX];
+
+        disk_interface_type(devices[i].path, devices[i].name, interface_type,
+                            sizeof(interface_type));
+
+        // 设备名 = 接口前缀 + 厂商 + 型号，例如：
+        //   NVMe SAMSUNG MZVLQ512HBLU-00B00
+        //   UFS  SAMSUNG KLUEG4RHHF-F0G1
+        //   SAMSUNG NUEWBJ-DEWDC     （既不是 NVMe 也不是 UFS：不加前缀）
+        // 型号里已经带了厂商名（NVMe 的 model 常常就是 "SAMSUNG MZVLQ…"）时不再重复拼一遍
+        char model[TM_OUT_VALUE_MAX];
+
+        char vendor[TM_OUT_VALUE_MAX];
+
+        model[0] = '\0';
+        vendor[0] = '\0';
+
+        snprintf(path, sizeof(path), "%s/device/model", devices[i].path);
+
+        if (read_text_file(path, model, (int) sizeof(model)) > 0) {
+            trim_disk_text(model);
+        }
+
+        read_disk_vendor(devices[i].path, vendor, sizeof(vendor));
+
+        char display[TM_OUT_VALUE_MAX * 2];
+
+        display[0] = '\0';
+
+        size_t display_used = 0;
+
+        disk_name_append(display, sizeof(display), &display_used, interface_type);
+
+        if (vendor[0] != '\0' && !starts_with_ci(model, vendor)) {
+            disk_name_append(display, sizeof(display), &display_used, vendor);
+        }
+
+        disk_name_append(display, sizeof(display), &display_used, model);
+
+        // 型号与厂商都缺（比如 /sys 被裁过的老机器）就退回块名 sda，右上角不至于空着
+        device_put(device, "name", display[0] != '\0' ? display : devices[i].name);
+
+        // 块设备名（sda / sdb / mmcblk0 / nvme0n1）：页面标题写"磁盘 0 (sda)"用。
+        // 它与 name 是两件事：name 是"厂商 + 型号"，不含块名（只有型号都缺时才退回块名）。
+        device_put(device, "node", devices[i].name);
+
+        double rotational = 0.0;
+
+        int has_rotation = 0;
+
+        snprintf(path, sizeof(path), "%s/queue/rotational", devices[i].path);
+
+        if (read_first_number(path, &rotational)) {
+            has_rotation = 1;
+        }
+
+        const char *media = NULL;
+        const char *bus = NULL;
+
+        if (text_contains_ci(target, "nvme") || strncmp(devices[i].name, "nvme", 4) == 0) {
+
+            bus = "NVMe";
+            media = "SSD";
+
+        } else if (text_contains_ci(target, "ufs")) {
+
+            // UFS 走 SCSI 子系统，块名是 sdX：总线照实报 SCSI，介质报 UFS
+            media = "UFS";
+            bus = "SCSI";
+
+        } else if (text_contains_ci(target, "mmc") || text_contains_ci(target, "sdhci")) {
+
+            media = "eMMC";
+            bus = "MMC";
+
+        } else if (text_contains_ci(target, "virtio")) {
+
+            bus = "VIRTIO";
+
+        } else if (disk_is_usb_attached(devices[i].path, target)) {
+
+            // 移动硬盘 / U 盘：括号里写 (USB)；介质仍由 queue/rotational 判 SSD / HDD
+            bus = "USB";
+
+        } else if (text_contains_ci(target, "scsi") || strncmp(devices[i].name, "sd", 2) == 0) {
+
+            bus = "SCSI";
+        }
+
+        if (media == NULL && has_rotation) {
+            media = (rotational > 0.5) ? "HDD" : "SSD";
+        }
+
+        if (media != NULL) {
+            device_put(device, "media", media);
+        }
+
+        if (bus != NULL) {
+            device_put(device, "bus", bus);
+        }
+
+        // 容量：size 的 512 字节扇区数
+        double sectors = 0.0;
+
+        long long capacity_bytes = -1;
+
+        snprintf(path, sizeof(path), "%s/size", devices[i].path);
+
+        if (read_first_number(path, &sectors) && sectors > 0.0 && sectors < 1.0e15) {
+            capacity_bytes = (long long) (sectors * (double) TM_DISK_SECTOR_BYTES);
+        }
+
+        device_put_int(device, "capacity_bytes", capacity_bytes, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+        // 已格式化容量：没有挂载命中就是没有值，不拿 0 顶替
+        device_put_int(device, "formatted_bytes",
+                       formatted_known[i] ? formatted[i] : -1,
+                       TM_FIELD_STATUS_NOT_AVAILABLE);
+
+        // 系统盘：整机认不出来就整格不发（页面显示破折号，而不是"否"）
+        if (system_disk >= 0) {
+            device_put(device, "system_disk", (i == system_disk) ? "1" : "0");
+        }
+
+        device_put(device, "page_file", page_file[i] ? "1" : "0");
+
+        // 实时四项：优先取后台采样线程结算好的值 —— 它是固定 250 ms 一拍、
+        // 按最近 1 秒窗口算的，与 UI 选的是高 / 常规 / 低档完全无关。
+        // 线程没起来或值已过期，才退回老办法（用相邻两次请求的差值现算）。
+        bool runtime_ready = false;
+
+        TmDiskIo io = disk_runtime_io(devices[i].name, &runtime_ready);
+
+        if (!runtime_ready) {
+
+            snprintf(path, sizeof(path), "%s/stat", devices[i].path);
+
+            io = measure_disk_io(devices[i].name, path);
+        }
+
+        device_put_value(device, "activity_percent",
+                         query_value_float(io.has_activity, io.activity_percent, 2,
+                                           TM_QUERY_NO_BASELINE));
+
+        // 平均响应发两位小数：自适应窗口已经把分辨率压到 0.1 ms 一档，
+        // 协议侧再只发一位就等于把精度又截掉了。
+        device_put_value(device, "avg_response_ms",
+                         query_value_float(io.has_response, io.avg_response_ms, 2,
+                                           TM_QUERY_NO_BASELINE));
+
+        device_put_int(device, "read_bytes_per_sec",
+                       io.has_read ? (long long) io.read_bytes_per_sec : -1,
+                       TM_FIELD_STATUS_NO_BASELINE);
+
+        device_put_int(device, "write_bytes_per_sec",
+                       io.has_write ? (long long) io.write_bytes_per_sec : -1,
+                       TM_FIELD_STATUS_NO_BASELINE);
     }
 
     return limit;
@@ -5549,6 +7832,145 @@ static bool read_dram_spec(char *out, int capacity)
 }
 
 /**
+ * 内存颗粒厂商代码表：dt 的 ddr_manufacturer_id 就是这套编码（0x01..0xFF，编号是稀疏的）。
+ *
+ * 编码来自 JEDEC 的 DRAM 厂商编号，和高通内核头文件里的枚举一致；
+ * 表里没有的编号（预留 / 新型号）一律返回 NULL —— 上层据此整项不发，
+ * 页面连"厂商"这一行都不画，不写"未知厂商"占位。
+ */
+static const char *dram_manufacturer_name(int code)
+{
+    switch (code) {
+
+        case 0x01: return "三星（Samsung）";
+
+        case 0x02: return "奇梦达（Qimonda）";
+
+        case 0x03: return "尔必达（Elpida）";
+
+        case 0x04: return "钰创（Etron）";
+
+        case 0x05: return "南亚科技（Nanya）";
+
+        case 0x06: return "海力士（Hynix）";
+
+        case 0x07: return "茂矽电子（Mosel）";
+
+        case 0x08: return "华邦电子（Winbond）";
+
+        case 0x09: return "晶豪科技（ESMT）";
+
+        case 0x0B: return "飞索半导体（Spansion）";
+
+        case 0x0C: return "超捷半导体（SST）";
+
+        case 0x0D: return "智原科技（ZMOS）";
+
+        case 0x0E: return "英特尔（Intel）";
+
+        case 0xFE: return "美光旗下（Numonyx）";
+
+        case 0xFF: return "美光（Micron）";
+
+        default: return NULL;
+    }
+}
+
+/**
+ * 把一段 dt 属性解释成厂商代码，再换成人看的名字。
+ *
+ * 属性有两种形态（和 ddr_type 那套是同一个道理）：
+ *   二进制 —— u8（一个字节 0x01），或 big-endian 的 u32（00 00 00 01），
+ *             两种形态的编码值都在最后一个字节里，取它即可；
+ *   纯文本 —— 有些内核把 dt 属性导出成文本（"0x01" / "1"），按整数解析。
+ *
+ * @return true = 认出来了，out 里是厂商名；false = 读不到 / 编码不在表里
+ */
+static bool dram_manufacturer_from_property(const char *raw, int length, char *out, int capacity)
+{
+    if (raw == NULL || length <= 0 || out == NULL || capacity <= 0) {
+        return false;
+    }
+
+    bool printable = true;
+
+    for (int i = 0; i < length; i++) {
+
+        unsigned char ch = (unsigned char) raw[i];
+
+        if (ch < 0x20 || ch > 0x7e) {
+            printable = false;
+            break;
+        }
+    }
+
+    int code = -1;
+
+    if (printable) {
+
+        char text[16];
+
+        int count = length < (int) sizeof(text) - 1 ? length : (int) sizeof(text) - 1;
+
+        memcpy(text, raw, (size_t) count);
+
+        text[count] = '\0';
+
+        trim_disk_text(text);
+
+        code = (int) strtol(text, NULL, 0);
+
+    } else {
+
+        // u8 与 big-endian u32 的编码值都落在最后一个字节
+        code = (int) ((unsigned char) raw[length - 1]);
+    }
+
+    const char *name = dram_manufacturer_name(code);
+
+    if (name == NULL) {
+        return false;
+    }
+
+    snprintf(out, (size_t) capacity, "%s", name);
+
+    return true;
+}
+
+/**
+ * 内存颗粒厂商：先查 /proc/device-tree，再查 /sys/firmware/devicetree/base。
+ *
+ * 两个路径都试一遍：Android 上 /proc/device-tree 通常是 /sys/firmware/devicetree/base
+ * 的软链，但被裁过的系统 / SELinux 可能只放行其中一个。
+ *
+ * @return true = 读到了且编码认得出来；false = 调用方不要发这个字段
+ */
+static bool read_dram_manufacturer(char *out, int capacity)
+{
+    static const char *const k_paths[] = {
+        "/proc/device-tree/memory/ddr_manufacturer_id",
+        "/sys/firmware/devicetree/base/memory/ddr_manufacturer_id"
+    };
+
+    static char raw[16];
+
+    for (int i = 0; i < (int) (sizeof(k_paths) / sizeof(k_paths[0])); i++) {
+
+        int length = read_text_file(k_paths[i], raw, (int) sizeof(raw));
+
+        if (length <= 0) {
+            continue;
+        }
+
+        if (dram_manufacturer_from_property(raw, length, out, capacity)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * 标称容量：高通 dt 的 ddr_size，单位是 GB（8 就是 8 GB）。
  *
  * 为什么不用 MemTotal：那是内核能用的内存，已经被保留区啃掉一截，
@@ -5676,6 +8098,14 @@ static int build_memory_devices(TmOutDevice *out, int capacity,
         device_put(&out[0], "spec", spec);
     }
 
+    // 颗粒厂商：dt 的 ddr_manufacturer_id 换成中文名；读不到或编码不在表里就整项不发，
+    // 页面那边"厂商"这一行跟着消失（不留"未知"占位）
+    char manufacturer[64];
+
+    if (read_dram_manufacturer(manufacturer, (int) sizeof(manufacturer))) {
+        device_put(&out[0], "manufacturer", manufacturer);
+    }
+
     return 1;
 }
 
@@ -5728,6 +8158,468 @@ static void emit_device_block(const TmOutDevice *device)
     }
 }
 
+// ============================================================
+// 显卡设备：Linux 通用采集
+//
+// 枚举（enumerate_gpu_devices）只负责"这台机器有哪几张卡"，本节再去读能读到的数字。
+// 与网卡一样：这里只报事实，不替上层决定"显示哪一张"。
+//
+// 数据来源（每一项都能指到具体文件，页面上不猜）：
+//   <path>/gpu_busy_percentage                 高通 Adreno 的 3D 占用（形如 "12 %"）
+//   <path>/device/gpu_busy_percent             DRM 驱动导出的 3D 占用（amdgpu / i915）
+//   <path>/device/hwmon/hwmonN/temp1_input     显卡热区温度（毫摄氏度）
+//   /sys/class/thermal/thermal_zoneN/type      兜底：type 里带 gpu 的那一区
+//   <path>/device/mem_info_vram_total          专用显存总量（amdgpu）
+//   <path>/device/mem_info_vram_used           专用显存已用（amdgpu）
+//
+// 图形 API（页面上"DirectX 版本"那一格换成它）：
+//   1) 先问 libvulkan 的 vkEnumerateInstanceVersion —— 这是真实版本号；
+//   2) 没有再读 ro.opengles.version（十进制 0xMMmm，例如 196610 = 3.2）；
+//   3) 两样都查过、都没有，才发 gfx_api=NONE（明确不支持）；
+//   4) 连查都查不了（dlopen 与 getprop 都失败）就不发这两格，页面写"-"。
+//
+// 读不到的格子一律不发：页面按"不支持 / -"渲染，不拿 0 顶替。
+// ============================================================
+
+/** 读文件里的第一个整数（允许前导空白与后缀单位，如 "12 %"）。 */
+static bool gpu_read_first_int(const char *path, long long *value)
+{
+    char text[64];
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return false;
+    }
+
+    const char *cursor = text;
+
+    while (*cursor != '\0' && !isdigit((unsigned char) *cursor) && *cursor != '-') {
+        cursor++;
+    }
+
+    if (*cursor == '\0') {
+        return false;
+    }
+
+    char digits[32];
+
+    int count = 0;
+
+    if (*cursor == '-') {
+        digits[count++] = *cursor++;
+    }
+
+    while (isdigit((unsigned char) *cursor) && count < 31) {
+        digits[count++] = *cursor++;
+    }
+
+    digits[count] = '\0';
+
+    if (value != NULL) {
+        *value = strtoll(digits, NULL, 10);
+    }
+
+    return true;
+}
+
+/** 读一个百分比（夹到 0..100）。读不到返回 false。 */
+static bool gpu_read_percent(const char *path, long long *percent)
+{
+    long long value = 0;
+
+    if (!gpu_read_first_int(path, &value)) {
+        return false;
+    }
+
+    if (value < 0) value = 0;
+
+    if (value > 100) value = 100;
+
+    if (percent != NULL) {
+        *percent = value;
+    }
+
+    return true;
+}
+
+/** 文本里有没有 gpu 三个字母（忽略大小写）：判断某个热区是不是 GPU 的。 */
+static bool gpu_text_has_gpu(const char *text)
+{
+    char lower[64];
+
+    int count = 0;
+
+    for (; text[count] != '\0' && count < 63; count++) {
+        lower[count] = (char) tolower((unsigned char) text[count]);
+    }
+
+    lower[count] = '\0';
+
+    return strstr(lower, "gpu") != NULL;
+}
+
+/** 兜底温度：/sys/class/thermal 里 type 带 gpu 的第一个热区。 */
+static bool gpu_thermal_zone_temperature(long long *celsius)
+{
+    DIR *dir = opendir("/sys/class/thermal");
+
+    if (dir == NULL) {
+        return false;
+    }
+
+    bool found = false;
+
+    struct dirent *entry;
+
+    while (!found && (entry = readdir(dir)) != NULL) {
+
+        if (strncmp(entry->d_name, "thermal_zone", 12) != 0) {
+            continue;
+        }
+
+        char path[256];
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/%s/type", entry->d_name);
+
+        char type_text[64];
+
+        if (read_text_file(path, type_text, (int) sizeof(type_text)) <= 0) {
+            continue;
+        }
+
+        if (!gpu_text_has_gpu(type_text)) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", entry->d_name);
+
+        long long milli = 0;
+
+        if (!gpu_read_first_int(path, &milli)) {
+            continue;
+        }
+
+        *celsius = milli / 1000;
+
+        found = true;
+    }
+
+    closedir(dir);
+
+    return found;
+}
+
+/**
+ * 物理位置：DRM 节点若有 PCI_SLOT_NAME（domain:bus:device.function），
+ * 写成 "PCI 总线 2、设备 0、功能 0"；SoC 核显不是 PCI 设备，这一格就不发。
+ */
+static void gpu_pci_location(const char *device_path, char *out, int capacity)
+{
+    out[0] = '\0';
+
+    char path[256];
+
+    snprintf(path, sizeof(path), "%s/device/uevent", device_path);
+
+    char text[512];
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return;
+    }
+
+    const char *cursor = strstr(text, "PCI_SLOT_NAME=");
+
+    if (cursor == NULL) {
+        return;
+    }
+
+    cursor += strlen("PCI_SLOT_NAME=");
+
+    unsigned int domain = 0;
+
+    unsigned int bus = 0;
+
+    unsigned int device = 0;
+
+    unsigned int function = 0;
+
+    if (sscanf(cursor, "%x:%x:%x.%x", &domain, &bus, &device, &function) != 4) {
+        return;
+    }
+
+    snprintf(out, (size_t) capacity, "PCI 总线 %u、设备 %u、功能 %u", bus, device, function);
+}
+
+/** 显卡温度：先找 device 下的 hwmon，没有再退回 thermal zone。 */
+static bool gpu_read_temperature(const char *device_path, long long *celsius)
+{
+    for (int index = 0; index < 4; index++) {
+
+        char path[256];
+
+        snprintf(path, sizeof(path), "%s/device/hwmon/hwmon%d/temp1_input", device_path, index);
+
+        long long milli = 0;
+
+        if (gpu_read_first_int(path, &milli)) {
+
+            *celsius = milli / 1000;
+
+            return true;
+        }
+    }
+
+    return gpu_thermal_zone_temperature(celsius);
+}
+
+/** vkEnumerateInstanceVersion 的签名：传入 32 位编码版本号。 */
+typedef unsigned int (*gpu_vulkan_version_fn)(unsigned int *);
+
+/**
+ * 探测图形 API。
+ *
+ * @param has_result 是否真的查过（false = 连查都没查成，页面写"-"）
+ * @param api        输出 VULKAN / OPENGL / NONE
+ * @param version    输出 1.1 / 3.2 这类版本串；NONE 时为空
+ *
+ * 结果在进程内只算一次：这个值跟硬件走，不会中途变化。
+ */
+static void gpu_detect_gfx_api(bool *has_result, char *api, int api_size,
+                               char *version, int version_size)
+{
+    static bool cached = false;
+
+    static bool cached_has_result = false;
+
+    static char cached_api[16] = {0};
+
+    static char cached_version[24] = {0};
+
+    if (cached) {
+
+        *has_result = cached_has_result;
+
+        snprintf(api, (size_t) api_size, "%s", cached_api);
+
+        snprintf(version, (size_t) version_size, "%s", cached_version);
+
+        return;
+    }
+
+    cached = true;
+
+    bool searched = false;
+
+    // 1) Vulkan：loader 给出 32 位版本号（major 在 bit22 起，minor 在 bit12 起）
+    void *library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+
+    if (library != NULL) {
+
+        searched = true;
+
+        gpu_vulkan_version_fn enumerate =
+            (gpu_vulkan_version_fn) dlsym(library, "vkEnumerateInstanceVersion");
+
+        unsigned int encoded = (1u << 22);   // 老 loader 没这个函数：按 Vulkan 1.0 算
+
+        if (enumerate != NULL) {
+
+            encoded = 0;
+
+            if (enumerate(&encoded) != 0) {
+                encoded = 0;
+            }
+        }
+
+        if (encoded != 0) {
+
+            unsigned int major = encoded >> 22;
+
+            unsigned int minor = (encoded >> 12) & 0x3ffu;
+
+            snprintf(cached_api, sizeof(cached_api), "%s", "VULKAN");
+
+            snprintf(cached_version, sizeof(cached_version), "%u.%u", major, minor);
+
+            cached_has_result = true;
+
+            dlclose(library);
+
+            *has_result = true;
+
+            snprintf(api, (size_t) api_size, "%s", cached_api);
+
+            snprintf(version, (size_t) version_size, "%s", cached_version);
+
+            return;
+        }
+
+        dlclose(library);
+    }
+
+    // 2) OpenGL ES：ro.opengles.version 是十进制 0xMMmm
+    FILE *pipe = popen("getprop ro.opengles.version 2>/dev/null", "r");
+
+    if (pipe != NULL) {
+
+        searched = true;
+
+        char text[32] = {0};
+
+        if (fgets(text, (int) sizeof(text), pipe) == NULL) {
+            text[0] = '\0';
+        }
+
+        pclose(pipe);
+
+        if (text[0] != '\0') {
+
+            int encoded = atoi(text);
+
+            if (encoded > 0) {
+
+                int major = encoded >> 16;
+
+                int minor = encoded & 0xffff;
+
+                snprintf(cached_api, sizeof(cached_api), "%s", "OPENGL");
+
+                snprintf(cached_version, sizeof(cached_version), "%d.%d", major, minor);
+
+                cached_has_result = true;
+
+                *has_result = true;
+
+                snprintf(api, (size_t) api_size, "%s", cached_api);
+
+                snprintf(version, (size_t) version_size, "%s", cached_version);
+
+                return;
+            }
+        }
+    }
+
+    // 3) 查过了、两样都没有：明确不支持
+    if (searched) {
+
+        snprintf(cached_api, sizeof(cached_api), "%s", "NONE");
+
+        cached_has_result = true;
+    }
+
+    *has_result = cached_has_result;
+
+    snprintf(api, (size_t) api_size, "%s", cached_api);
+
+    snprintf(version, (size_t) version_size, "%s", cached_version);
+}
+
+/**
+ * 把显卡实例填进包。
+ *
+ * 每个实例发：name / gpu_usage / gpu_temp_c / dedicated_total_bytes /
+ * dedicated_used_bytes / gfx_api / gfx_api_version。
+ * 读不到的不发（页面按"不支持 / -"显示）。
+ */
+static int build_gpu_devices(TmOutDevice *out, int capacity,
+                             const TmDeviceRef *devices, int count)
+{
+    if (out == NULL || devices == NULL || capacity <= 0 || count <= 0) {
+        return 0;
+    }
+
+    int limit = count;
+
+    if (limit > capacity) {
+        limit = capacity;
+    }
+
+    bool has_api = false;
+
+    char api_name[16] = {0};
+
+    char api_version[24] = {0};
+
+    gpu_detect_gfx_api(&has_api, api_name, (int) sizeof(api_name),
+                       api_version, (int) sizeof(api_version));
+
+    for (int i = 0; i < limit; i++) {
+
+        device_begin(&out[i], devices[i].id, TM_DEV_TYPE_GPU);
+
+        device_put(&out[i], "name", devices[i].name);
+
+        const char *base = devices[i].path;
+
+        char path[256];
+
+        long long usage = 0;
+
+        bool has_usage = false;
+
+        // Adreno 的占用率文件
+        snprintf(path, sizeof(path), "%s/gpu_busy_percentage", base);
+
+        if (gpu_read_percent(path, &usage)) {
+            has_usage = true;
+        }
+
+        // DRM 驱动（amdgpu / i915）的占用率文件
+        if (!has_usage) {
+
+            snprintf(path, sizeof(path), "%s/device/gpu_busy_percent", base);
+
+            if (gpu_read_percent(path, &usage)) {
+                has_usage = true;
+            }
+        }
+
+        if (has_usage) {
+            device_put_int(&out[i], "gpu_usage", usage, TM_FIELD_STATUS_NOT_AVAILABLE);
+        }
+
+        long long celsius = 0;
+
+        if (gpu_read_temperature(base, &celsius)) {
+            device_put_int(&out[i], "gpu_temp_c", celsius, TM_FIELD_STATUS_NOT_AVAILABLE);
+        }
+
+        long long dedicated_total = 0;
+
+        snprintf(path, sizeof(path), "%s/device/mem_info_vram_total", base);
+
+        if (gpu_read_first_int(path, &dedicated_total) && dedicated_total >= 0) {
+            device_put_int(&out[i], "dedicated_total_bytes", dedicated_total, TM_FIELD_STATUS_NOT_AVAILABLE);
+        }
+
+        long long dedicated_used = 0;
+
+        snprintf(path, sizeof(path), "%s/device/mem_info_vram_used", base);
+
+        if (gpu_read_first_int(path, &dedicated_used) && dedicated_used >= 0) {
+            device_put_int(&out[i], "dedicated_used_bytes", dedicated_used, TM_FIELD_STATUS_NOT_AVAILABLE);
+        }
+
+        char location[64];
+
+        gpu_pci_location(base, location, (int) sizeof(location));
+
+        if (location[0] != '\0') {
+            device_put(&out[i], "location", location);
+        }
+
+        if (has_api && api_name[0] != '\0') {
+
+            device_put(&out[i], "gfx_api", api_name);
+
+            if (api_version[0] != '\0') {
+                device_put(&out[i], "gfx_api_version", api_version);
+            }
+        }
+    }
+
+    return limit;
+}
+
  /**
   * 处理 typeCode=5：抓一次设备快照，按设备集合发出。
   *
@@ -5737,9 +8629,11 @@ static void emit_device_block(const TmOutDevice *device)
   * 包内容（有实例才发，没有的类型一条 D 行都不发）：
   *   CPU     : 永远一块，把所有物理处理器合并；含利用率 / 频率 / 拓扑 / 缓存 / 逐核利用率
   *   MEMORY  : 一台，含 /proc/meminfo 的统计项、zram 压缩量、Device Tree 里的规格
-  *   DISK    : 每块磁盘一块，这一版只有块名
-  *   NETWORK : 每个网卡一块，这一版只有接口名
-  *   GPU     : 每个图形设备一块，这一版只有节点名
+  *   DISK    : 每块物理盘一块，含型号 / 介质 / 总线 / 容量 / 已格式化 /
+ *             系统盘 / 页面文件 / 活动时间 / 平均响应 / 读写速率
+  *   NETWORK : 每个接口一块（虚拟接口也报），带角色 / 型号 / SSID / 连接类型 /
+  *             地址 / 信号强度 / 收发速率；要显示哪一类由客户端决定
+  *   GPU     : 每个图形设备一块，带利用率 / 温度 / 专用显存 / 图形 API 版本
   *   SYSTEM  : 进程 / 线程 / 句柄 / 开机时长
   *
   * 附加参数是本帧的设备模型上下文（见 apply_device_context）：请求即权威，
@@ -5780,21 +8674,20 @@ static bool handle_device_snapshot(unsigned long long seq, int type,
     device_count += build_system_device(devices + device_count,
                                         TM_OUT_DEVICE_MAX - device_count);
 
-    // 磁盘 / 网卡 / GPU：这一版只报名称
-    device_count += build_named_devices(devices + device_count,
-                                        TM_OUT_DEVICE_MAX - device_count,
-                                        registry.disk, registry.disk_count,
-                                        TM_DEV_TYPE_DISK);
+    // 磁盘：每块物理盘一块，带型号 / 介质 / 总线 / 容量 / 已格式化 / 系统盘 /
+    // 页面文件 / 活动时间 / 平均响应 / 读写速率（详见 build_disk_devices 上方的说明）
+    device_count += build_disk_devices(devices + device_count,
+                                       TM_OUT_DEVICE_MAX - device_count,
+                                       registry.disk, registry.disk_count);
 
-    device_count += build_named_devices(devices + device_count,
-                                        TM_OUT_DEVICE_MAX - device_count,
-                                        registry.network, registry.network_count,
-                                        TM_DEV_TYPE_NETWORK);
+    device_count += build_network_devices(devices + device_count,
+                                          TM_OUT_DEVICE_MAX - device_count,
+                                          registry.network, registry.network_count);
 
-    device_count += build_named_devices(devices + device_count,
-                                        TM_OUT_DEVICE_MAX - device_count,
-                                        registry.gpu, registry.gpu_count,
-                                        TM_DEV_TYPE_GPU);
+    // 显卡：每张卡一块，带利用率 / 温度 / 专用显存 / 图形 API 版本
+    device_count += build_gpu_devices(devices + device_count,
+                                      TM_OUT_DEVICE_MAX - device_count,
+                                      registry.gpu, registry.gpu_count);
 
     // 包头要先知道后面有几行：D 头算一行，每个字段算一行
     int line_count = 0;
@@ -6195,6 +9088,11 @@ int main(int argc, char *argv[])
     // 父进程先关掉管道、本进程还在往 stdout 写，默认会收到 SIGPIPE 直接死掉；
     // 忽略它，这样写失败只让 printf / fflush 返回错误，循环还能按 EOF 正常收尾。
     signal(SIGPIPE, SIG_IGN);
+
+    // 磁盘四项指标的常驻采样线程：250 ms 一拍、最近 1 秒窗口结算，
+    // 快照请求只查表。放在 READY 之前起，第一屏就有一拍可用；
+    // 起不来（极少见）会自动退回"请求现算"，功能不丢。
+    disk_sampler_start();
 
     // 页大小与时钟节拍：整个进程只取一次，采集时每进程都省一次 sysconf
     long page_size = sysconf(_SC_PAGESIZE);

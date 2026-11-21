@@ -98,6 +98,8 @@ import com.android.taskmanager.data.LinuxRequestType
 import com.android.taskmanager.data.PerformanceSnapshot
 import com.android.taskmanager.data.ProcessScope
 
+import com.android.taskmanager.manager.PageManagers
+
 class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, IOverlayApi,
     IUserCredentialApi, ILinuxDataApi, IPageSearchApi {
 
@@ -132,15 +134,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         /** 性能页的页名（与 MainActivity.navigationTitle 同一套文案）。 */
         private const val PAGE_PERFORMANCE = "性能"
 
-        /**
-         * CPU 历史点的容量上限。
-         *
-         * 最长窗口 = 低（240 秒）、最短采样间隔 = 高（0.5 秒），480 点已经够铺满整个窗口；
-         * 取 512 是为了留一点余量，不至于因为某次调度抖动多出两三个点就把最早的点挤掉。
-         */
-        private const val CPU_HISTORY_MAX_POINTS = 512
-
-        /**
+                /**
          * 详细信息页的出厂可见列。
          *
          * 只给 8 列而不是 43 列全开：页面一打开就要能读懂（名称 / 包名 / PID / 状态 /
@@ -344,6 +338,10 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         // 3.6 用户凭据：把真实授权状态推一次给界面（设置页"用户凭据"分组的按钮据此显示）
         //     之后每次 credentialSnapshot() 调用都会再推，服务侧一发现授权变化，界面自然跟着变。
         credentialSnapshot()
+
+        // 3.7 页面管理器接上本服务的快照发布口：从这一刻起，每采一帧就有人接着。
+        //     管理器是进程级的（横竖屏、浮窗、切页都不会丢历史），服务重建只重接订阅。
+        PageManagers.attach(this)
     }
 
     override fun onStartCommand(
@@ -400,6 +398,10 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         // 列布局的排队写入先让它落完（都是几十字节，不会等太久）
         runCatching { detailViewSaveExecutor.shutdown() }
+
+        // 页面管理器摘订阅：只断开与本服务的关系，历史 / 页面状态留在管理器里，
+        // 服务重建后重新接上继续攒（同一进程内不丢）。
+        PageManagers.detach(this)
 
         settingsLoaded = false
         instance = null
@@ -967,64 +969,49 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     //        —— 处理器商品名与虚拟化方案由 ELF 侧后续补实现，这里只负责把值透出去
     //   对外：IPageDataApi.performanceSnapshot() / performanceChartWindowLabel()
     //         / refreshPerformanceNow()
-    //   状态：CPU 与内存两组已接真实数据（内存曲线另有一份独立的历史队列）；
-    //        磁盘 / WLAN / GPU 的页面入口与占位数据已删除，重新设计时再接。
+    //   状态：CPU 与内存两组已接真实数据；页面私有的历史 / 图表偏好在
+    //        manager/PerformanceManager.kt 里，本服务只负责采集与发布。
     //
-    //   两个"谁负责"的结论（页面不要抢）：
+    //   三个"谁负责"的结论（都不要再抢）：
     //   1) 采集节奏：本服务的定时器（间隔 = 设置页的实时更新速度），页面不自己计时；
-    //   2) 图表窗口文案：本服务按实时更新速度换算（高 30 / 常规 60 / 低 240 / 已暂停），
-    //      页面只在切进来时取一次。
+    //   2) 历史与图表状态：性能页管理器（PerformanceManager），本服务不存页面数据；
+    //   3) 发布方式：每帧调用订阅者（[addPerformanceFrameListener]），
+    //      本服务不知道任何关于"图表怎么画"的事。
 
     /**
-     * 性能页最近一帧。
+     * 性能帧订阅者。
      *
-     * 用 Compose 的 mutableState 装：页面在 composition 里读它，写一次就会重组一次，
-     * 页面因此不需要自己轮询、也不需要自己拼刷新间隔。
+     * 采集线程每采到一帧就按序通知一次；订阅者自己决定怎么存（现在只有一个：
+     * 性能页管理器，它把点追加进自己的历史队列）。
+     *
+     * 用 CopyOnWriteArrayList：订阅几乎只发生在创建 / 销毁这种低频时刻，
+     * 而通知每 0.5 秒一次、可能同时有多个线程读 —— 写时复制正好把这两件事分开。
      */
-    private val performanceSnapshotState =
-        androidx.compose.runtime.mutableStateOf(PerformanceSnapshot.EMPTY)
+    private val performanceFrameListeners =
+        java.util.concurrent.CopyOnWriteArrayList<(PerformanceSnapshot, Long) -> Unit>()
 
-    /**
-     * 最近一次采到的帧（不管性能页看不看得见都留着）。
-     *
-     * 切回性能页时先把它推上去，用户不用空等下一拍；不可见期间也不写 state，
-     * 免得后台每秒都让一个没人在看的页面重组一次。
-     */
-    @Volatile
-    private var performanceLastSnapshot: PerformanceSnapshot? = null
+    /** 订阅性能帧（管理器在 attach 时调用；同一引用重复订阅只会被记一次）。 */
+    fun addPerformanceFrameListener(listener: (PerformanceSnapshot, Long) -> Unit) {
 
-    /**
-     * CPU 利用率的历史点，大图表与左列迷你图**共用这一份**。
-     *
-     * 容量按"最长窗口"算：低 = 240 秒，最短采样间隔 = 高 0.5 秒，
-     * 240 / 0.5 = 480 点，取 512 留余量。超过就丢最老的（环形）。
-     *
-     * 只在采集线程（ui-linux-poll）写；页面只读 [performanceHistoryState]，
-     * 所以这个队列不上锁也不会被并发改。
-     */
-    private val cpuUsageHistory = kotlin.collections.ArrayDeque<CpuUsagePoint>()
+        if (!performanceFrameListeners.contains(listener)) {
+            performanceFrameListeners.add(listener)
+        }
+    }
 
-    /**
-     * 内存使用量的历史队列，规则与 [cpuUsageHistory] 完全一致（同一套点数上限、
-     * 同一个采样时刻、同一份"首点垫 0"的规矩）。
-     *
-     * 为什么另开一份：曲线的纵轴不同（CPU 是利用率，内存是占总量的百分比），
-     * 更重要的是某一帧 CPU 有值而内存没值时，只该让对应那条曲线断开，
-     * 不能把另一条也带断。percent 存的是 0..100，没有值的帧直接不入队。
-     */
-    private val memoryUsageHistory = kotlin.collections.ArrayDeque<CpuUsagePoint>()
+    /** 退订。服务销毁时由管理器调用（数据留在管理器里，不丢）。 */
+    fun removePerformanceFrameListener(listener: (PerformanceSnapshot, Long) -> Unit) {
+        performanceFrameListeners.remove(listener)
+    }
 
-    /**
-     * 推给页面的那一份（已按当前窗口裁剪）。
-     *
-     * 用 state 而不是让页面自己去读队列：写一次才重组一次，
-     * 和 [performanceSnapshotState] 同拍，两个图的横轴始终对齐。
-     */
-    private val performanceHistoryState =
-        androidx.compose.runtime.mutableStateOf<List<CpuUsagePoint>>(emptyList())
+    /** 把一帧交给所有订阅者。异常不外抛：某个订阅者算错不该打断采集节拍。 */
+    private fun notifyPerformanceFrame(snapshot: PerformanceSnapshot, atMs: Long) {
 
-    private val performanceMemoryHistoryState =
-        androidx.compose.runtime.mutableStateOf<List<CpuUsagePoint>>(emptyList())
+        performanceFrameListeners.forEach { listener ->
+
+            runCatching { listener(snapshot, atMs) }
+                .onFailure { Log.w(TAG, "性能帧订阅者处理失败：${it.message}") }
+        }
+    }
 
     // ── 页面数据区 · 应用历史记录（ApphistoryScreen）──────────────
     //   用途：按时间线展示应用的资源使用历史
@@ -1563,15 +1550,10 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             linuxDemands.remove(PAGE_DETAIL)
         }
 
-        // 切到性能页：先把后台已经采到的那一帧推上去，别让用户对着一屏破折号等下一拍。
-        // 这里 force = true：切页上报与 Activity 的前台状态未必同一时刻到位。
+        // 切到性能页：名称缓存只在这一下清（用户刚看这一页，名字值得重探一次）；
+        // 当前帧在性能页管理器里一直留着，切回来直接就有，不必这里再推一次。
         if (next == PAGE_PERFORMANCE) {
-
-            // 名称缓存只在这一下清：用户刚看这一页，名字值得重探一次；
-            // 其余字段不额外触发刷新，仍按"实时更新速度"的节拍走。
             LinuxService.instanceOrNull()?.requestCpuNameRefreshOnce()
-
-            performanceLastSnapshot?.let { pushPerformanceSnapshot(it, force = true) }
         }
 
         reschedulePolling()
@@ -1802,18 +1784,14 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         // 不会显示成"AVF 支持：否"。
         val merged = mergeAndroidSystem(snapshot)
 
-        // 采样时刻在这里取：ELF 那边只回"当前值"，时间轴由本服务自己的点来排，
+        // 采样时刻在这里取：ELF 那边只回"当前值"，时间轴由本服务统一排，
         // 不依赖跨进程的时钟，也不受一次往返耗时的抖动影响。
+        // CPU 与内存两条曲线拿到的是同一个时刻，横轴天然对齐。
         val sampleAt = SystemClock.elapsedRealtime()
 
-        appendCpuUsagePoint(merged, sampleAt)
-
-        // 内存曲线与 CPU 曲线共用同一个采样时刻：两条图同拍，横轴才对得上
-        appendMemoryUsagePoint(merged, sampleAt)
-
-        performanceLastSnapshot = merged
-
-        pushPerformanceSnapshot(merged, force = force)
+        // 交给订阅者（性能页管理器）：入历史、写页面状态都是页面私有的事，
+        // 本服务到此为止，不再持有任何"图表要画什么"的数据。
+        notifyPerformanceFrame(merged, sampleAt)
     }
 
     /**
@@ -1836,150 +1814,6 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     }
 
     /**
-     * 往历史队列里追加一个点。
-     *
-     * 利用率拿不到（第一帧的 NO_BASELINE、或读数失败）就不入队：
-     * 断点插一个 0 会在曲线上画出一道根本不存在的陡降。
-     */
-    private fun appendCpuUsagePoint(snapshot: PerformanceSnapshot, atMs: Long) {
-
-        val percent = snapshot.cpuUsagePercent ?: return
-
-        // 队列为空 = 一段历史刚刚开始（服务刚起、进程被回收后重建）。
-        // 先垫一个利用率 0 的起点，真实数据从第二个点开始：曲线的第一笔永远从底边起步，
-        // 不会直接从中段（比如 30%）拉出来。绘制层一行都不用改，大小图 / 内核色带 /
-        // 逐核网格读的都是这份历史，自然一起跟着变。
-        // 攒满 60 点之后种子点会被挤出窗口，留下的全是真实历史。
-        if (cpuUsageHistory.isEmpty()) {
-            appendHistorySeedPoint(snapshot, atMs)
-        }
-
-        // 内核时间与逐核两列跟着同一个点一起入队：图上的内核区域必须和总曲线
-        // 来自同一帧，分开存会出现"总利用率是这一秒、内核时间是下一秒"的错位。
-        cpuUsageHistory.addLast(
-            CpuUsagePoint(
-                timeMs = atMs,
-                percent = percent,
-                kernelPercent = snapshot.cpuKernelPercent,
-                corePercents = snapshot.logicalUsage,
-                coreKernels = snapshot.logicalKernel
-            )
-        )
-
-        while (cpuUsageHistory.size > CPU_HISTORY_MAX_POINTS) {
-            cpuUsageHistory.removeFirst()
-        }
-    }
-
-    /**
-     * 往历史里垫一个"图表起点"：利用率 0 的假点。
-     *
-     * 三条要求，少一条曲线就会自相矛盾：
-     * 1) 总利用率是 0 —— 这是这个点存在的唯一目的；
-     * 2) 内核时间：首帧报得上就垫 0，报不上就保持 null（绘制层按"这一槽没值"处理，
-     *    不会伪造一条内核色带）；
-     * 3) 逐核数组照首帧的核数铺同样多的 0 —— 逻辑处理器网格的列数从第一屏就是对的，
-     *    不会因为种子点少一核而重排网格。
-     *
-     * 以后内存 / 磁盘 / 网络 / GPU 各自的曲线接入时，用同样的规则给它们自己的队列垫起点。
-     */
-    private fun appendHistorySeedPoint(snapshot: PerformanceSnapshot, atMs: Long) {
-
-        cpuUsageHistory.addLast(
-            CpuUsagePoint(
-                timeMs = atMs,
-                percent = 0f,
-                kernelPercent = snapshot.cpuKernelPercent?.let { 0f },
-                corePercents = snapshot.logicalUsage.map { 0f },
-                coreKernels = snapshot.logicalKernel.map { 0f }
-            )
-        )
-    }
-
-    /**
-     * 交给界面的历史点：**不按时间裁**，整段缓存直接给出去。
-     *
-     * 为什么不裁：一屏画多少个点由界面定死（以常规速度为准的那个点数），
-     * 三个更新档位共用同一份缓存。要是这里按当前档位的秒数裁，
-     * 从高档切到低档就会瞬间把大半历史点裁掉 —— 那正好就是"换了一张图、数据被清了"。
-     * 更新速度只决定新点多久进来一个，不决定能留多少。
-     *
-     * 只受缓存上限（CPU_HISTORY_MAX_POINTS）约束，超了从最老的开始丢。
-     */
-    private fun trimmedCpuHistory(): List<CpuUsagePoint> = cpuUsageHistory.toList()
-
-    /**
-     * 往内存历史队列追加一个点。
-     *
-     * 纵轴是"占总量的百分比"，分母用 totalBytes（图表顶端那条线的含义），
-     * 与右侧统计区、图上方那行小字用的是同一套量。used 或 total 任一缺失就不入队：
-     * 内存数据是后接上的，首帧可能还没有总量，插一个 0 会在曲线上留一道假谷。
-     *
-     * 队列为空时同样先垫一个 0 起点，规矩与 CPU 那条一模一样。
-     */
-    private fun appendMemoryUsagePoint(snapshot: PerformanceSnapshot, atMs: Long) {
-
-        val memory = snapshot.memory ?: return
-
-        val total = memory.totalBytes ?: return
-
-        val used = memory.usedBytes ?: return
-
-        if (total <= 0L || used < 0L) return
-
-        val percent = (used.toDouble() / total.toDouble() * 100.0)
-            .toFloat()
-            .coerceIn(0f, 100f)
-
-        if (memoryUsageHistory.isEmpty()) {
-
-            memoryUsageHistory.addLast(
-                CpuUsagePoint(timeMs = atMs, percent = 0f)
-            )
-        }
-
-        memoryUsageHistory.addLast(
-            CpuUsagePoint(timeMs = atMs, percent = percent)
-        )
-
-        while (memoryUsageHistory.size > CPU_HISTORY_MAX_POINTS) {
-            memoryUsageHistory.removeFirst()
-        }
-    }
-
-    /**
-     * 交给界面的内存历史点：与 CPU 那份同一个规矩 —— 整段缓存直接给出去，不按时间裁。
-     * 三个更新档位共用同一份缓存，换档只影响新点进来的快慢。
-     */
-    private fun trimmedMemoryHistory(): List<CpuUsagePoint> = memoryUsageHistory.toList()
-
-    /**
-     * 把一帧推到界面。
-     *
-     * @param force true = 不看可见性直接写（用在"用户刚切进性能页"这一下）：
-     *              切页上报与 Activity 的前台回调谁先到不确定，这时候等可见性成立
-     *              会让用户先看到一屏空数据。
-     */
-    private fun pushPerformanceSnapshot(snapshot: PerformanceSnapshot, force: Boolean = false) {
-
-        if (!force && !isPerformancePageVisible()) return
-
-        // 时间戳每次都要换：同一个时间戳的两帧在 Compose 眼里是同一个值，不会重组
-        performanceSnapshotState.value =
-            snapshot.copy(receivedAtMs = SystemClock.elapsedRealtime())
-
-        // 历史点与当前值同一拍推：两个图共用这一份，横轴不会错位
-        performanceHistoryState.value = trimmedCpuHistory()
-
-        // 内存那一份同期推出去，否则内存曲线会停在"进入页面那一帧"
-        performanceMemoryHistoryState.value = trimmedMemoryHistory()
-    }
-
-    /** 性能页现在是否看得见：主界面在前台并选中它，或浮窗正停在它上面。 */
-    private fun isPerformancePageVisible(): Boolean =
-        isUiRefreshAllowed() && effectiveActivePage() == PAGE_PERFORMANCE
-
-    /**
      * 实时更新速度 -> 图表标签行文案。
      *
      *   高 30 秒内的利用率 % / 常规 60 秒内的利用率 % / 低 4 分钟内的利用率 %
@@ -1999,15 +1833,16 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         else -> "60 秒内的利用率 %"
     }
 
-    override fun performanceSnapshot(): PerformanceSnapshot = performanceSnapshotState.value
-
-    override fun performanceCpuHistory(): List<CpuUsagePoint> = performanceHistoryState.value
-
-    override fun performanceMemoryHistory(): List<CpuUsagePoint> =
-        performanceMemoryHistoryState.value
-
     override fun performanceChartWindowLabel(): String =
         performanceChartWindowLabel(settingsSnapshot.updateSpeed)
+
+    /**
+     * 当前更新速度对应的采集间隔（毫秒）；0 = 已暂停。
+     *
+     * 给性能页判断"这一帧是不是刚采过"用：进页面（含双击进预览重建子树）时本来会补采
+     * 一帧，但如果距上一帧还不足一个间隔，这一帧会和上一帧几乎同时刻，看上去像加速了一拍。
+     */
+    internal fun performancePollIntervalMs(): Long = pollIntervalMs(settingsSnapshot.updateSpeed)
 
     override fun refreshPerformanceNow(): Boolean {
 

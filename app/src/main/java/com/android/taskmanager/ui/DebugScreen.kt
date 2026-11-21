@@ -69,9 +69,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
+import com.android.taskmanager.manager.PageManagers
 import com.android.taskmanager.service.UIService
 
 import kotlinx.coroutines.Dispatchers
@@ -662,27 +665,125 @@ fun DebugScreen() {
         }
 
         Spacer(
+            modifier = Modifier.height(16.dp)
+        )
+
+        // ====================================================
+        // 性能页的测试设备
+        //
+        // 为什么放在调试页：磁盘 / WLAN 这类多实例入口只有"快照里真的出现了设备"才画，
+        // 手上没有第二块网卡、第二台磁盘时就没法验版式与选中逻辑。
+        // 这里的按钮往性能页管理器注入一个**没有数据的空设备实例**
+        // （字段全是默认值：容量读不到、速率 0、明细"不支持"），
+        // 入口、详情、图表都走真实渲染路径，等于把多设备场景凭空造出来。
+        //
+        // 只在展示层注入，不动底层采集：真实采样到达时空设备依然在，
+        // 因为数量记在管理器里，每帧合并一次。
+        // ====================================================
+
+        Text(
+            text = "性能页：测试设备",
+
+            style = MaterialTheme.typography.titleSmall,
+
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(
+            modifier = Modifier.height(4.dp)
+        )
+
+        Text(
+            text = "往性能页注入没有数据的空设备实例：每按一次多一台，性能页立刻出现对应入口" +
+                "（空磁盘进「磁盘 N」、空网卡进「WLAN」）。不影响底层真实采集。",
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(
             modifier = Modifier.height(8.dp)
         )
 
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
+        // 注入数量：管理器里记着，这里只是按钮按下后显示一份，免得还要等一次重组
+        var debugDeviceState by remember {
+            mutableStateOf(PageManagers.performance(context).debugDeviceText())
+        }
 
-            color = MaterialTheme.colorScheme.surfaceVariant,
-
-            shape = MaterialTheme.shapes.medium
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
 
-            Text(
-                text = packetOutput,
+            OutlinedButton(
+                onClick = {
 
-                modifier = Modifier.padding(12.dp),
+                    val manager = PageManagers.performance(context)
 
-                style = MaterialTheme.typography.bodySmall,
+                    manager.addDebugEmptyNetwork()
 
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+                    debugDeviceState = manager.debugDeviceText()
+                }
+            ) {
+                Text("添加空网卡")
+            }
+
+            OutlinedButton(
+                onClick = {
+
+                    val manager = PageManagers.performance(context)
+
+                    manager.addDebugEmptyDisk()
+
+                    debugDeviceState = manager.debugDeviceText()
+                }
+            ) {
+                Text("添加空磁盘")
+            }
+
+            OutlinedButton(
+                onClick = {
+
+                    val manager = PageManagers.performance(context)
+
+                    manager.addDebugEmptyGpu()
+
+                    debugDeviceState = manager.debugDeviceText()
+                }
+            ) {
+                Text("添加空 GPU")
+            }
+
+            TextButton(
+                onClick = {
+
+                    val manager = PageManagers.performance(context)
+
+                    manager.clearDebugDevices()
+
+                    debugDeviceState = manager.debugDeviceText()
+                }
+            ) {
+                Text("清除测试设备")
+            }
         }
+
+        Spacer(
+            modifier = Modifier.height(6.dp)
+        )
+
+        Text(
+            text = "当前注入：$debugDeviceState",
+
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(
+            modifier = Modifier.height(16.dp)
+        )
+
+        DebugOutputBox(text = packetOutput)
 
         Spacer(
             modifier = Modifier.height(16.dp)
@@ -803,23 +904,8 @@ fun DebugScreen() {
             modifier = Modifier.height(8.dp)
         )
 
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-
-            color = MaterialTheme.colorScheme.surfaceVariant,
-
-            shape = MaterialTheme.shapes.medium
-        ) {
-            Text(
-                text = deviceOutput,
-
-                modifier = Modifier.padding(12.dp),
-
-                style = MaterialTheme.typography.bodySmall,
-
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
+        // 设备快照字段多（每台盘十来个键、整包几十行），给足可视高度
+        DebugOutputBox(text = deviceOutput)
 
         Spacer(
             modifier = Modifier.height(16.dp)
@@ -1079,6 +1165,53 @@ fun DebugScreen() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+        }
+    }
+}
+
+
+/**
+ * 调试页的输出框：给足可视高度，内容超出就在**框内**滚动，等宽小字。
+ *
+ * 为什么不再用"自动撑高"的 Surface：设备快照一包几十行，框跟着内容长，
+ * 整页就被顶得很长，想看后半段得来回拖整页；现在框固定 360–560dp，
+ * 超过的部分在框里滚，页面本身仍然可滚（两段滚动互不冲突）。
+ * 等宽字体是为了让 "key=value" 的列对齐，11sp / 15sp 比 bodySmall 更紧凑，
+ * 一屏能多看十来行。
+ */
+@Composable
+private fun DebugOutputBox(text: String, modifier: Modifier = Modifier) {
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+
+        color = MaterialTheme.colorScheme.surfaceVariant,
+
+        shape = MaterialTheme.shapes.medium
+    ) {
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 360.dp, max = 560.dp)
+        ) {
+
+            Text(
+                text = text,
+
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(12.dp),
+
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                ),
+
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
