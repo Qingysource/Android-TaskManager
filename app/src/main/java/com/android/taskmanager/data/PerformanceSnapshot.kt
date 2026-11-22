@@ -81,11 +81,23 @@ data class PerformanceSnapshot(
     /** 一级缓存总量（KB）。 */
     val l1CacheKb: Int? = null,
 
+    /**
+     * L1 没读到时的原因：`ACCESS_DENIED`（有这一级但读不出来，页面写「-」）
+     * 或 `NOT_AVAILABLE` / `UNSUPPORTED`（这一级确实不存在，页面写「不支持」）。
+     */
+    val l1CacheStatus: String? = null,
+
     /** 二级缓存总量（KB）。 */
     val l2CacheKb: Int? = null,
 
-    /** 三级缓存总量（KB）；null = 这台机器没有 L3。 */
+    /** L2 的状态，含义同 [l1CacheStatus]。 */
+    val l2CacheStatus: String? = null,
+
+    /** 三级缓存总量（KB）；null = 这一级没读到，原因看 [l3CacheStatus]。 */
     val l3CacheKb: Int? = null,
+
+    /** L3 的状态，含义同 [l1CacheStatus]。 */
+    val l3CacheStatus: String? = null,
 
     /**
      * 是不是虚拟机客人（本程序自己就跑在虚拟机里）。
@@ -194,13 +206,36 @@ data class PerformanceSnapshot(
     fun cpuBaseText(): String = speedText(cpuBaseMhz)
 
     /** 一级缓存按 KB 显示。 */
-    fun l1Text(): String = l1CacheKb?.let { "$it KB" } ?: "—"
+    fun l1Text(): String = cacheText(l1CacheKb, l1CacheStatus) { "$it KB" }
 
     /** 二级缓存按 MB 显示（一位小数）。 */
-    fun l2Text(): String = l2CacheKb?.let { megabyteText(it) } ?: "—"
+    fun l2Text(): String = cacheText(l2CacheKb, l2CacheStatus) { megabyteText(it) }
 
-    /** 三级缓存：没有这一级就说"不支持"，不要说 0 MB。 */
-    fun l3Text(): String = l3CacheKb?.let { megabyteText(it) } ?: "不支持"
+    /** 三级缓存按 MB 显示（一位小数）。 */
+    fun l3Text(): String = cacheText(l3CacheKb, l3CacheStatus) { megabyteText(it) }
+
+    /**
+     * 三级缓存共用一套文案，按后端给的状态决定，而不是按级别写死。
+     *
+     *   有值                        -> 正常格式化（0 也是值，不当作没有）
+     *   NOT_AVAILABLE / UNSUPPORTED -> 「不支持」（这一级确实不存在 / 平台不导出缓存信息）
+     *   ACCESS_DENIED 及其它        -> 「-」（有这一格、这次没读出来，换个身份可能就读得到）
+     *
+     * 为什么不再按级别写死：之前是 L1/L2 恒写「—」、L3 恒写「不支持」，
+     * 于是「L1 没权限」和「L1 真的不存在」在页面上长得一模一样，
+     * 而 L3 明明是没权限也照样写「不支持」——把两种原因混成了一种。
+     */
+    private fun cacheText(kb: Int?, status: String?, format: (Int) -> String): String {
+
+        if (kb != null) return format(kb)
+
+        return when (status) {
+
+            FIELD_STATUS_NOT_AVAILABLE, FIELD_STATUS_UNSUPPORTED -> CACHE_UNSUPPORTED_TEXT
+
+            else -> CACHE_UNKNOWN_TEXT
+        }
+    }
 
     /**
      * 虚拟化：后端给什么就显示什么（"不支持 / 已禁用 / 已启用(KVM)" 整串直出）。
@@ -334,9 +369,16 @@ data class PerformanceSnapshot(
 
                 l1CacheKb = cpuFields.intOf("l1_cache_kb"),
 
+                // 没读到时的原因：读不了（没权限）还是根本没有这一级，页面按它分「-」和「不支持」
+                l1CacheStatus = cpuFields.statusOf("l1_cache_kb"),
+
                 l2CacheKb = cpuFields.intOf("l2_cache_kb"),
 
+                l2CacheStatus = cpuFields.statusOf("l2_cache_kb"),
+
                 l3CacheKb = cpuFields.intOf("l3_cache_kb"),
+
+                l3CacheStatus = cpuFields.statusOf("l3_cache_kb"),
 
                 // 内存整块来自 MEMORY 设备；这一版没有该设备（老后端）就留空，页面显示破折号
                 memory = packet.deviceOf(LinuxProtocol.DEVICE_TYPE_MEMORY)?.fields
@@ -365,7 +407,7 @@ data class PerformanceSnapshot(
          * 0 只代表"确实是 0"，不会被拿来冒充没读到。
          *
          * 键名与 C 侧 build_disk_devices 一一对应：
-         *   name / media / bus / capacity_bytes / formatted_bytes /
+         *   name / node / wwid / media / bus / capacity_bytes / formatted_bytes /
          *   system_disk / page_file / activity_percent / avg_response_ms /
          *   read_bytes_per_sec / write_bytes_per_sec
          *
@@ -383,6 +425,9 @@ data class PerformanceSnapshot(
                 name = fields.textValueOf("name"),
 
                 node = fields.textValueOf("node"),
+
+                // 硬件标识（wwid / 序列号）：只做身份，不显示；没发或者是 !状态 时是 null
+                wwid = fields.textValueOf("wwid"),
 
                 mediaType = fields.textValueOf("media"),
 
@@ -467,6 +512,10 @@ data class PerformanceSnapshot(
 
                 // 内核节点名，详情页没名字时的兜底
                 node = device.fields.textValueOf("node"),
+
+                // 厂商标签（QUALCOMM / MEDIATEK / SAMSUNG / GOOGLE / ARM …）：
+                // 底层按它决定走哪套接口取字段，这里只留着便于排查
+                vendor = device.fields.textValueOf("vendor"),
 
                 utilizationPercent = device.fields.floatOf("gpu_usage"),
 
@@ -566,6 +615,8 @@ data class PerformanceSnapshot(
 
                 reservedBytes = fields.longOf("reserved_bytes"),
 
+                reservedStatus = fields.statusOf("reserved_bytes"),
+
                 usedPart = partOf(usedNetBytes),
 
                 modifiedPart = partOf(modifiedBytes),
@@ -588,6 +639,19 @@ data class PerformanceSnapshot(
 
         private fun Map<String, String>.floatOf(key: String): Float? =
             valueOf(key)?.toFloatOrNull()
+
+        /**
+         * `!STATUS` 里的状态文本（ACCESS_DENIED / UNSUPPORTED …）；这一项有值时返回 null。
+         *
+         * 和 [valueOf] 的分工：valueOf 只关心"有没有值"，这里关心"为什么没值" ——
+         * 没权限和根本不支持要显示成不同的东西。
+         */
+        private fun Map<String, String>.statusOf(key: String): String? {
+
+            val raw = this[key] ?: return null
+
+            return if (raw.startsWith("!")) raw.substring(1) else null
+        }
 
         private fun Map<String, String>.intOf(key: String): Int? = valueOf(key)?.toIntOrNull()
 
@@ -682,12 +746,34 @@ data class CpuUsagePoint(
  * @param usedSlots             已使用的插槽数（缺省按 1 算）
  * @param totalSlots            插槽总数（缺省按 1 算）
  * @param formFactor            外观规格（SODIMM / 板载 …）；底层给不出就是 null，页面写"其他"
- * @param reservedBytes         为硬件保留的内存
+ * @param reservedBytes         为硬件保留的内存（标称容量 - MemTotal，底层算好）
+ * @param reservedStatus        上面那个值读不到时的原因
  * @param usedPart              分条图四段的比例（0..1，不用自己凑成 1，显示时会归一）
  * @param modifiedPart
  * @param standbyPart
  * @param freePart
  */
+/** 内存页「不支持」的固定文案：底层明确说 Android 上没有这一项。 */
+internal const val MEMORY_UNSUPPORTED_TEXT = "不支持"
+
+/** 没权限时的占位：一个横线，意思是"也许有，只是这次没读到"。 */
+internal const val MEMORY_ACCESS_DENIED_TEXT = "-"
+
+/** 底层字段状态里的"没权限"标记，只有它要和不支持分开显示。 */
+internal const val FIELD_STATUS_ACCESS_DENIED = "ACCESS_DENIED"
+
+/** 后端说"这一格这次没给出来"（这台机器确实没有这一项）。 */
+internal const val FIELD_STATUS_NOT_AVAILABLE = "NOT_AVAILABLE"
+
+/** 后端说"平台不导出这项信息"。 */
+internal const val FIELD_STATUS_UNSUPPORTED = "UNSUPPORTED"
+
+/** 缓存读不到时的文案：这一级确实不存在 / 平台不导出。 */
+internal const val CACHE_UNSUPPORTED_TEXT = "不支持"
+
+/** 缓存有这一级但读不出来（多半是权限）：写「-」，表示"也许能拿到"。 */
+internal const val CACHE_UNKNOWN_TEXT = "-"
+
 data class MemorySnapshot(
     val totalBytes: Long? = null,
     val nominalBytes: Long? = null,
@@ -706,6 +792,10 @@ data class MemorySnapshot(
     val totalSlots: Int? = null,
     val formFactor: String? = null,
     val reservedBytes: Long? = null,
+
+    /** 为硬件保留的内存读不到时的原因（ACCESS_DENIED = 没权限，其它见底层状态表） */
+    val reservedStatus: String? = null,
+
     val usedPart: Float? = null,
     val modifiedPart: Float? = null,
     val standbyPart: Float? = null,
@@ -852,7 +942,18 @@ data class MemorySnapshot(
     /** 外观规格：底层给不出就写"其他"（比"未知"读起来像正常答案），这同样不是错误状态。 */
     fun formFactorText(): String = formFactor?.takeIf { it.isNotBlank() } ?: "其他"
 
-    fun reservedText(): String = memorySizeText(reservedBytes)
+    /**
+     * 为硬件保留的内存：有值写容量；没权限写一个横线（提示"也许能拿到"）；
+     * 其余失败（没有 ddr_size、数据矛盾、读失败）统一写"不支持"。
+     */
+    fun reservedText(): String = when {
+
+        reservedBytes != null -> memorySizeText(reservedBytes)
+
+        reservedStatus == FIELD_STATUS_ACCESS_DENIED -> MEMORY_ACCESS_DENIED_TEXT
+
+        else -> MEMORY_UNSUPPORTED_TEXT
+    }
 
     /**
      * 分条图四段的比例，按「使用中 → 已修改 → 备用 → 可用」的顺序。
@@ -901,8 +1002,8 @@ data class MemorySnapshot(
  * 不拿 0 冒充（0% 与 读不到 是两件事）。将来 Linux 侧接上后，只需按 id 填这张表，
  * 页面与管理器都不用改。
  *
- * @param id            底层给的设备 id（/sys/block 里的名字或序列号一类）：管理器用它做
- *                      缓存键与"磁盘 N"的稳定身份；拿不到就按报文顺序编号
+ * @param id            底层给的设备索引（disk0 / disk1）：只是本帧数据的查找键，
+ *                      跟着排序后的枚举位置走；认"是哪一块盘"要看 node（块名）
  * @param name          设备名（型号串），显示在页面右上角；未实现前保持 null -> 破折号
  * @param mediaType     介质类型：HDD / SSD / UFS（底层字段一）
  * @param busType       总线类型：SCSI / NVMe / USB（底层字段二），与介质合成"SSD (NVMe)"
@@ -921,6 +1022,14 @@ data class DiskSnapshot(
 
     /** 挂在的块设备名（sda / sdb / mmcblk0 / nvme0n1），只用于标题里的括号"磁盘 0 (sda)" */
     val node: String? = null,
+
+    /**
+     * 硬件标识（wwid / 序列号）：**认盘的最终依据**。
+     *
+     * 块名会被内核复用（拔掉 sdb 再插一块还叫 sdb），只有这一格能证明"还是原来那块盘"；
+     * 部分平台不提供（null），这时退回 node。
+     */
+    val wwid: String? = null,
     val mediaType: String? = null,
     val busType: String? = null,
     val capacityBytes: Long? = null,
@@ -1311,7 +1420,7 @@ internal fun networkRateText(bytesPerSec: Double?): String {
  *   3) 取不到     —— 写「-」（有这一格，这次没读出来）。
  *
  * 键名与 C 侧 build_gpu_devices 一一对应：
- *   name / node / gpu_usage / gpu_temp_c /
+ *   name / node / vendor / gpu_usage / gpu_temp_c /
  *   dedicated_total_bytes / dedicated_used_bytes /
  *   shared_total_bytes / shared_used_bytes /
  *   driver_version / driver_date / gfx_api / gfx_api_version /
@@ -1320,7 +1429,13 @@ internal fun networkRateText(bytesPerSec: Double?): String {
 data class GpuSnapshot(
     val id: String? = null,
     val name: String? = null,
+
+    /** 这张卡是从哪个 sysfs 节点发现的（/sys/class/kgsl/kgsl-3d0 这类），
+     *  名字抓不到时作为适配器名的兜底 */
     val node: String? = null,
+
+    /** 厂商标签（QUALCOMM / MEDIATEK / SAMSUNG / GOOGLE / ARM / IMAGINATION …）：说明这张卡是哪家的 */
+    val vendor: String? = null,
     val utilizationPercent: Float? = null,
     val temperatureC: Int? = null,
     val dedicatedTotalBytes: Long? = null,

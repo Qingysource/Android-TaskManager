@@ -54,6 +54,7 @@ import android.widget.Toast
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -69,10 +70,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 
 import com.android.taskmanager.manager.PageManagers
 import com.android.taskmanager.service.UIService
@@ -145,6 +144,22 @@ fun DebugScreen() {
      */
     var packetOutput by remember {
         mutableStateOf("尚未发起 v2 请求（协议见 data/LinuxService.kt ① 段）")
+    }
+
+    /**
+     * 输出框的"复制"：写系统剪贴板。
+     *
+     * 这里直接用 Android 的 ClipboardManager，不用 Compose 那套新版 Clipboard ——
+     * 后者只有挂起的 setClipEntry，还得自己包一层 ClipEntry，
+     * 而调试页要的只是"把一段文本塞进剪贴板"，系统 API 一行就够，也不会有弃用警告。
+     */
+    fun copyOutput(value: String) {
+
+        val manager = context.getSystemService(android.content.ClipboardManager::class.java)
+
+        manager?.setPrimaryClip(
+            android.content.ClipData.newPlainText("调试输出", value)
+        )
     }
 
     /**
@@ -694,8 +709,9 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "往性能页注入没有数据的空设备实例：每按一次多一台，性能页立刻出现对应入口" +
-                "（空磁盘进「磁盘 N」、空网卡进「WLAN」）。不影响底层真实采集。",
+            text = "往性能页注入没有数据的测试设备：每按一次多一台，性能页立刻出现对应入口" +
+                "（测试磁盘进「磁盘 N」、测试网卡进「WLAN」、测试 GPU 进「GPU N」）。" +
+                "不影响底层真实采集，清除按钮一次全清。",
             style = MaterialTheme.typography.bodySmall,
 
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -724,7 +740,7 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("添加空网卡")
+                Text("测试网卡")
             }
 
             OutlinedButton(
@@ -737,7 +753,7 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("添加空磁盘")
+                Text("测试磁盘")
             }
 
             OutlinedButton(
@@ -750,8 +766,15 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("添加空 GPU")
+                Text("测试 GPU")
             }
+
+        }
+
+        // 清除按钮单独一排：四个按钮并排时，窄屏 / 竖屏里最后那个会被挤出屏幕
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
 
             TextButton(
                 onClick = {
@@ -783,7 +806,44 @@ fun DebugScreen() {
             modifier = Modifier.height(16.dp)
         )
 
-        DebugOutputBox(text = packetOutput)
+        // 复制入口：把这一框的全文写进剪贴板（框内文字也能长按自己选段复制）
+        TextButton(
+            onClick = { copyOutput(packetOutput) },
+
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+        ) {
+            Text("复制输出")
+        }
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                // 只拉高可视区，字号仍是 bodySmall：框固定 320~480dp，
+                // 内容超出就在框内滚动，整页不用来回拖
+                .heightIn(min = 320.dp, max = 480.dp),
+
+            color = MaterialTheme.colorScheme.surfaceVariant,
+
+            shape = MaterialTheme.shapes.medium
+        ) {
+
+            // 长按可选中、复制框内的任意一段
+            SelectionContainer {
+
+                Text(
+                    text = packetOutput,
+
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(12.dp),
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
 
         Spacer(
             modifier = Modifier.height(16.dp)
@@ -904,8 +964,44 @@ fun DebugScreen() {
             modifier = Modifier.height(8.dp)
         )
 
-        // 设备快照字段多（每台盘十来个键、整包几十行），给足可视高度
-        DebugOutputBox(text = deviceOutput)
+        // 复制入口：把这一框的全文写进剪贴板（框内文字也能长按自己选段复制）
+        TextButton(
+            onClick = { copyOutput(deviceOutput) },
+
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+        ) {
+            Text("复制输出")
+        }
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                // 只拉高可视区，字号仍是 bodySmall：框固定 320~480dp，
+                // 内容超出就在框内滚动，整页不用来回拖
+                .heightIn(min = 320.dp, max = 480.dp),
+
+            color = MaterialTheme.colorScheme.surfaceVariant,
+
+            shape = MaterialTheme.shapes.medium
+        ) {
+
+            // 长按可选中、复制框内的任意一段
+            SelectionContainer {
+
+                Text(
+                    text = deviceOutput,
+
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(12.dp),
+
+                    style = MaterialTheme.typography.bodySmall,
+
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
 
         Spacer(
             modifier = Modifier.height(16.dp)
@@ -1165,53 +1261,6 @@ fun DebugScreen() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-        }
-    }
-}
-
-
-/**
- * 调试页的输出框：给足可视高度，内容超出就在**框内**滚动，等宽小字。
- *
- * 为什么不再用"自动撑高"的 Surface：设备快照一包几十行，框跟着内容长，
- * 整页就被顶得很长，想看后半段得来回拖整页；现在框固定 360–560dp，
- * 超过的部分在框里滚，页面本身仍然可滚（两段滚动互不冲突）。
- * 等宽字体是为了让 "key=value" 的列对齐，11sp / 15sp 比 bodySmall 更紧凑，
- * 一屏能多看十来行。
- */
-@Composable
-private fun DebugOutputBox(text: String, modifier: Modifier = Modifier) {
-
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-
-        color = MaterialTheme.colorScheme.surfaceVariant,
-
-        shape = MaterialTheme.shapes.medium
-    ) {
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 360.dp, max = 560.dp)
-        ) {
-
-            Text(
-                text = text,
-
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(12.dp),
-
-                style = MaterialTheme.typography.bodySmall.copy(
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    lineHeight = 15.sp
-                ),
-
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }

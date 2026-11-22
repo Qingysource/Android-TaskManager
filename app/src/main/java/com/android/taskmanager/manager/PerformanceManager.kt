@@ -318,6 +318,31 @@ class PerformanceManager internal constructor(appContext: Context) {
         return if (block == null) "磁盘 $index" else "磁盘 $index ($block)"
     }
 
+    /**
+     * 资源监视器（性能页右上角菜单的第二项）。
+     *
+     * Android 目前没有系统级的"资源监视器"，这一版只留接口：
+     * 菜单项点了什么也不做，也不弹窗。将来要接的时候把实现写进这里，
+     * 菜单与调用处都不用改。
+     */
+    fun openResourceMonitor() {
+        // 暂无实现：留空，等 Android 侧有可用的资源监视器再填
+    }
+
+    /**
+     * 性能页挂进来的「复制当前图表」实现。
+     *
+     * 菜单画在宿主的页名行（MainActivity），那一行拿不到页面内部的剪贴板逻辑，
+     * 也不该自己去拼文本：页面进组合时把自己的函数挂到这儿，宿主只发一次请求。
+     * 页面不在组合里时为空，这时点菜单什么也不会发生。
+     */
+    var copyChartHandler: (() -> Unit)? = null
+
+    /** 宿主请求「复制当前图表」：转交给性能页自己挂上来的实现。 */
+    fun requestCopyChart() {
+        copyChartHandler?.invoke()
+    }
+
     /** 这一帧里有几块网卡（0 = 连 WLAN 入口都不该出现）。 */
     fun networkCount(): Int = snapshot.networks.size
 
@@ -349,7 +374,7 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         val gpu = gpus.getOrNull(index) ?: return null
 
-        val key = gpu.id?.takeIf { it.isNotBlank() } ?: "index:$index"
+        val key = chartKeyOf(gpu.node, gpu.id, index)
 
         return gpuCharts[key]
     }
@@ -407,7 +432,7 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         val network = networks.getOrNull(index) ?: return null
 
-        val key = network.id?.takeIf { it.isNotBlank() } ?: "index:$index"
+        val key = chartKeyOf(network.iface, network.id, index)
 
         return networkCharts[key]
     }
@@ -546,6 +571,10 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         id = "debug-disk-$index",
 
+        // 默认名称统一写 NAME：调试设备本来就没有型号，写 NAME 与真实设备
+        // "抓不到名字时的兜底"是同一个值，页面上一眼能认出这是注入出来的
+        name = "NAME",
+
         activityPercent = 0f,
 
         avgResponseMs = 0.0,
@@ -565,13 +594,19 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         id = "debug-net-$index",
 
+        // 同空磁盘：默认名称 NAME
+        name = "NAME",
+
         role = ROLE_WIFI
     )
 
     /** 空显卡：只有 id，其余全 null（页面按「不支持 / -」渲染）。 */
     private fun emptyDebugGpu(index: Int): GpuSnapshot = GpuSnapshot(
 
-        id = "debug-gpu-$index"
+        id = "debug-gpu-$index",
+
+        // 同空磁盘 / 空网卡：默认名称 NAME（名字取不到时页面本来就写 NAME）
+        name = "NAME"
     )
 
     // ==================== 6. 内部：快照入队 ====================
@@ -704,6 +739,20 @@ class PerformanceManager internal constructor(appContext: Context) {
             val key = diskKeyOf(disk, index)
 
             val buffers = diskBuffers.getOrPut(key) { DiskBuffers() }
+
+            // 换盘检测：同一个位置上的硬件标识变了 = 这块盘被顶替了。
+            // 旧盘攒下的曲线属于上一块盘，接在新盘后面就是假历史，整段丢掉重画。
+            // 只有"两边都有值且不同"才算换盘：读不到标识（null）一律不动，
+            // 否则一次读失败就会把正常曲线抹掉。
+            val hardwareId = disk.wwid?.takeIf { it.isNotBlank() }
+
+            if (hardwareId != null && buffers.wwid != null && buffers.wwid != hardwareId) {
+                buffers.reset()
+            }
+
+            if (hardwareId != null) {
+                buffers.wwid = hardwareId
+            }
 
             appendDiskActivity(buffers, disk.activityPercent, atMs)
 
@@ -884,9 +933,22 @@ class PerformanceManager internal constructor(appContext: Context) {
         return (bytesPerSec / range * 100.0).toFloat().coerceIn(0f, 100f)
     }
 
-    /** 缓存键：优先用底层 id（同一台盘换位置也不会串数据），没有就用序号。 */
+    /**
+     * 曲线缓存的键：物理短名优先（磁盘 node=块名、网卡 iface、显卡 node=来源节点），
+     * 其次底层 id，最后本帧下标。
+     *
+     * **wwid 不参与建键**。它是硬件序列号那类字符串，一帧读不到、下一帧又读到，
+     * 键就换了：同一块盘的曲线会被判成两台设备，旧的留在原键下再没人取，
+     * 屏幕上就表现成曲线突然断掉重来。建键只能用一帧里必然存在、不会凭空消失的东西。
+     * 换盘不靠换键来区分，靠 [DiskBuffers.wwid] 的变化把这块盘的曲线清零重画。
+     */
+    private fun chartKeyOf(identity: String?, id: String?, index: Int): String =
+        identity?.takeIf { it.isNotBlank() }
+            ?: id?.takeIf { it.isNotBlank() }
+            ?: "index:$index"
+
     private fun diskKeyOf(disk: DiskSnapshot, index: Int): String =
-        disk.id?.takeIf { it.isNotBlank() } ?: "index:$index"
+        chartKeyOf(disk.node, disk.id, index)
 
     /**
      * 一帧里的每张显卡各攒三条曲线。
@@ -910,7 +972,7 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         gpus.forEachIndexed { index, gpu ->
 
-            val key = gpu.id?.takeIf { it.isNotBlank() } ?: "index:$index"
+            val key = chartKeyOf(gpu.node, gpu.id, index)
 
             val buffers = gpuBuffers.getOrPut(key) { GpuBuffers() }
 
@@ -977,7 +1039,7 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         networks.forEachIndexed { index, network ->
 
-            val key = network.id?.takeIf { it.isNotBlank() } ?: "index:$index"
+            val key = chartKeyOf(network.iface, network.id, index)
 
             val buffers = networkBuffers.getOrPut(key) { NetworkBuffers() }
 
@@ -993,7 +1055,10 @@ class PerformanceManager internal constructor(appContext: Context) {
         networkCharts = charts
     }
 
-    /** 收发速率入队：两个值都缺失就整帧丢弃（那是"这一轮没采到"），与磁盘同一个规矩。 */
+    /**
+     * 收发速率入队：两个值都缺失就整帧丢弃（那是"这一轮没采到"）；
+     * 队列为空时垫一对 0 起点并丢掉首帧真实值，与磁盘速率图同一套规矩。
+     */
     private fun appendNetworkRate(
         buffers: NetworkBuffers,
         send: Double?,
@@ -1003,9 +1068,21 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         if (send == null && receive == null) return
 
-        buffers.sendSamples.addLast(RateSample(atMs, (send ?: 0.0).coerceAtLeast(0.0)))
+        // 与磁盘速率图完全同一套规矩：空队列时先垫一对 0，并**丢掉这一帧的真实值**。
+        // 第一帧速率是"开机以来累计计数的第一次差分"，代表整段累计量而不是这一拍，
+        // 直接画上去左端会顶到天花板，与其它图（都从 0 起）对不上。
+        if (buffers.sendSamples.isEmpty() && buffers.receiveSamples.isEmpty()) {
 
-        buffers.receiveSamples.addLast(RateSample(atMs, (receive ?: 0.0).coerceAtLeast(0.0)))
+            buffers.sendSamples.addLast(RateSample(atMs, 0.0))
+
+            buffers.receiveSamples.addLast(RateSample(atMs, 0.0))
+
+        } else {
+
+            buffers.sendSamples.addLast(RateSample(atMs, (send ?: 0.0).coerceAtLeast(0.0)))
+
+            buffers.receiveSamples.addLast(RateSample(atMs, (receive ?: 0.0).coerceAtLeast(0.0)))
+        }
 
         while (buffers.sendSamples.size > MAX_HISTORY_POINTS) {
             buffers.sendSamples.removeFirst()
@@ -1073,6 +1150,13 @@ class PerformanceManager internal constructor(appContext: Context) {
     /** 一台磁盘的原始缓存（不进 Compose 状态，只在采集线程里改）。 */
     private class DiskBuffers {
 
+        /**
+         * 这一段曲线属于哪块盘（硬件标识 wwid / 序列号）。
+         *
+         * 不参与建键，只用来发现"这个位置换了盘"。null = 平台没给标识，无从判断。
+         */
+        var wwid: String? = null
+
         val activity = ArrayDeque<CpuUsagePoint>()
 
         val readSamples = ArrayDeque<RateSample>()
@@ -1085,6 +1169,21 @@ class PerformanceManager internal constructor(appContext: Context) {
         var readPoints: List<CpuUsagePoint> = emptyList()
 
         var writePoints: List<CpuUsagePoint> = emptyList()
+
+        /**
+         * 清空这段历史，回到"刚插上一块新盘"的状态。
+         *
+         * 量程也一并回到最小档：新盘的速率与旧盘无关，接着旧盘的大档会把
+         * 纵轴压得看不见起伏。清空后第一帧照常垫 0 起点（见 appendDiskRate）。
+         */
+        fun reset() {
+            activity.clear()
+            readSamples.clear()
+            writeSamples.clear()
+            rangeBytesPerSec = MIN_DISK_RANGE_BYTES_PER_SEC
+            readPoints = emptyList()
+            writePoints = emptyList()
+        }
     }
 
     /** 一次速率采样：时刻 + 绝对字节/秒。 */

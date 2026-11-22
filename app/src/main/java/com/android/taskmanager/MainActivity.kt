@@ -599,6 +599,9 @@ private fun MainPage(
     }
     var railExpanded by rememberSaveable { mutableStateOf(false) }
 
+    // 性能页管理器：页名行右端的溢出菜单往这里发请求（复制由页面实现、资源监视器只有空接口）
+    val performanceManager = PageManagers.performance(LocalContext.current)
+
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -678,6 +681,18 @@ private fun MainPage(
                                 modifier = Modifier.weight(1f)
                             )
                         }
+
+                        // 性能页没有搜索框，这一行的右端留给它的溢出菜单（复制图表 / 资源监视器）。
+                        // 这里只决定按钮画在哪，点下去转交性能页管理器，复制逻辑仍在页面里。
+                        if (selectedPage == TaskPage.Performance) {
+                            Spacer(Modifier.weight(1f))
+
+                            PerformanceOverflowMenu(
+                                onCopyChart = { performanceManager.requestCopyChart() },
+
+                                onOpenResourceMonitor = { performanceManager.openResourceMonitor() }
+                            )
+                        }
                     }
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -754,6 +769,16 @@ private fun MainPage(
                                     Icon(
                                         imageVector = Icons.Default.Menu,
                                         contentDescription = "打开导航菜单"
+                                    )
+                                }
+                            },
+                            actions = {
+                                // 性能页的溢出菜单：顶栏右侧，与宽屏页名行是同一个位置
+                                if (selectedPage == TaskPage.Performance) {
+                                    PerformanceOverflowMenu(
+                                        onCopyChart = { performanceManager.requestCopyChart() },
+
+                                        onOpenResourceMonitor = { performanceManager.openResourceMonitor() }
                                     )
                                 }
                             }

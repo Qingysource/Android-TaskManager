@@ -2770,35 +2770,76 @@ static int count_logical_cpus(void)
 /**
  * 数处理器插槽与物理核心。
  *
- * 口径：cpuN/topology 下 physical_package_id 是第几颗芯片（插槽），
- * core_id 是这颗芯片里的第几核。同一颗芯片里 core_id 唯一，所以按
- * 插槽编号 + 核编号这一对去重才是物理核心数 —— 只看 core_id 会把双路机器的两个核算成一个。
+ * 优先级（越靠前越可信）：
+ *   1) cpuN/topology/core_cpus_list       同一物理核心包含哪些逻辑 CPU
+ *   2) cpuN/topology/thread_siblings_list 老内核的同义文件，作用完全相同
+ *   3) physical_package_id + cluster_id + core_id  前两者都没有时的备用组合
+ *   4) 都拿不到  cores 返回 -1（未知），**不拿逻辑 CPU 数冒充物理核心数**
  *
- * @param sockets_out 插槽数；一个都没读到给 -1
- * @param cores_out   物理核心数；一个都没读到给 -1
+ * 为什么不再以 core_id 为首选：cluster_id / core_id 是平台相关的拓扑编号，
+ * 不同簇里 core_id 会重复（big.LITTLE 的小核簇与大核簇各有 0..3），
+ * 只按 package + core_id 去重会把 8 核并成 4 核 —— 这正是旧实现的坑。
+ * 内核直接给的"同核心 CPU 集合"才是我们要的那个关系。
+ *
+ * cluster_id 不是插槽：physical_package_id 表示处理器封装（SoC / 插槽），
+ * 手机多簇共用一颗 SoC，package 通常都是 0。
+ *
+ * 列表会先展开成升序编号再组键（"0-3,5" 与 "0,1,2,3,5" 认作同一个核心），
+ * 不靠字符串字面比较。统计口径是"存在的 CPU"（枚举 cpuN 目录），不看 online：
+ * 任务管理器要的是这颗芯片有几个物理核心，热插拔下线不该让核心数变少。
+ *
+ * @param sockets_out 插槽数：读到 package 就按实际去重数，读不到按单 SoC = 1；一个核都没有给 -1
+ * @param cores_out   物理核心数；拓扑不可靠或一个都没读到给 -1
  */
 static void count_sockets_and_cores(int *sockets_out, int *cores_out)
 {
     *sockets_out = -1;
+
     *cores_out = -1;
 
-    int logical = count_logical_cpus();
+    DIR *dir = opendir("/sys/devices/system/cpu");
 
-    if (logical <= 0) {
+    if (dir == NULL) {
         return;
     }
 
-    char core_keys[256][24];
+    // 每个物理核心一条键：有同核心列表时是 "S:0,4"，否则是 "F:0:1:2"（封装:簇:核）
+    char core_keys[128][96];
+
     int core_key_count = 0;
 
     int socket_ids[64];
+
     int socket_id_count = 0;
 
-    for (int cpu = 0; cpu < logical; cpu++) {
+    int cpu_seen = 0;
+
+    // 只要有一台 cpuN 拿不到可靠拓扑，整台机器的核心数就不下结论
+    bool topology_failed = false;
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        // 只认 cpuN；cpufreq / cpuidle / policyN 这些不是处理器
+        if (strncmp(entry->d_name, "cpu", 3) != 0) {
+            continue;
+        }
+
+        if (!is_pure_digits(entry->d_name + 3)) {
+            continue;
+        }
+
+        int cpu = atoi(entry->d_name + 3);
+
+        cpu_seen++;
 
         char path[TM_PATH_MAX];
 
+        // ---------------- 插槽：physical_package_id ----------------
+
         double package = 0.0;
+
         bool has_package = false;
 
         snprintf(path, sizeof(path),
@@ -2809,6 +2850,7 @@ static void count_sockets_and_cores(int *sockets_out, int *cores_out)
             has_package = true;
 
             int id = (int) package;
+
             bool known = false;
 
             for (int index = 0; index < socket_id_count; index++) {
@@ -2819,22 +2861,194 @@ static void count_sockets_and_cores(int *sockets_out, int *cores_out)
                 }
             }
 
-            if (!known && socket_id_count < 64) {
+            if (known) {
+                // 已经记过这个封装
+            } else if (socket_id_count < (int) (sizeof(socket_ids) / sizeof(socket_ids[0]))) {
                 socket_ids[socket_id_count++] = id;
+            } else {
+                topology_failed = true;
             }
         }
 
-        double core = 0.0;
+        // ---------------- 核心：同核心 CPU 集合 ----------------
 
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+        char list[96];
 
-        if (!read_first_number(path, &core)) {
-            continue;
+        list[0] = '\0';
+
+        bool has_list = false;
+
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/topology/core_cpus_list", cpu);
+
+        if (read_text_file(path, list, (int) sizeof(list)) > 0) {
+            has_list = true;
         }
 
-        char key[24];
+        if (!has_list) {
 
-        snprintf(key, sizeof(key), "%d:%d", has_package ? (int) package : 0, (int) core);
+            // 老内核叫 thread_siblings_list，内容与 core_cpus_list 同义
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+
+            if (read_text_file(path, list, (int) sizeof(list)) > 0) {
+                has_list = true;
+            }
+        }
+
+        char key[96];
+
+        key[0] = '\0';
+
+        if (has_list) {
+
+            // 去掉首尾空白（文件末尾常带一个换行）
+            int head = 0;
+
+            while (list[head] == ' ' || list[head] == '\t' ||
+                   list[head] == '\r' || list[head] == '\n') {
+                head++;
+            }
+
+            int tail = (int) strlen(list) - 1;
+
+            while (tail >= head && (list[tail] == ' ' || list[tail] == '\t' ||
+                                    list[tail] == '\r' || list[tail] == '\n')) {
+                tail--;
+            }
+
+            // 把 "0-3,5" 展开成升序编号，再拼成键
+            int siblings[96];
+
+            int sibling_count = 0;
+
+            bool parsed = head <= tail;
+
+            const char *cursor = list + head;
+
+            while (parsed && cursor <= list + tail && *cursor != '\0') {
+
+                if (*cursor == ',' || *cursor == ' ' || *cursor == '\t') {
+                    cursor++;
+                    continue;
+                }
+
+                if (*cursor < '0' || *cursor > '9') {
+                    parsed = false;
+                    break;
+                }
+
+                int from = 0;
+
+                while (*cursor >= '0' && *cursor <= '9') {
+                    from = from * 10 + (*cursor - '0');
+                    cursor++;
+                }
+
+                int to = from;
+
+                if (*cursor == '-') {
+
+                    cursor++;
+
+                    if (*cursor < '0' || *cursor > '9') {
+                        parsed = false;
+                        break;
+                    }
+
+                    to = 0;
+
+                    while (*cursor >= '0' && *cursor <= '9') {
+                        to = to * 10 + (*cursor - '0');
+                        cursor++;
+                    }
+                }
+
+                if (to < from) {
+                    parsed = false;
+                    break;
+                }
+
+                for (int value = from; value <= to; value++) {
+
+                    if (sibling_count >= (int) (sizeof(siblings) / sizeof(siblings[0])) ||
+                        value >= (int) (sizeof(siblings) / sizeof(siblings[0]))) {
+                        parsed = false;
+                        break;
+                    }
+
+                    siblings[sibling_count++] = value;
+                }
+            }
+
+            if (parsed && sibling_count > 0) {
+
+                // 插入排序：集合很小（最多几十个逻辑核），不值得为它引 qsort 的比较函数
+                for (int index = 1; index < sibling_count; index++) {
+
+                    int value = siblings[index];
+
+                    int slot = index - 1;
+
+                    while (slot >= 0 && siblings[slot] > value) {
+                        siblings[slot + 1] = siblings[slot];
+                        slot--;
+                    }
+
+                    siblings[slot + 1] = value;
+                }
+
+                size_t used = 0;
+
+                used += (size_t) snprintf(key + used, sizeof(key) - used, "S:");
+
+                int previous = -1;
+
+                for (int index = 0; index < sibling_count && used < sizeof(key) - 4; index++) {
+
+                    if (siblings[index] == previous) {
+                        continue;
+                    }
+
+                    previous = siblings[index];
+
+                    used += (size_t) snprintf(key + used, sizeof(key) - used,
+                                              (used <= 2) ? "%d" : ",%d", siblings[index]);
+                }
+
+            } else {
+                // 读到了但解析不了：别拿这段文本当键，退回备用组合
+                has_list = false;
+            }
+        }
+
+        if (!has_list) {
+
+            // 备用：封装 + 簇 + 核（三者齐全才算可靠）
+            double cluster = 0.0;
+
+            double core = 0.0;
+
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/topology/cluster_id", cpu);
+
+            bool has_cluster = read_first_number(path, &cluster);
+
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+
+            bool has_core = read_first_number(path, &core);
+
+            if (!has_cluster || !has_core) {
+                topology_failed = true;
+                continue;
+            }
+
+            snprintf(key, sizeof(key), "F:%d:%d:%d",
+                     has_package ? (int) package : 0, (int) cluster, (int) core);
+        }
+
+        // ---------------- 对物理核心标识去重 ----------------
 
         bool known = false;
 
@@ -2846,19 +3060,32 @@ static void count_sockets_and_cores(int *sockets_out, int *cores_out)
             }
         }
 
-        if (!known && core_key_count < 256) {
-
-            snprintf(core_keys[core_key_count], sizeof(core_keys[core_key_count]), "%s", key);
-
-            core_key_count++;
+        if (known) {
+            continue;
         }
+
+        if (core_key_count >= (int) (sizeof(core_keys) / sizeof(core_keys[0])) ||
+            key[0] == '\0') {
+            topology_failed = true;
+            continue;
+        }
+
+        snprintf(core_keys[core_key_count], sizeof(core_keys[core_key_count]), "%s", key);
+
+        core_key_count++;
     }
 
-    if (socket_id_count > 0) {
-        *sockets_out = socket_id_count;
+    closedir(dir);
+
+    if (cpu_seen == 0) {
+        return;
     }
 
-    if (core_key_count > 0) {
+    // 手机多簇共用一颗 SoC：内核给了 package 就按实际去重数，没给就按单封装
+    *sockets_out = (socket_id_count > 0) ? socket_id_count : 1;
+
+    // 有任何一个核的拓扑不可靠，就不报一个"看起来合理"的总数
+    if (!topology_failed && core_key_count > 0) {
         *cores_out = core_key_count;
     }
 }
@@ -2958,18 +3185,51 @@ static TmQueryStatus query_cache_kb_external(int cpu_id, const char *device_path
  *    也更容易被 SELinux 放行；
  * 3. 同一级有多条（L1 分数据与指令）就相加，页面上的 L1 缓存是总量。
  *
- * @param cpu_dir 该实例的 sysfs 目录，例如 /sys/devices/system/cpu/cpu0
- * @param out_kb  长度 3，分别接 L1 / L2 / L3；-1 = 这一级没扫到
+ * @param cpu_dir   该实例的 sysfs 目录，例如 /sys/devices/system/cpu/cpu0
+ * @param out_kb    长度 3，分别接 L1 / L2 / L3；-1 = 这一级没扫到
+ * @param out_status 长度 3，说清"为什么没扫到"，三种可能：
+ *                   OK             读到了
+ *                   ACCESS_DENIED  有这一级，但尺寸读不出来（没权限 / 解析失败）
+ *                   NOT_AVAILABLE  内核列出来的缓存里根本没有这一级（例如没有 L3）
+ *                   UNSUPPORTED    连 <cpu_dir>/cache 目录都没有（平台不导出缓存信息）
  */
-static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3])
+static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3],
+                                       TmQueryStatus out_status[3])
 {
     out_kb[0] = -1;
     out_kb[1] = -1;
     out_kb[2] = -1;
 
+    out_status[0] = TM_QUERY_NOT_AVAILABLE;
+    out_status[1] = TM_QUERY_NOT_AVAILABLE;
+    out_status[2] = TM_QUERY_NOT_AVAILABLE;
+
     int total[3] = { 0, 0, 0 };
 
     bool found[3] = { false, false, false };
+
+    // 先探 cache 目录本身：目录都打不开，就不是"没有这一级"，而是读不了
+    char cache_dir[TM_PATH_MAX];
+
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", cpu_dir);
+
+    DIR *cache_handle = opendir(cache_dir);
+
+    if (cache_handle == NULL) {
+
+        bool denied = (errno == EACCES || errno == EPERM);
+
+        for (int level = 0; level < 3; level++) {
+            out_status[level] = denied ? TM_QUERY_ACCESS_DENIED : TM_QUERY_UNSUPPORTED;
+        }
+
+        return;
+    }
+
+    closedir(cache_handle);
+
+    // 这一级在不在：index 里有 level=N 就算"有"，尺寸读不出来另算
+    bool seen[3] = { false, false, false };
 
     for (int index = 0; index < 16; index++) {
 
@@ -2987,6 +3247,8 @@ static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3])
         if (level < 1 || level > 3) {
             continue;
         }
+
+        seen[level - 1] = true;
 
         int size_kb = -1;
 
@@ -3035,7 +3297,20 @@ static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3])
 
     for (int level = 1; level <= 3; level++) {
 
-        out_kb[level - 1] = found[level - 1] ? total[level - 1] : -1;
+        if (found[level - 1]) {
+
+            out_kb[level - 1] = total[level - 1];
+            out_status[level - 1] = TM_QUERY_OK;
+
+        } else if (seen[level - 1]) {
+
+            // 内核明确列了这一级，但尺寸拿不到：这是"读不到"，不是"没有"
+            out_status[level - 1] = TM_QUERY_ACCESS_DENIED;
+
+        } else {
+
+            out_status[level - 1] = TM_QUERY_NOT_AVAILABLE;
+        }
     }
 }
 
@@ -3239,10 +3514,37 @@ typedef enum {
   * path : 采集时读的位置（sysfs 目录或 procfs 文件）；
   * name : 内核里的名字（块名 / 网卡名）；CPU 与内存留空。
   */
+/**
+ * 显卡厂商：发现的时候定下来，采集的时候决定"这一格该找谁去读"。
+ *
+ * 为什么必须分厂商：同样是"GPU 利用率"，各家把文件放在完全不同的地方 ——
+ *   高通   /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage（KGSL 专用）
+ *   联发科 /sys/module/ged/parameters/gpu_loading（GED 框架）与 /sys/kernel/ged/hal/gpu_utilization
+ *   Mali   devfreq 的 load（kbase / panfrost / panthor 都有）
+ *   通用   <card>/device/gpu_busy_percent（amdgpu / i915 这类 PCI 驱动）
+ * 不知道是哪家的卡，就只能把所有这些路径挨个试一遍，既慢又容易读到别人的数据。
+ */
+typedef enum {
+    TM_GPU_VENDOR_UNKNOWN = 0,
+    TM_GPU_VENDOR_QUALCOMM,
+    TM_GPU_VENDOR_MEDIATEK,
+    TM_GPU_VENDOR_SAMSUNG,
+    TM_GPU_VENDOR_GOOGLE,
+    TM_GPU_VENDOR_ARM,          /* 认不出是哪家 SoC 的 Mali */
+    TM_GPU_VENDOR_IMAGINATION,  /* PowerVR */
+    TM_GPU_VENDOR_NVIDIA,
+    TM_GPU_VENDOR_AMD,
+    TM_GPU_VENDOR_INTEL,
+    TM_GPU_VENDOR_VIRTIO
+} TmGpuVendor;
+
 typedef struct {
     char id[TM_OUT_ID_MAX];
     char path[TM_PATH_MAX];
     char name[64];
+
+    /** 厂商（TmGpuVendor）：只有显卡用；其余几类留 0，采集时不读它 */
+    int vendor;
 } TmDeviceRef;
 
 /**
@@ -3718,13 +4020,16 @@ static int enumerate_disk_devices(TmDeviceRef *out, int capacity)
 
     closedir(dir);
 
-    // 按块名排序后再编号：序号与名字的对应关系跨帧稳定
+    // 按块名排序：枚举顺序跨帧稳定，界面上的"磁盘 0 / 磁盘 1"才不会来回换位
     if (count > 1) {
         qsort(out, (size_t) count, sizeof(TmDeviceRef), compare_disk_name);
     }
 
     for (int i = 0; i < count; i++) {
 
+        // id 是片段内的稳定索引（disk0 / disk1），只用来查这一帧的数据；
+        // 它跟着排序后的枚举位置走，不代表某一块具体的盘。
+        // 物理身份由 node 承担（node=块名 sda），客户端按 node 认盘。
         snprintf(out[i].id, sizeof(out[i].id), "disk%d", i);
 
         ensure_device_name(out[i].name, (int) sizeof(out[i].name));
@@ -3780,50 +4085,717 @@ static void gpu_drm_vendor_name(const char *device_path, char *out, int capacity
     }
 }
 
-/**
- * 枚举图形设备：按几个常见厂商的 sysfs 位置探测，找到哪个用哪个。
+/* ============================================================
+ * 显卡发现（GPU Discovery）
  *
- * 名字按节点类型区分：kgsl = 高通 Adreno、mali = ARM Mali、
- * DRM 节点再按 PCI 厂商号给一个厂商级名字（Intel / NVIDIA / AMD …）。
+ * 为什么不能只认 /sys/class/drm/card0：Android 上显卡驱动分好几套体系，
+ * 各家的节点位置不同；而且同一颗 GPU 常常同时出现在厂商节点与 DRM 节点下
+ * （一颗 Adreno 既有 kgsl-3d0，又有 msm 的 card0）。只按 DRM 找会漏掉
+ * KGSL 那套字段，只按厂商找又会漏掉纯 DRM 驱动的设备。
+ *
+ * 发现顺序（先专用的、后通用的，专用的信息更全）：
+ *   1. 高通      /sys/class/kgsl/kgsl-3dN          KGSL，Adreno 专用
+ *   2. 联发科/三星/Google /sys/class/misc/maliN     kbase，靠 SoC 判具体是谁
+ *   3. ARM       /sys/bus/platform/devices 里名字带 mali 的设备（裸 Mali 平台设备）
+ *   4. 通用 DRM  /sys/class/drm/cardN               panfrost / panthor / amdgpu / i915 …
+ *
+ * 去重：同一个 GPU 被两条路径发现时只留一条 —— 用 realpath 比对节点与它的
+ * device 目录；高通还额外按厂商去重（kgsl 与 msm 的 card 是同一颗 GPU）。
+ *
+ * 厂商怎么认：专用节点直接定；Mali 要看 SoC 是谁（同一套 kbase 被 MTK / 三星 /
+ * Google 都在用），读 /sys/devices/soc0/machine，再退回 getprop ro.soc.manufacturer；
+ * DRM 看 device/driver 的驱动名与 uevent 里的 PCI 厂商号。
+ * ============================================================ */
+
+/** 文本清理与大小写无关的查找：实现在磁盘一节，这里先声明（同一套规则不重复写）。 */
+static void trim_disk_text(char *text);
+
+/**
+ * 大小写无关的子串查找（只用于 SoC 名字这种小写比较）。
+ *
+ * 不用 strcasestr：它是 GNU 扩展，bionic 上有，但别的 libc 不一定有；
+ * 这里自己拼一份，编译在任何 libc 上都不会冒隐式声明的警告。
  */
-static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
+static bool gpu_text_contains(const char *text, const char *needle)
 {
-    static const char *const candidates[] = {
-        "/sys/class/kgsl/kgsl-3d0",   // 高通 Adreno
-        "/sys/class/misc/mali0",      // ARM Mali
-        "/sys/class/drm/card0",       // 通用 DRM 显卡节点
-    };
+    if (text == NULL || needle == NULL || needle[0] == '\0') {
+        return false;
+    }
+
+    char lower_text[256];
 
     int count = 0;
 
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    for (; text[count] != '\0' && count < (int) sizeof(lower_text) - 1; count++) {
+        lower_text[count] = (char) tolower((unsigned char) text[count]);
+    }
 
-        struct stat info;
+    lower_text[count] = '\0';
 
-        if (stat(candidates[i], &info) != 0) {
+    char lower_needle[32];
+
+    int needle_length = 0;
+
+    for (; needle[needle_length] != '\0' && needle_length < (int) sizeof(lower_needle) - 1;
+         needle_length++) {
+        lower_needle[needle_length] = (char) tolower((unsigned char) needle[needle_length]);
+    }
+
+    lower_needle[needle_length] = '\0';
+
+    return strstr(lower_text, lower_needle) != NULL;
+}
+
+/** 大小写无关地找子串，返回命中位置（找不到返回 NULL）；用于在型号里找 Adreno。 */
+static const char *gpu_case_find(const char *text, const char *needle)
+{
+    if (text == NULL || needle == NULL || needle[0] == '\0') {
+        return NULL;
+    }
+
+    size_t length = strlen(needle);
+
+    for (const char *cursor = text; *cursor != '\0'; cursor++) {
+
+        if (strncasecmp(cursor, needle, length) == 0) {
+            return cursor;
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * 高通显卡的规范名：把内核导出的 gpu_model 拼成统一的写法。
+ *
+ * 内核给的原文什么样都有："Adreno735"、"Adreno (TM) 740"、"KGSL: Adreno 650"，
+ * 也有根本不是 Adreno 的（自研代号 JSBY-SFF23 这种）。规则按用户定的来：
+ *
+ *   1. 原文里有 Adreno —— 取 Adreno 之后的部分当型号尾（去掉 (TM) / (R) 与空格），
+ *      前面统一写 Qualcomm(R) Adreno(TM)，得到 "Qualcomm(R) Adreno(TM) 735"；
+ *   2. 原文里没有 Adreno —— 不硬套 Adreno，写 "Qualcomm(R) <原文>"，
+ *      例如 "Qualcomm(R) JSBY-SFF23"；
+ *   3. 原文为空（内核没导出这一格）—— 写 "Qualcomm(R) Adreno(TM)"，不带型号。
+ *
+ * 为什么只改写法不动内容：型号（735 / 740）是内核给的事实，不能丢也不能编；
+ * 这里只补厂商前缀、把 (TM)/(R) 归位，让它和 Windows 那种"厂商 + 系列 + 型号"
+ * 的写法一致。
+ */
+static void gpu_qualcomm_model_name(const char *model, char *out, int capacity)
+{
+    if (out == NULL || capacity <= 0) {
+        return;
+    }
+
+    char text[64];
+
+    snprintf(text, sizeof(text), "%s", (model != NULL) ? model : "");
+
+    trim_disk_text(text);
+
+    const char *adreno = gpu_case_find(text, "adreno");
+
+    if (adreno == NULL) {
+
+        // 不是 Adreno 系列：只加厂商前缀，型号原样保留
+        if (text[0] != '\0') {
+            snprintf(out, (size_t) capacity, "Qualcomm(R) %s", text);
+        } else {
+            snprintf(out, (size_t) capacity, "%s", "Qualcomm(R) Adreno(TM)");
+        }
+
+        return;
+    }
+
+    const char *tail = adreno + strlen("adreno");
+
+    // 跳过 Adreno 与型号之间的分隔：空格、(TM)、(R)、单独的 TM
+    bool trimmed = true;
+
+    while (trimmed) {
+
+        trimmed = false;
+
+        while (*tail == ' ' || *tail == '\t') {
+            tail++;
+        }
+
+        if (strncasecmp(tail, "(TM)", 4) == 0) {
+            tail += 4;
+            trimmed = true;
+        } else if (strncasecmp(tail, "(R)", 3) == 0) {
+            tail += 3;
+            trimmed = true;
+        } else if (strncasecmp(tail, "TM", 2) == 0) {
+            tail += 2;
+            trimmed = true;
+        }
+    }
+
+    while (*tail == ' ' || *tail == '\t') {
+        tail++;
+    }
+
+    // 尾部空白也去掉（内核文件常带换行，已经 trim 过，这里防型号后面还有空格）
+    char tail_text[48];
+
+    snprintf(tail_text, sizeof(tail_text), "%s", tail);
+
+    trim_disk_text(tail_text);
+
+    if (tail_text[0] != '\0') {
+        snprintf(out, (size_t) capacity, "Qualcomm(R) Adreno(TM) %s", tail_text);
+    } else {
+        snprintf(out, (size_t) capacity, "%s", "Qualcomm(R) Adreno(TM)");
+    }
+}
+
+/** 厂商的协议写法：单行无空格，客户端可以直接当标签显示。 */
+static const char *gpu_vendor_text(int vendor)
+{
+    switch (vendor) {
+
+        case TM_GPU_VENDOR_QUALCOMM:
+            return "QUALCOMM";
+
+        case TM_GPU_VENDOR_MEDIATEK:
+            return "MEDIATEK";
+
+        case TM_GPU_VENDOR_SAMSUNG:
+            return "SAMSUNG";
+
+        case TM_GPU_VENDOR_GOOGLE:
+            return "GOOGLE";
+
+        case TM_GPU_VENDOR_ARM:
+            return "ARM";
+
+        case TM_GPU_VENDOR_IMAGINATION:
+            return "IMAGINATION";
+
+        case TM_GPU_VENDOR_NVIDIA:
+            return "NVIDIA";
+
+        case TM_GPU_VENDOR_AMD:
+            return "AMD";
+
+        case TM_GPU_VENDOR_INTEL:
+            return "INTEL";
+
+        case TM_GPU_VENDOR_VIRTIO:
+            return "VIRTIO";
+
+        default:
+            return "OTHER";
+    }
+}
+
+/**
+ * SoC 是哪一家做的（只在认 Mali 的归属时用得上）。
+ *
+ * 依据两条，都是系统自己声明的事实：
+ *   /sys/devices/soc0/machine        例如 "Qualcomm Technologies, Inc SM8550"
+ *                                   或 "MT6893"、"EXYNOS9610"、"Tensor"
+ *   getprop ro.soc.manufacturer      Android 的属性，值形如 Qualcomm / MediaTek / Samsung / Google
+ *
+ * 结果在进程内只算一次：SoC 不会中途换。
+ */
+static int gpu_soc_vendor(void)
+{
+    static bool cached = false;
+
+    static int cached_vendor = TM_GPU_VENDOR_UNKNOWN;
+
+    if (cached) {
+        return cached_vendor;
+    }
+
+    cached = true;
+
+    char text[256];
+
+    text[0] = '\0';
+
+    read_text_file("/sys/devices/soc0/machine", text, (int) sizeof(text));
+
+    if (text[0] == '\0') {
+        read_text_file("/sys/devices/soc0/family", text, (int) sizeof(text));
+    }
+
+    char prop[128];
+
+    prop[0] = '\0';
+
+    FILE *pipe = popen("getprop ro.soc.manufacturer 2>/dev/null", "r");
+
+    if (pipe != NULL) {
+
+        if (fgets(prop, (int) sizeof(prop), pipe) == NULL) {
+            prop[0] = '\0';
+        }
+
+        pclose(pipe);
+    }
+
+    if (gpu_text_contains(text, "qualcomm") || gpu_text_contains(text, "snapdragon")
+        || gpu_text_contains(prop, "qualcomm")) {
+
+        cached_vendor = TM_GPU_VENDOR_QUALCOMM;
+
+    } else if (gpu_text_contains(text, "mediatek") || gpu_text_contains(text, "mt6")
+               || gpu_text_contains(text, "mt8") || gpu_text_contains(text, "mt9")
+               || gpu_text_contains(prop, "mediatek")) {
+
+        cached_vendor = TM_GPU_VENDOR_MEDIATEK;
+
+    } else if (gpu_text_contains(text, "exynos") || gpu_text_contains(text, "samsung")
+               || gpu_text_contains(prop, "samsung")) {
+
+        cached_vendor = TM_GPU_VENDOR_SAMSUNG;
+
+    } else if (gpu_text_contains(text, "tensor") || gpu_text_contains(text, "gs101")
+               || gpu_text_contains(text, "gs201") || gpu_text_contains(text, "zum")
+               || gpu_text_contains(prop, "google")) {
+
+        cached_vendor = TM_GPU_VENDOR_GOOGLE;
+    }
+
+    return cached_vendor;
+}
+
+/** 读一条符号链接的最后一段（<node>/device/driver -> mali）。空串表示没有。 */
+static void gpu_link_name(const char *path, char *out, int capacity)
+{
+    out[0] = '\0';
+
+    char target[TM_PATH_MAX];
+
+    target[0] = '\0';
+
+    if (readlink(path, target, sizeof(target) - 1) <= 0) {
+        return;
+    }
+
+    target[sizeof(target) - 1] = '\0';
+
+    const char *slash = strrchr(target, '/');
+
+    snprintf(out, (size_t) capacity, "%s", (slash != NULL) ? (slash + 1) : target);
+}
+
+/** 规范化后的真实路径：读不到就原样返回，保证调用方总有可比对的字符串。 */
+static void gpu_real_path(const char *path, char *out, int capacity)
+{
+    char *resolved = realpath(path, NULL);
+
+    if (resolved != NULL) {
+
+        snprintf(out, (size_t) capacity, "%s", resolved);
+
+        free(resolved);
+
+        return;
+    }
+
+    snprintf(out, (size_t) capacity, "%s", path);
+}
+
+/** 已登记节点的去重表：最多四张卡，每条记两个路径（节点本身 + 它的 device）。 */
+typedef struct {
+    char path[TM_OUT_GPU_MAX * 2][TM_PATH_MAX];
+    int count;
+} TmGpuSeen;
+
+static bool gpu_seen_has(const TmGpuSeen *seen, const char *real_path)
+{
+    for (int i = 0; i < seen->count; i++) {
+
+        if (strcmp(seen->path[i], real_path) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void gpu_seen_add(TmGpuSeen *seen, const char *real_path)
+{
+    if (seen->count >= (int) (sizeof(seen->path) / sizeof(seen->path[0]))) {
+        return;
+    }
+
+    snprintf(seen->path[seen->count], sizeof(seen->path[0]), "%s", real_path);
+
+    seen->count++;
+}
+
+/**
+ * 登记一张卡：去重后追加。
+ *
+ * 去重用的是"真实路径"：/sys/class/misc/mali0/device 与
+ * /sys/bus/platform/devices/13000000.mali 指向同一个平台设备，只登记一次。
+ *
+ * @return 追加后的新条数（被去重时原样返回）
+ */
+static int gpu_add(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen,
+                   const char *node, const char *name, int vendor)
+{
+    if (count >= capacity) {
+        return count;
+    }
+
+    char node_real[TM_PATH_MAX];
+
+    gpu_real_path(node, node_real, (int) sizeof(node_real));
+
+    if (gpu_seen_has(seen, node_real)) {
+        return count;
+    }
+
+    char device_path[TM_PATH_MAX];
+
+    snprintf(device_path, sizeof(device_path), "%s/device", node);
+
+    char device_real[TM_PATH_MAX];
+
+    gpu_real_path(device_path, device_real, (int) sizeof(device_real));
+
+    if (strcmp(device_real, device_path) != 0 && gpu_seen_has(seen, device_real)) {
+        return count;
+    }
+
+    // id 是稳定索引（gpu0 / gpu1）：哪张卡是哪个由 node 说明
+    snprintf(out[count].id, sizeof(out[count].id), "gpu%d", count);
+
+    snprintf(out[count].path, sizeof(out[count].path), "%s", node);
+
+    snprintf(out[count].name, sizeof(out[count].name), "%s", name);
+
+    out[count].vendor = vendor;
+
+    ensure_device_name(out[count].name, (int) sizeof(out[count].name));
+
+    gpu_seen_add(seen, node_real);
+
+    if (strcmp(device_real, device_path) != 0) {
+        gpu_seen_add(seen, device_real);
+    }
+
+    return count + 1;
+}
+
+/** 1) 高通：/sys/class/kgsl 下的 kgsl-3dN（3D 图形核；kgsl-2d 是 2D 合成，不算显卡）。 */
+static int gpu_discover_kgsl(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+{
+    DIR *dir = opendir("/sys/class/kgsl");
+
+    if (dir == NULL) {
+        return count;
+    }
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (strncmp(entry->d_name, "kgsl-3d", 7) != 0) {
             continue;
         }
 
-        if (count >= capacity) {
-            break;
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/kgsl/%s", entry->d_name);
+
+        struct stat info;
+
+        if (stat(path, &info) != 0) {
+            continue;
         }
 
-        snprintf(out[count].id, sizeof(out[count].id), "gpu%d", count);
+        // gpu_model 是高通导出的芯片名（Adreno735 / Adreno (TM) 740 这种）。
+        // 原文写法不统一，这里过一遍规范名函数，统一成
+        // "Qualcomm(R) Adreno(TM) 735"；不是 Adreno 的型号只加厂商前缀。
+        char model[64];
 
-        snprintf(out[count].path, sizeof(out[count].path), "%s", candidates[i]);
+        model[0] = '\0';
 
-        if (i == 0) {
-            snprintf(out[count].name, sizeof(out[count].name), "%s", "Qualcomm Adreno GPU");
-        } else if (i == 1) {
-            snprintf(out[count].name, sizeof(out[count].name), "%s", "ARM Mali GPU");
-        } else {
-            gpu_drm_vendor_name(candidates[i], out[count].name, (int) sizeof(out[count].name));
-        }
+        char model_path[TM_PATH_MAX];
 
-        ensure_device_name(out[count].name, (int) sizeof(out[count].name));
+        snprintf(model_path, sizeof(model_path), "%s/gpu_model", path);
 
-        count++;
+        read_text_file(model_path, model, (int) sizeof(model));
+
+        trim_disk_text(model);
+
+        char display[TM_OUT_VALUE_MAX];
+
+        gpu_qualcomm_model_name(model, display, (int) sizeof(display));
+
+        count = gpu_add(out, capacity, count, seen, path, display, TM_GPU_VENDOR_QUALCOMM);
     }
+
+    closedir(dir);
+
+    return count;
+}
+
+/**
+ * 2) / 3) / 4) Mali 系：/sys/class/misc 下的 maliN，以及平台设备里名字带 mali 的。
+ *
+ * 同一个驱动（ARM kbase）被联发科、三星、Google 三家都用着，节点位置一模一样，
+ * 所以厂商只能靠 SoC 判；判不出来就记 ARM（驱动确实是 ARM 的）。
+ */
+static int gpu_discover_mali_misc(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+{
+    DIR *dir = opendir("/sys/class/misc");
+
+    if (dir == NULL) {
+        return count;
+    }
+
+    int vendor = gpu_soc_vendor();
+
+    if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
+        vendor = TM_GPU_VENDOR_ARM;
+    }
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (strncmp(entry->d_name, "mali", 4) != 0) {
+            continue;
+        }
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/misc/%s", entry->d_name);
+
+        struct stat info;
+
+        if (stat(path, &info) != 0) {
+            continue;
+        }
+
+        // kbase 的 gpuinfo：Mali-G57 5 cores r0p1 0x9091
+        char info_text[64];
+
+        info_text[0] = '\0';
+
+        char info_path[TM_PATH_MAX];
+
+        snprintf(info_path, sizeof(info_path), "%s/device/gpuinfo", path);
+
+        read_text_file(info_path, info_text, (int) sizeof(info_text));
+
+        trim_disk_text(info_text);
+
+        if (info_text[0] == '\0') {
+            snprintf(info_path, sizeof(info_path), "%s/gpuinfo", path);
+            read_text_file(info_path, info_text, (int) sizeof(info_text));
+            trim_disk_text(info_text);
+        }
+
+        count = gpu_add(out, capacity, count, seen, path,
+                        info_text[0] != '\0' ? info_text : "ARM Mali GPU", vendor);
+    }
+
+    closedir(dir);
+
+    return count;
+}
+
+/** 5) 裸 Mali 平台设备：/sys/bus/platform/devices 里名字带 mali 的那几个。 */
+static int gpu_discover_mali_platform(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+{
+    DIR *dir = opendir("/sys/bus/platform/devices");
+
+    if (dir == NULL) {
+        return count;
+    }
+
+    int vendor = gpu_soc_vendor();
+
+    if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
+        vendor = TM_GPU_VENDOR_ARM;
+    }
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (strstr(entry->d_name, "mali") == NULL) {
+            continue;
+        }
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/bus/platform/devices/%s", entry->d_name);
+
+        struct stat info;
+
+        if (stat(path, &info) != 0) {
+            continue;
+        }
+
+        count = gpu_add(out, capacity, count, seen, path, "ARM Mali GPU", vendor);
+    }
+
+    closedir(dir);
+
+    return count;
+}
+
+/**
+ * 6) Linux 官方 DRM：/sys/class/drm 下的 cardN（renderD* 与 cardN 是同一个设备，
+ *    只按 cardN 登记；cardN-XXX 是接口连接器，不是显卡）。
+ *
+ * 厂商按驱动名判；PCI 卡再看 uevent 的 PCI_ID。
+ * 高通那套已经由 KGSL 登记过，这里的 msm/msm_drm card 直接跳过，避免一张卡两行。
+ */
+static int gpu_discover_drm(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+{
+    DIR *dir = opendir("/sys/class/drm");
+
+    if (dir == NULL) {
+        return count;
+    }
+
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (strncmp(entry->d_name, "card", 4) != 0) {
+            continue;
+        }
+
+        bool digits_only = true;
+
+        for (const char *cursor = entry->d_name + 4; *cursor != '\0'; cursor++) {
+
+            if (!isdigit((unsigned char) *cursor)) {
+                digits_only = false;
+                break;
+            }
+        }
+
+        if (!digits_only) {
+            continue;
+        }
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/drm/%s", entry->d_name);
+
+        char driver[64];
+
+        driver[0] = '\0';
+
+        char driver_link[TM_PATH_MAX];
+
+        snprintf(driver_link, sizeof(driver_link), "%s/device/driver", path);
+
+        gpu_link_name(driver_link, driver, (int) sizeof(driver));
+
+        int vendor = TM_GPU_VENDOR_UNKNOWN;
+
+        if (strcasecmp(driver, "amdgpu") == 0 || strcasecmp(driver, "radeon") == 0) {
+
+            vendor = TM_GPU_VENDOR_AMD;
+
+        } else if (strcasecmp(driver, "nvidia") == 0 || strcasecmp(driver, "nouveau") == 0
+                   || strcmp(driver, "nvidia-drm") == 0) {
+
+            vendor = TM_GPU_VENDOR_NVIDIA;
+
+        } else if (strcasecmp(driver, "i915") == 0 || strcasecmp(driver, "xe") == 0) {
+
+            vendor = TM_GPU_VENDOR_INTEL;
+
+        } else if (strcasecmp(driver, "msm") == 0 || strcasecmp(driver, "msm_drm") == 0
+                   || strcasecmp(driver, "kgsl") == 0) {
+
+            // 高通：KGSL 那一趟通常已经登记过同一颗 GPU，这时不再追加；
+            // 但老内核 / 权限不足时可能根本没有 kgsl 节点，那 msm 的 card
+            // 就是唯一的线索，必须收下，否则整页会一张卡都没有。
+            bool already = false;
+
+            for (int k = 0; k < count; k++) {
+
+                if (out[k].vendor == TM_GPU_VENDOR_QUALCOMM) {
+                    already = true;
+                    break;
+                }
+            }
+
+            if (already) {
+                continue;
+            }
+
+            vendor = TM_GPU_VENDOR_QUALCOMM;
+
+        } else if (strcasecmp(driver, "virtio_gpu") == 0) {
+
+            vendor = TM_GPU_VENDOR_VIRTIO;
+
+        } else if (strcasecmp(driver, "panfrost") == 0 || strcasecmp(driver, "panthor") == 0
+                   || strcasecmp(driver, "kbase") == 0) {
+
+            vendor = gpu_soc_vendor();
+
+            if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
+                vendor = TM_GPU_VENDOR_ARM;
+            }
+
+        } else if (strcasecmp(driver, "pvrsrvkm") == 0 || strcasecmp(driver, "powervr") == 0) {
+
+            vendor = TM_GPU_VENDOR_IMAGINATION;
+
+        } else if (strcasecmp(driver, "exynos") == 0 || strstr(driver, "exynos") != NULL) {
+
+            vendor = TM_GPU_VENDOR_SAMSUNG;
+        }
+
+        char name[64];
+
+        gpu_drm_vendor_name(path, name, (int) sizeof(name));
+
+        // 驱动名认出来了但名字还是默认的 "GPU"，就补成"厂商 + 驱动"，便于分辨
+        if (strcmp(name, "GPU") == 0 && driver[0] != '\0') {
+            snprintf(name, sizeof(name), "%s (%s)", gpu_vendor_text(vendor), driver);
+        }
+
+        count = gpu_add(out, capacity, count, seen, path, name, vendor);
+    }
+
+    closedir(dir);
+
+    return count;
+}
+
+/**
+ * 枚举图形设备：四趟发现，前面的结果占位，后面的只补空缺。
+ *
+ * 上限 TM_OUT_GPU_MAX：手机 / 平板最多一两颗 GPU，四张是给 PCI 多卡留的余量。
+ */
+static int enumerate_gpu_devices(TmDeviceRef *out, int capacity)
+{
+    if (out == NULL || capacity <= 0) {
+        return 0;
+    }
+
+    TmGpuSeen seen;
+
+    memset(&seen, 0, sizeof(seen));
+
+    int count = 0;
+
+    count = gpu_discover_kgsl(out, capacity, count, &seen);
+
+    count = gpu_discover_mali_misc(out, capacity, count, &seen);
+
+    count = gpu_discover_mali_platform(out, capacity, count, &seen);
+
+    count = gpu_discover_drm(out, capacity, count, &seen);
 
     return count;
 }
@@ -5126,7 +6098,11 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
 
         int cache_kb[3] = { -1, -1, -1 };
 
-        probe_cpu_cache_from_sysfs(device->path, cache_kb);
+        TmQueryStatus own_status[3] = {
+            TM_QUERY_UNSUPPORTED, TM_QUERY_UNSUPPORTED, TM_QUERY_UNSUPPORTED
+        };
+
+        probe_cpu_cache_from_sysfs(device->path, cache_kb, own_status);
 
         for (int level = 1; level <= 3; level++) {
 
@@ -5137,7 +6113,10 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
 
             // 外部 OK 才覆盖自己扫到的
             if (status == TM_QUERY_OK && external_kb > 0) {
+
                 cache_kb[level - 1] = external_kb;
+
+                own_status[level - 1] = TM_QUERY_OK;
             }
 
             if (cache_kb[level - 1] >= 0) {
@@ -5148,9 +6127,16 @@ static int build_cpu_devices(TmOutDevice *out, int capacity,
 
                 cache_status[level - 1] = TM_QUERY_OK;
 
-            } else if (i == 0 && cache_status[level - 1] != TM_QUERY_OK) {
+            } else if (i == 0) {
 
-                cache_status[level - 1] = status;
+                cache_status[level - 1] = own_status[level - 1];
+
+            } else if (cache_status[level - 1] != TM_QUERY_ACCESS_DENIED
+                       && own_status[level - 1] == TM_QUERY_ACCESS_DENIED) {
+
+                // 多颗芯片时取"更能说明问题"的那个：只要有一颗读不到，
+                // 就写"-"（读不到），不能因为另一颗没这一级就谎称"不支持"
+                cache_status[level - 1] = TM_QUERY_ACCESS_DENIED;
             }
         }
     }
@@ -5421,6 +6407,7 @@ static int enumerate_network_devices(TmDeviceRef *out, int capacity)
 
     for (int i = 0; i < count; i++) {
 
+        // id 是稳定索引（network0 / network1）；具体是哪块网卡由 iface 说明
         snprintf(out[i].id, sizeof(out[i].id), "network%d", i);
 
         ensure_device_name(out[i].name, (int) sizeof(out[i].name));
@@ -6658,6 +7645,86 @@ static void trim_disk_text(char *text)
     }
 }
 
+/**
+ * 读一块盘的硬件标识（wwid / 序列号）。
+ *
+ * 为什么要它：块名（sda / mmcblk0）是内核按枚举顺序分配的，可以复用——拔掉 sdb
+ * 再插一块新盘，内核很可能还叫它 sdb。只靠块名认盘的话，新盘会继承旧盘的曲线。
+ * 硬件标识写死在盘上（SCSI 的 VPD、NVMe 的 EUI、UFS / MMC 的序列号），换盘必变。
+ *
+ * 四条路径按顺序试，取第一个读到的：
+ *   <block>/device/wwid    SCSI / UFS，形如 t10.ATA_____Samsung_SSD_…
+ *   <block>/wwid           NVMe 命名空间，形如 nvme.<eui>.<nsid>
+ *   <block>/device/serial  序列号（部分 SATA / MMC 控制器只给这一格）
+ *   <block>/serial         同上，少数平台直接挂在块目录下
+ *
+ * @param status 读不到时写状态：节点全不存在 = UNSUPPORTED（平台不给），
+ *               节点在但打不开 = ACCESS_DENIED（没权限，换个身份也许能读）
+ * @return 读到返回 true，out 里是去掉首尾空白的标识
+ */
+static bool disk_read_hardware_id(const char *block_path, char *out, int capacity,
+                                  TmQueryStatus *status)
+{
+    static const char *const suffixes[] = {
+        "/device/wwid", "/wwid", "/device/serial", "/serial"
+    };
+
+    bool denied = false;
+
+    if (status != NULL) {
+        *status = TM_QUERY_UNSUPPORTED;
+    }
+
+    if (out == NULL || capacity <= 0 || block_path == NULL) {
+        return false;
+    }
+
+    out[0] = '\0';
+
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "%s%s", block_path, suffixes[i]);
+
+        // 路径不存在是常态（例如 NVMe 没有 device/wwid），直接换下一条，不算失败
+        if (access(path, F_OK) != 0) {
+            continue;
+        }
+
+        if (access(path, R_OK) != 0) {
+            denied = true;
+            continue;
+        }
+
+        char text[TM_OUT_VALUE_MAX];
+
+        if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+            continue;
+        }
+
+        trim_disk_text(text);
+
+        if (text[0] == '\0') {
+            continue;
+        }
+
+        snprintf(out, (size_t) capacity, "%s", text);
+
+        if (status != NULL) {
+            *status = TM_QUERY_OK;
+        }
+
+        return true;
+    }
+
+    if (status != NULL) {
+        *status = denied ? TM_QUERY_ACCESS_DENIED : TM_QUERY_UNSUPPORTED;
+    }
+
+    return false;
+}
+
 /** 不区分大小写地找子串（只用于 sysfs 链接路径里的 nvme / ufs / mmc 这些关键字）。 */
 static bool text_contains_ci(const char *text, const char *needle)
 {
@@ -7314,6 +8381,20 @@ static int build_disk_devices(TmOutDevice *out, int capacity,
         // 块设备名（sda / sdb / mmcblk0 / nvme0n1）：页面标题写"磁盘 0 (sda)"用。
         // 它与 name 是两件事：name 是"厂商 + 型号"，不含块名（只有型号都缺时才退回块名）。
         device_put(device, "node", devices[i].name);
+
+        // 硬件标识（wwid / 序列号）：页面不显示，只给上层曲线缓存做最高优先级的键，
+        // 调试页转储字段时能看见，便于核对"这块盘到底认成了谁"。
+        // 读不到也照发一格状态：字段不删，让人一眼看出是平台不给还是没权限。
+        char hardware_id[TM_OUT_VALUE_MAX];
+
+        TmQueryStatus hardware_status = TM_QUERY_UNSUPPORTED;
+
+        if (disk_read_hardware_id(devices[i].path, hardware_id, (int) sizeof(hardware_id),
+                                  &hardware_status)) {
+            device_put_value(device, "wwid", query_value_text(TM_QUERY_OK, hardware_id));
+        } else {
+            device_put_value(device, "wwid", query_value_none(hardware_status));
+        }
 
         double rotational = 0.0;
 
@@ -7989,6 +9070,399 @@ static long long read_dram_size_bytes(void)
     return gigabytes * 1024LL * 1024LL * 1024LL;
 }
 
+// ============================================================
+// 硬件保留内存：物理地址区间那一条线
+//
+// 任务管理器里的"为硬件保留的内存"= 物理内存里不能交给操作系统普通管理的那一截。
+// Android 没有现成的计数器，只能自己拼：
+//
+//   1) 标称容量（高通 dt 的 ddr_size）是商品上写的那个数；
+//   2) MemTotal 是内核真正接管的部分；
+//   3) 两者之差就是固件 / Hypervisor / 各子系统 carveout / 内核镜像自身这些
+//      "内核没拿到"的字节数 —— 页面显示的就是它；
+//   4) /proc/iomem 的 System RAM 与设备树 reserved-memory 再算一份
+//      "按地址区间对得上的预留量"，口径不同，只给调试页交叉验证用。
+//
+// 为什么不直接把设备树里所有 reg 相加：带 reusable 的区域（CMA、qdss 这类）
+// 允许内核回收，动态 size 的节点又没有固定地址，直接相加会把能用的内存
+// 也算成保留。
+// ============================================================
+
+/** 一段物理地址区间（闭区间，单位字节）。 */
+typedef struct {
+    long long start;
+    long long size;
+} TmMemRange;
+
+/** 区间表容量：System RAM 的段数加上设备树预留区，一页装得下。 */
+#define TM_MEM_RANGE_MAX 64
+
+/** 32 位大端单元（设备树 reg 的每个 cell 都是 4 字节大端）。 */
+static unsigned long long mem_cell32(const unsigned char *raw)
+{
+    return ((unsigned long long) raw[0] << 24) |
+           ((unsigned long long) raw[1] << 16) |
+           ((unsigned long long) raw[2] << 8) |
+           (unsigned long long) raw[3];
+}
+
+/**
+ * 按大端 cell 拼一个 64 位值。
+ *
+ * arm64 的地址 / 长度单元只可能是 1 或 2；其它取值返回 -1 让调用方跳过这一条 ——
+ * 猜着拼出来的地址比不算更糟。
+ */
+static long long mem_be_value(const unsigned char *raw, int cells)
+{
+    if (cells == 1) {
+        return (long long) mem_cell32(raw);
+    }
+
+    if (cells == 2) {
+        return (long long) ((mem_cell32(raw) << 32) | mem_cell32(raw + 4));
+    }
+
+    return -1;
+}
+
+/** 描述列是否正好是 label（后面最多带个 \r），避免 "System RAM Bus" 之类混进来。 */
+static bool mem_label_exact(const char *desc, int remaining, const char *label)
+{
+    int length = (int) strlen(label);
+
+    if (remaining < length) {
+        return false;
+    }
+
+    if (strncmp(desc, label, (size_t) length) != 0) {
+        return false;
+    }
+
+    if (remaining == length) {
+        return true;
+    }
+
+    return remaining == length + 1 && desc[length] == '\r';
+}
+
+/**
+ * 从 /proc/iomem 收集某一类区间。
+ *
+ * @param label    描述列要完全匹配的名字（"System RAM" / "reserved"）
+ * @param indented true 取缩进的子区域，false 取顶格的父区域
+ * @param out      结果数组
+ * @param capacity 结果数组容量
+ * @return 段数；-1 = 没权限（有权限时也许能拿到）；-2 = 读失败
+ */
+static int mem_collect_iomem(const char *label, bool indented,
+                             TmMemRange *out, int capacity)
+{
+    if (out == NULL || capacity <= 0) {
+        return -2;
+    }
+
+    // iomem 一台机器几十行，16 KB 足够；静态缓冲，别在栈上开大数组
+    static char text[16384];
+
+    if (read_text_file("/proc/iomem", text, (int) sizeof(text)) <= 0) {
+
+        // 打不开时先分清"没权限"和"根本不存在"：前者以后也许能拿到
+        return (access("/proc/iomem", R_OK) != 0) ? -1 : -2;
+    }
+
+    int count = 0;
+    const char *line = text;
+
+    while (*line != '\0' && count < capacity) {
+
+        const char *line_end = strchr(line, '\n');
+        int length = (line_end != NULL) ? (int) (line_end - line) : (int) strlen(line);
+
+        const char *cursor = line;
+        const char *limit = line + length;
+
+        int indent = 0;
+
+        while (cursor < limit && (*cursor == ' ' || *cursor == '\t')) {
+            cursor++;
+            indent++;
+        }
+
+        // 父段与子段只取一类：子段本来就在父段里，重复加会把总量翻倍
+        if ((indent > 0) == indented && cursor < limit) {
+
+            unsigned long long start = 0;
+            unsigned long long stop = 0;
+
+            if (sscanf(cursor, "%llx-%llx", &start, &stop) == 2) {
+
+                const char *colon = memchr(cursor, ':', (size_t) (limit - cursor));
+
+                if (colon != NULL && stop >= start) {
+
+                    const char *desc = colon + 1;
+
+                    while (desc < limit && *desc == ' ') {
+                        desc++;
+                    }
+
+                    if (desc < limit &&
+                        mem_label_exact(desc, (int) (limit - desc), label)) {
+
+                        out[count].start = (long long) start;
+                        out[count].size = (long long) (stop - start) + 1;
+                        count++;
+                    }
+                }
+            }
+        }
+
+        line = (line_end != NULL) ? line_end + 1 : limit;
+    }
+
+    return count;
+}
+
+/** 区间并集的总字节数：重叠的设备树节点只算一次。 */
+static long long mem_union_size(const TmMemRange *ranges, int count)
+{
+    if (ranges == NULL || count <= 0) {
+        return 0;
+    }
+
+    TmMemRange sorted[TM_MEM_RANGE_MAX];
+    int limit = (count > TM_MEM_RANGE_MAX) ? TM_MEM_RANGE_MAX : count;
+
+    for (int i = 0; i < limit; i++) {
+        sorted[i] = ranges[i];
+    }
+
+    // 段数只有几十个，插入排序最省事
+    for (int i = 1; i < limit; i++) {
+
+        TmMemRange value = sorted[i];
+        int j = i - 1;
+
+        while (j >= 0 && sorted[j].start > value.start) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+
+        sorted[j + 1] = value;
+    }
+
+    long long total = 0;
+    long long current_start = sorted[0].start;
+    long long current_end = sorted[0].start + sorted[0].size - 1;
+
+    for (int i = 1; i < limit; i++) {
+
+        long long start = sorted[i].start;
+        long long end = start + sorted[i].size - 1;
+
+        if (start <= current_end + 1) {
+
+            if (end > current_end) {
+                current_end = end;
+            }
+        } else {
+            total += current_end - current_start + 1;
+            current_start = start;
+            current_end = end;
+        }
+    }
+
+    total += current_end - current_start + 1;
+
+    return total;
+}
+
+/**
+ * 把一段区间裁到 other 表里，命中的片段追加进 out。
+ *
+ * 用来把设备树的预留区裁到 /proc/iomem 真正登记成 System RAM 的范围内：
+ * 只落在 MMIO 空洞里的预留区不是内存，不该算进来。
+ *
+ * @return 追加了几段
+ */
+static int mem_append_clipped(TmMemRange *out, int count, int capacity,
+                              const TmMemRange *source,
+                              const TmMemRange *other, int other_count)
+{
+    if (out == NULL || source == NULL || other == NULL) {
+        return 0;
+    }
+
+    int added = 0;
+
+    long long source_start = source->start;
+    long long source_end = source_start + source->size - 1;
+
+    for (int i = 0; i < other_count && count + added < capacity; i++) {
+
+        long long other_end = other[i].start + other[i].size - 1;
+
+        long long start = (source_start > other[i].start) ? source_start : other[i].start;
+        long long end = (source_end < other_end) ? source_end : other_end;
+
+        if (start <= end) {
+            out[count + added].start = start;
+            out[count + added].size = end - start + 1;
+            added++;
+        }
+    }
+
+    return added;
+}
+
+/** 读设备树的单元数属性（#address-cells / #size-cells）：固定 4 字节大端。 */
+static int mem_dt_cell_count(const char *path, int fallback)
+{
+    unsigned char raw[4];
+
+    int length = read_text_file(path, (char *) raw, (int) sizeof(raw));
+
+    if (length != 4) {
+        return fallback;
+    }
+
+    return (int) mem_cell32(raw);
+}
+
+/**
+ * 读一个节点的 reg 属性，拆成若干 (起始地址, 长度)。
+ *
+ * reg 的布局是 (地址单元 × address-cells, 长度单元 × size-cells) 重复出现，
+ * 每个单元 4 字节大端。单元数不是 1 或 2、总长度凑不成整数条，都算解析失败。
+ *
+ * @return 条目数；0 = 没有 reg 或格式不认识
+ */
+static int mem_dt_reg(const char *path, int address_cells, int size_cells,
+                      TmMemRange *out, int capacity)
+{
+    if (out == NULL || capacity <= 0) {
+        return 0;
+    }
+
+    unsigned char raw[256];
+
+    int length = read_text_file(path, (char *) raw, (int) sizeof(raw));
+    int entry_bytes = (address_cells + size_cells) * 4;
+
+    if (length <= 0 || entry_bytes <= 0 || (length % entry_bytes) != 0) {
+        return 0;
+    }
+
+    int count = 0;
+
+    for (int offset = 0; offset < length && count < capacity; offset += entry_bytes) {
+
+        const unsigned char *entry = raw + offset;
+
+        long long start = mem_be_value(entry, address_cells);
+        long long size = mem_be_value(entry + address_cells * 4, size_cells);
+
+        if (start < 0 || size <= 0) {
+            continue;
+        }
+
+        out[count].start = start;
+        out[count].size = size;
+        count++;
+    }
+
+    return count;
+}
+
+/**
+ * 设备树 reserved-memory 里"不可复用"的预留区，与 System RAM 求交后的并集大小。
+ *
+ * 只算 no-map / 普通 carveout：带 reusable 属性的（CMA、qdss 之类）允许内核回收，
+ * 算进去就不是硬件保留了。动态 size 的节点没有固定 reg，直接跳过。
+ *
+ * @param ram        /proc/iomem 的 System RAM 区间
+ * @param ram_count  区间数
+ * @param out_bytes  结果（字节）
+ * @return 0 = 成功；-1 = 没权限；-2 = 没有这个目录 / 解析不了
+ */
+static int mem_dt_reserved_bytes(const TmMemRange *ram, int ram_count,
+                                 long long *out_bytes)
+{
+    if (ram == NULL || ram_count <= 0 || out_bytes == NULL) {
+        return -2;
+    }
+
+    const char *base = "/sys/firmware/devicetree/base/reserved-memory";
+
+    DIR *dir = opendir(base);
+
+    if (dir == NULL) {
+        return (errno == EACCES) ? -1 : -2;
+    }
+
+    int address_cells = mem_dt_cell_count(
+        "/sys/firmware/devicetree/base/reserved-memory/#address-cells", 2);
+
+    int size_cells = mem_dt_cell_count(
+        "/sys/firmware/devicetree/base/reserved-memory/#size-cells", 2);
+
+    if (address_cells <= 0 || address_cells > 2 || size_cells <= 0 || size_cells > 2) {
+        closedir(dir);
+        return -2;
+    }
+
+    TmMemRange hits[TM_MEM_RANGE_MAX];
+    int hit_count = 0;
+
+    struct dirent *entry = NULL;
+
+    while ((entry = readdir(dir)) != NULL && hit_count < TM_MEM_RANGE_MAX) {
+
+        if (entry->d_name[0] == '.' || entry->d_name[0] == '#') {
+            continue;
+        }
+
+        char path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "%s/%s", base, entry->d_name);
+
+        struct stat info;
+
+        if (stat(path, &info) != 0 || !S_ISDIR(info.st_mode)) {
+            continue;
+        }
+
+        // reusable：内核能在约束满足时回收，不算永久保留
+        char flag_path[PATH_MAX];
+
+        snprintf(flag_path, sizeof(flag_path), "%s/reusable", path);
+
+        if (access(flag_path, F_OK) == 0) {
+            continue;
+        }
+
+        snprintf(flag_path, sizeof(flag_path), "%s/reg", path);
+
+        TmMemRange regions[8];
+
+        int region_count = mem_dt_reg(flag_path, address_cells, size_cells,
+                                      regions,
+                                      (int) (sizeof(regions) / sizeof(regions[0])));
+
+        for (int i = 0; i < region_count && hit_count < TM_MEM_RANGE_MAX; i++) {
+
+            hit_count += mem_append_clipped(hits, hit_count, TM_MEM_RANGE_MAX,
+                                            &regions[i], ram, ram_count);
+        }
+    }
+
+    closedir(dir);
+
+    *out_bytes = mem_union_size(hits, hit_count);
+
+    return 0;
+}
+
 /**
  * 填内存设备。一台机器一份 /proc/meminfo，所以只发第一台实例。
  *
@@ -8089,8 +9563,68 @@ static int build_memory_devices(TmOutDevice *out, int capacity,
 
     // 标称容量与规格都来自高通 Device Tree，读不到就整项不发：
     // 名称行那边会用 MemTotal 兜容量、少写规格，不会空着
-    device_put_int(&out[0], "nominal_bytes", read_dram_size_bytes(),
-                   TM_FIELD_STATUS_NOT_AVAILABLE);
+    long long nominal = read_dram_size_bytes();
+
+    device_put_int(&out[0], "nominal_bytes", nominal, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    // 为硬件保留的内存：标称容量与 MemTotal 的差额 —— 内核没有接管的那一截。
+    //
+    //   标称容量从 dt 来，MemTotal 是内核统计的总页数，两者之差包含固件 /
+    //   Hypervisor / 各子系统 carveout / 内核镜像自身与页表。
+    //   和 Windows 口径不完全等（那边把内核自身算"在用"），但这是 Android 上
+    //   能拿到的最接近的差异量，比拿 0 或者拿 CMA 总量冒充强得多。
+    //
+    // 数据互相矛盾（标称不超过 MemTotal）时不硬算，报"没有基准"，让上层显示不支持。
+    long long hardware_reserved = -1;
+    const char *hardware_reserved_status = TM_FIELD_STATUS_NOT_AVAILABLE;
+
+    if (nominal <= 0) {
+
+        // 非高通设备没有 ddr_size：物理容量根本不知道，属于"不支持"
+        hardware_reserved_status = TM_FIELD_STATUS_UNSUPPORTED;
+
+    } else if (total <= 0) {
+
+        hardware_reserved_status = TM_FIELD_STATUS_READ_FAILED;
+
+    } else if (nominal <= total) {
+
+        hardware_reserved_status = TM_FIELD_STATUS_NO_BASELINE;
+
+    } else {
+
+        hardware_reserved = nominal - total;
+    }
+
+    device_put_int(&out[0], "reserved_bytes", hardware_reserved,
+                   hardware_reserved_status);
+
+    // 交叉验证（只上调试页，页面不读这两项）：
+    //   system_ram_bytes —— /proc/iomem 里顶格 "System RAM" 的地址总量（并集）
+    //   reserved_dt_bytes —— 设备树不可复用预留区与上面这段求交之后的并集
+    // 差额口径与 carveout 口径本来就不相等，两份数摆在一起才好核对。
+    TmMemRange ram_ranges[TM_MEM_RANGE_MAX];
+
+    int ram_count = mem_collect_iomem("System RAM", false, ram_ranges, TM_MEM_RANGE_MAX);
+
+    long long system_ram = (ram_count > 0) ? mem_union_size(ram_ranges, ram_count) : -1;
+
+    device_put_int(&out[0], "system_ram_bytes", system_ram, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    long long dt_reserved = -1;
+    const char *dt_reserved_status = TM_FIELD_STATUS_UNSUPPORTED;
+
+    if (ram_count > 0) {
+
+        dt_reserved_status = TM_FIELD_STATUS_NOT_AVAILABLE;
+
+        if (mem_dt_reserved_bytes(ram_ranges, ram_count, &dt_reserved) == -1) {
+            dt_reserved = -1;
+            dt_reserved_status = TM_FIELD_STATUS_ACCESS_DENIED;
+        }
+    }
+
+    device_put_int(&out[0], "reserved_dt_bytes", dt_reserved, dt_reserved_status);
 
     char spec[32];
 
@@ -8159,18 +9693,22 @@ static void emit_device_block(const TmOutDevice *device)
 }
 
 // ============================================================
-// 显卡设备：Linux 通用采集
+// 显卡设备：按厂商取字段
 //
-// 枚举（enumerate_gpu_devices）只负责"这台机器有哪几张卡"，本节再去读能读到的数字。
-// 与网卡一样：这里只报事实，不替上层决定"显示哪一张"。
+// 枚举（enumerate_gpu_devices）定下"这台机器有哪几张卡、各是哪一家"，
+// 本节负责把每一格填上。结构是两层：
 //
-// 数据来源（每一项都能指到具体文件，页面上不猜）：
-//   <path>/gpu_busy_percentage                 高通 Adreno 的 3D 占用（形如 "12 %"）
-//   <path>/device/gpu_busy_percent             DRM 驱动导出的 3D 占用（amdgpu / i915）
-//   <path>/device/hwmon/hwmonN/temp1_input     显卡热区温度（毫摄氏度）
-//   /sys/class/thermal/thermal_zoneN/type      兜底：type 里带 gpu 的那一区
-//   <path>/device/mem_info_vram_total          专用显存总量（amdgpu）
-//   <path>/device/mem_info_vram_used           专用显存已用（amdgpu）
+//   填写函数（gpu_field_usage 这类）：只知道"要填哪一格"，不关心厂商；
+//   厂商读取函数（gpu_qualcomm_usage 这类）：知道具体文件在哪，读回来交给填写函数。
+//
+// 顺序一律是"厂商专用接口 -> 通用 DRM 接口 -> 发状态"：
+//   高通      gpu_busy_percentage / gpubusy / temp / gpu_model
+//   联发科    /sys/module/ged/parameters/gpu_loading、/sys/kernel/ged/hal/gpu_utilization
+//   Mali 系   devfreq 的 load（kbase / panfrost / panthor 都导出这一格）
+//   通用 DRM  device/gpu_busy_percent、device/mem_info_vram_*、device/mem_info_gtt_*
+//   温度      先 device/hwmon/hwmonN/temp1_input，再退回 type 里带 gpu 的热区
+//
+// 读不到就发 `!状态`（客户端折成 null，页面写"不支持 / -"），不拿 0 顶替。
 //
 // 图形 API（页面上"DirectX 版本"那一格换成它）：
 //   1) 先问 libvulkan 的 vkEnumerateInstanceVersion —— 这是真实版本号；
@@ -8513,10 +10051,390 @@ static void gpu_detect_gfx_api(bool *has_result, char *api, int api_size,
     snprintf(version, (size_t) version_size, "%s", cached_version);
 }
 
+/** 一格字段的读取结果：要么有数值，要么是一个状态（二者互斥）。 */
+typedef struct {
+    bool has;
+    long long number;
+    const char *status;
+} GpuField;
+
+static GpuField gpu_field_value(long long number)
+{
+    GpuField field;
+
+    memset(&field, 0, sizeof(field));
+
+    field.has = true;
+    field.number = number;
+
+    return field;
+}
+
+static GpuField gpu_field_missing(const char *status)
+{
+    GpuField field;
+
+    memset(&field, 0, sizeof(field));
+
+    field.status = status;
+
+    return field;
+}
+
+/** 一次性读两个整数（gpubusy 那种"忙碌 总计"的格式）。 */
+static bool gpu_read_two_ints(const char *path, long long *first, long long *second)
+{
+    char text[96];
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return false;
+    }
+
+    long long a = 0;
+
+    long long b = 0;
+
+    if (sscanf(text, "%lld %lld", &a, &b) != 2) {
+        return false;
+    }
+
+    *first = a;
+    *second = b;
+
+    return true;
+}
+
+/**
+ * devfreq 的 load 一格：Mali / panfrost / panthor 都走这个。
+ *
+ * 格式是 "22@300000000Hz"（占用百分比 @ 当前频率），也见过只写百分比的。
+ * 只取 @ 前面那个数，夹到 0..100。
+ */
+static bool gpu_devfreq_load(long long *percent)
+{
+    DIR *dir = opendir("/sys/class/devfreq");
+
+    if (dir == NULL) {
+        return false;
+    }
+
+    bool found = false;
+
+    struct dirent *entry;
+
+    while (!found && (entry = readdir(dir)) != NULL) {
+
+        bool looks_gpu = strstr(entry->d_name, "gpu") != NULL
+                         || strstr(entry->d_name, "mali") != NULL
+                         || strstr(entry->d_name, "pan") != NULL;
+
+        if (!looks_gpu) {
+            continue;
+        }
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/devfreq/%s/load", entry->d_name);
+
+        long long value = 0;
+
+        if (!gpu_read_first_int(path, &value)) {
+            continue;
+        }
+
+        if (value < 0) value = 0;
+
+        if (value > 100) value = 100;
+
+        *percent = value;
+
+        found = true;
+    }
+
+    closedir(dir);
+
+    return found;
+}
+
+/**
+ * 高通：GPU 利用率。
+ *
+ *   gpu_busy_percentage  直接给百分比（"37 %"），最省事，优先用；
+ *   gpubusy              给两个计数（忙碌 / 总计），自己算比例；
+ *   device/gpu_busy_percent  个别机型只留了 DRM 这一格。
+ *
+ * 一份数据三个来源，取第一个能读到的，绝不相加。
+ */
+static GpuField gpu_qualcomm_usage(const char *base)
+{
+    char path[TM_PATH_MAX];
+
+    long long percent = 0;
+
+    snprintf(path, sizeof(path), "%s/gpu_busy_percentage", base);
+
+    if (gpu_read_percent(path, &percent)) {
+        return gpu_field_value(percent);
+    }
+
+    long long busy = 0;
+
+    long long total = 0;
+
+    snprintf(path, sizeof(path), "%s/gpubusy", base);
+
+    if (gpu_read_two_ints(path, &busy, &total) && total > 0 && busy >= 0) {
+
+        long long ratio = busy * 100 / total;
+
+        if (ratio < 0) ratio = 0;
+
+        if (ratio > 100) ratio = 100;
+
+        return gpu_field_value(ratio);
+    }
+
+    snprintf(path, sizeof(path), "%s/device/gpu_busy_percent", base);
+
+    if (gpu_read_percent(path, &percent)) {
+        return gpu_field_value(percent);
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+}
+
+/** 联发科：GED 框架与它的 hal 节点。两处都试，先读到的算。 */
+static GpuField gpu_mediatek_usage(void)
+{
+    static const char *const paths[] = {
+        "/sys/module/ged/parameters/gpu_loading",
+        "/sys/kernel/ged/hal/gpu_utilization",
+        "/sys/kernel/ged/hal/loading_percentage"
+    };
+
+    long long percent = 0;
+
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+
+        if (gpu_read_percent(paths[i], &percent)) {
+            return gpu_field_value(percent);
+        }
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+}
+
+/** 通用 DRM（amdgpu / i915 / panfrost 等）：驱动自己导出的占用文件。 */
+static GpuField gpu_drm_usage(const char *base)
+{
+    char path[TM_PATH_MAX];
+
+    long long percent = 0;
+
+    snprintf(path, sizeof(path), "%s/device/gpu_busy_percent", base);
+
+    if (gpu_read_percent(path, &percent)) {
+        return gpu_field_value(percent);
+    }
+
+    snprintf(path, sizeof(path), "%s/gpu_busy_percent", base);
+
+    if (gpu_read_percent(path, &percent)) {
+        return gpu_field_value(percent);
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+}
+
+/**
+ * 填写函数：GPU 利用率。
+ *
+ * 顺序：本厂商的专用接口 -> devfreq（Mali 系）-> 通用 DRM -> 状态。
+ * 前两层对高通/联发科不适用它们自己的路径已经覆盖，这里只是兜底。
+ */
+static GpuField gpu_field_usage(const TmDeviceRef *device)
+{
+    GpuField field;
+
+    switch (device->vendor) {
+
+        case TM_GPU_VENDOR_QUALCOMM:
+
+            field = gpu_qualcomm_usage(device->path);
+
+            if (field.has) {
+                return field;
+            }
+
+            break;
+
+        case TM_GPU_VENDOR_MEDIATEK:
+
+            field = gpu_mediatek_usage();
+
+            if (field.has) {
+                return field;
+            }
+
+            break;
+
+        case TM_GPU_VENDOR_SAMSUNG:
+        case TM_GPU_VENDOR_GOOGLE:
+        case TM_GPU_VENDOR_ARM:
+        case TM_GPU_VENDOR_IMAGINATION:
+        default:
+
+            break;
+    }
+
+    long long percent = 0;
+
+    if (gpu_devfreq_load(&percent)) {
+        return gpu_field_value(percent);
+    }
+
+    return gpu_drm_usage(device->path);
+}
+
+/**
+ * 高通温度：kgsl 的 temp。
+ *
+ * 单位在不同内核版本上不一样（有的直接摄氏度，有的毫摄氏度），按量级猜：
+ * ≥200 当毫摄氏度。这是**猜测**，不是读到的元数据；猜错最多差一千倍，
+ * 但 200 度以上的手机 GPU 不存在，所以这条界线足够安全。
+ */
+static GpuField gpu_qualcomm_temperature(const char *base)
+{
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/temp", base);
+
+    long long raw = 0;
+
+    if (gpu_read_first_int(path, &raw)) {
+
+        long long celsius = (raw >= 200) ? (raw / 1000) : raw;
+
+        return gpu_field_value(celsius);
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+}
+
+/** 填写函数：GPU 温度（厂商专用 -> hwmon -> 热区 -> 状态）。 */
+static GpuField gpu_field_temperature(const TmDeviceRef *device)
+{
+    if (device->vendor == TM_GPU_VENDOR_QUALCOMM) {
+
+        GpuField field = gpu_qualcomm_temperature(device->path);
+
+        if (field.has) {
+            return field;
+        }
+    }
+
+    long long celsius = 0;
+
+    if (gpu_read_temperature(device->path, &celsius)) {
+        return gpu_field_value(celsius);
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+}
+
+/** 填写函数：专用显存总量 / 已用（amdgpu 这类有真 VRAM 的卡才有）。 */
+static GpuField gpu_field_dedicated(const TmDeviceRef *device, bool used)
+{
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/device/mem_info_vram_%s", device->path,
+             used ? "used" : "total");
+
+    long long bytes = 0;
+
+    if (gpu_read_first_int(path, &bytes) && bytes >= 0) {
+        return gpu_field_value(bytes);
+    }
+
+    // 手机上的集成 GPU（Adreno / Mali）没有独立显存，这一格就该空着，
+    // 不能拿系统内存或 KGSL 的 vmalloc 冒充
+    return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
+}
+
+/** 填写函数：共享显存（DRM 的 gtt 统计；手机上一般没有这一格）。 */
+static GpuField gpu_field_shared(const TmDeviceRef *device, bool used)
+{
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/device/mem_info_gtt_%s", device->path,
+             used ? "used" : "total");
+
+    long long bytes = 0;
+
+    if (gpu_read_first_int(path, &bytes) && bytes >= 0) {
+        return gpu_field_value(bytes);
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
+}
+
+/**
+ * 填写函数：内核驱动名与版本。
+ *
+ * 名字来自 <node>/device/driver 这条链接（mali / amdgpu / kgsl …），
+ * 版本来自 /sys/module/<驱动名>/version —— 只有导出 MODULE_VERSION 的驱动才有。
+ * 两者分开报：驱动名有、版本没有，是常见情况。
+ */
+static void gpu_field_driver(const TmDeviceRef *device, char *name, int name_size,
+                             char *version, int version_size)
+{
+    name[0] = '\0';
+    version[0] = '\0';
+
+    char link[TM_PATH_MAX];
+
+    snprintf(link, sizeof(link), "%s/device/driver", device->path);
+
+    gpu_link_name(link, name, name_size);
+
+    if (name[0] == '\0') {
+        return;
+    }
+
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "/sys/module/%s/version", name);
+
+    read_text_file(path, version, version_size);
+
+    trim_disk_text(version);
+}
+
+/** 整数字段落地：有值写数值，没值写状态。 */
+static void gpu_put_int_field(TmOutDevice *device, const char *key, GpuField field)
+{
+    if (field.has) {
+        device_put_int(device, key, field.number, TM_FIELD_STATUS_NOT_AVAILABLE);
+    } else {
+        device_put_value(device, key, query_value_none(query_status_of(field.status)));
+    }
+}
+
+/** 文本字段落地：有值写文本，没值写状态。 */
+static void gpu_put_text_field(TmOutDevice *device, const char *key,
+                               const char *text, const char *status)
+{
+    if (text != NULL && text[0] != '\0') {
+        device_put(device, key, text);
+    } else {
+        device_put_value(device, key, query_value_none(query_status_of(status)));
+    }
+}
+
 /**
  * 把显卡实例填进包。
  *
- * 每个实例发：name / gpu_usage / gpu_temp_c / dedicated_total_bytes /
+ * 每个实例发：name / node / gpu_usage / gpu_temp_c / dedicated_total_bytes /
  * dedicated_used_bytes / gfx_api / gfx_api_version。
  * 读不到的不发（页面按"不支持 / -"显示）。
  */
@@ -8548,60 +10466,52 @@ static int build_gpu_devices(TmOutDevice *out, int capacity,
 
         device_put(&out[i], "name", devices[i].name);
 
-        const char *base = devices[i].path;
+        // 这张卡是从哪个节点发现的：枚举时命中的 sysfs 目录原样发上去
+        // （/sys/class/kgsl/kgsl-3d0 、/sys/class/misc/mali0 、/sys/class/drm/card0 …）。
+        // 与磁盘的 node（块名 sda）一个作用：让上层与日志能分辨"这是哪一张卡"，
+        // 名字抓不到时也能拿它兜住，不至于两行都写「不支持」看不出区别。
+        device_put(&out[i], "node", devices[i].path);
 
-        char path[256];
+        // 厂商：客户端拿它决定"这张卡该按哪套接口去理解"，
+        // 也让人一眼看出这台机器上是哪家的 GPU（QUALCOMM / MEDIATEK / ARM …）
+        device_put(&out[i], "vendor", gpu_vendor_text(devices[i].vendor));
 
-        long long usage = 0;
+        gpu_put_int_field(&out[i], "gpu_usage", gpu_field_usage(&devices[i]));
 
-        bool has_usage = false;
+        gpu_put_int_field(&out[i], "gpu_temp_c", gpu_field_temperature(&devices[i]));
 
-        // Adreno 的占用率文件
-        snprintf(path, sizeof(path), "%s/gpu_busy_percentage", base);
+        gpu_put_int_field(&out[i], "dedicated_total_bytes",
+                          gpu_field_dedicated(&devices[i], false));
 
-        if (gpu_read_percent(path, &usage)) {
-            has_usage = true;
-        }
+        gpu_put_int_field(&out[i], "dedicated_used_bytes",
+                          gpu_field_dedicated(&devices[i], true));
 
-        // DRM 驱动（amdgpu / i915）的占用率文件
-        if (!has_usage) {
+        gpu_put_int_field(&out[i], "shared_total_bytes",
+                          gpu_field_shared(&devices[i], false));
 
-            snprintf(path, sizeof(path), "%s/device/gpu_busy_percent", base);
+        gpu_put_int_field(&out[i], "shared_used_bytes",
+                          gpu_field_shared(&devices[i], true));
 
-            if (gpu_read_percent(path, &usage)) {
-                has_usage = true;
-            }
-        }
+        // 驱动：名字（mali / amdgpu / kgsl）+ 版本（只有导出 MODULE_VERSION 的驱动才有）
+        char driver_name[64];
 
-        if (has_usage) {
-            device_put_int(&out[i], "gpu_usage", usage, TM_FIELD_STATUS_NOT_AVAILABLE);
-        }
+        char driver_version[64];
 
-        long long celsius = 0;
+        gpu_field_driver(&devices[i], driver_name, (int) sizeof(driver_name),
+                         driver_version, (int) sizeof(driver_version));
 
-        if (gpu_read_temperature(base, &celsius)) {
-            device_put_int(&out[i], "gpu_temp_c", celsius, TM_FIELD_STATUS_NOT_AVAILABLE);
-        }
+        gpu_put_text_field(&out[i], "driver_version", driver_version,
+                           TM_FIELD_STATUS_NOT_AVAILABLE);
 
-        long long dedicated_total = 0;
-
-        snprintf(path, sizeof(path), "%s/device/mem_info_vram_total", base);
-
-        if (gpu_read_first_int(path, &dedicated_total) && dedicated_total >= 0) {
-            device_put_int(&out[i], "dedicated_total_bytes", dedicated_total, TM_FIELD_STATUS_NOT_AVAILABLE);
-        }
-
-        long long dedicated_used = 0;
-
-        snprintf(path, sizeof(path), "%s/device/mem_info_vram_used", base);
-
-        if (gpu_read_first_int(path, &dedicated_used) && dedicated_used >= 0) {
-            device_put_int(&out[i], "dedicated_used_bytes", dedicated_used, TM_FIELD_STATUS_NOT_AVAILABLE);
-        }
+        // 驱动日期：Linux / Android 没有可靠的发布日期来源，
+        // 文件 mtime 只是 OTA 复制时间、内核版本日期也不是驱动日期，
+        // 所以这一格一律明确写"不支持"，不猜一个看起来像日期的值
+        device_put_value(&out[i], "driver_date",
+                         query_value_none(TM_QUERY_UNSUPPORTED));
 
         char location[64];
 
-        gpu_pci_location(base, location, (int) sizeof(location));
+        gpu_pci_location(devices[i].path, location, (int) sizeof(location));
 
         if (location[0] != '\0') {
             device_put(&out[i], "location", location);

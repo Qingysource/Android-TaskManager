@@ -55,6 +55,7 @@ package com.android.taskmanager
 
 import android.content.ClipData
 import android.content.Context
+import android.widget.Toast
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ScrollState
@@ -82,21 +83,29 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.setValue
 
 import androidx.compose.ui.Alignment
@@ -855,6 +864,46 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         manager.summaryActive = false
     }
 
+    /**
+     * 右上角菜单「复制图表」：把当前选中硬件的那份文本写进剪贴板。
+     *
+     * 文本由页面自己的 clipboardTextFor 现算 —— 与长按图表菜单里的「复制」同一份，
+     * 走的是同一个"当前设备"口径（CPU / 内存 / 磁盘 / WLAN / GPU 自动分发），
+     * MainActivity 不参与，也不需要它转发。
+     */
+    val copyCurrentChart: () -> Unit = {
+
+        val text = clipboardTextFor(
+            kind = selected,
+            snapshot = snapshot,
+            usageDecimals = usageDecimals,
+            disk = diskPageData?.disk,
+            network = selectedNetwork,
+            networkLabel = manager.networkDisplayName,
+            networkScale = selectedNetworkChart?.rangeText() ?: NETWORK_SCALE_TEXT,
+            gpu = gpuPageData?.gpu
+        )
+
+        val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+
+        clipboard?.setPrimaryClip(
+            ClipData.newPlainText("性能页图表", text)
+        )
+
+        Toast.makeText(context, "已复制当前图表", Toast.LENGTH_SHORT).show()
+    }
+
+    // 把这份复制函数挂到管理器上：菜单按钮现在画在宿主的页名行（搜索框那一排），
+    // 那里只负责发"复制"请求，真正的文本仍由本页现算，MainActivity 不碰剪贴板。
+    SideEffect {
+        manager.copyChartHandler = copyCurrentChart
+    }
+
+    // 页面离开组合时摘掉，免得宿主在别的页面点到空实现
+    DisposableEffect(manager) {
+        onDispose { manager.copyChartHandler = null }
+    }
+
     // 图形摘要视图：整页只剩这一页的头部（名称行 / 标签行）与图表，图表吃满其余高度。
     //
     // 谁让位：主界面的导航栏与标题栏由 MainPage 让出，浮窗的标题栏与页签由 OverlayPageFrame 让出；
@@ -923,6 +972,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 networkChart = selectedNetworkChart,
 
                 networkLabel = manager.networkDisplayName,
+
+
+
+
 
                 summary = true,
 
@@ -1052,6 +1105,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         networkLabel = manager.networkDisplayName,
 
+
+
+
+
                         modifier = Modifier.weight(4f)
                             .fillMaxHeight()
                     )
@@ -1101,6 +1158,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                         networkChart = selectedNetworkChart,
 
                         networkLabel = manager.networkDisplayName,
+
+
+
+
 
                         modifier = Modifier.weight(1f)
                             .fillMaxWidth()
@@ -1156,22 +1217,18 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 manager.summaryActive = true
             },
 
-            viewTargets = buildList {
-                add("CPU(P)" to { manager.selectKind("CPU") })
-                add("内存(M)" to { manager.selectKind("MEMORY") })
-                disks.forEachIndexed { index, _ ->
-                    // 菜单同样带块设备名，和左栏、标题行保持一致
-                    add(manager.diskTitle(index, disks[index].node) to { manager.selectDisk(index) })
-                }
-                // WLAN 跟着网卡实例走：一条网卡一项，一块都没有就没有这一项
-                networks.forEachIndexed { index, _ ->
-                    add(manager.networkTitle(index) to { manager.selectNetwork(index) })
-                }
-                // GPU 同样按实例列：GPU 0、GPU 1 …
-                gpus.forEachIndexed { index, _ ->
-                    add(manager.gpuTitle(index) to { manager.selectGpu(index) })
-                }
-            },
+            // 查看只列"设备类型"，不列实例：固定六格（CPU/内存、磁盘/网络、GPU/NPU），
+            // 点哪一类就切到那一类的第一个实例（磁盘 -> 磁盘 0，网络 -> 网卡 0，GPU -> GPU 0）。
+            // 这一类一台都没读到就置灰：点下去也没有具体设备可定位。
+            // NPU 目前底层还没有采集，先固定占位并置灰，等有数据源再把 enabled 打开。
+            viewTargets = listOf(
+                ChartViewTarget("CPU(P)") { manager.selectKind("CPU") },
+                ChartViewTarget("内存(M)") { manager.selectKind("MEMORY") },
+                ChartViewTarget("磁盘(D)", enabled = disks.isNotEmpty()) { manager.selectDisk(0) },
+                ChartViewTarget("网络(N)", enabled = networks.isNotEmpty()) { manager.selectNetwork(0) },
+                ChartViewTarget("GPU(G)", enabled = gpus.isNotEmpty()) { manager.selectGpu(0) },
+                ChartViewTarget("NPU", enabled = false) { }
+            ),
 
             // 复制内容按当前选中的硬件现算：CPU / 内存各有一整块
             copyText = clipboardTextFor(
@@ -1875,6 +1932,7 @@ private fun HardwareDetail(
     networkLabel: String = "WLAN",
     summary: Boolean = false,
     onSecondChartDoubleTap: () -> Unit = {},
+
     modifier: Modifier = Modifier
 ) {
 
@@ -2055,6 +2113,7 @@ private fun HardwareDetail(
 
                 overflow = TextOverflow.Ellipsis
             )
+
         }
 
         // 2) 图表标签行：左侧说明窗口长度，右侧标出 100% 的位置（图表最上面那条线）
@@ -2119,6 +2178,9 @@ private fun HardwareDetail(
 
             NetworkThroughputChart(
                 chart = networkChart ?: NetworkChartData.EMPTY,
+
+                // 长按弹页面菜单：WLAN 这张图此前只接了双击，长按什么都不出
+                onLongPress = onChartLongPress,
 
                 onDoubleTap = onChartDoubleTap,
 
@@ -3317,6 +3379,7 @@ private fun NetworkStatCell(
 private fun NetworkThroughputChart(
     chart: NetworkChartData,
     onDoubleTap: () -> Unit,
+    onLongPress: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
 
@@ -3327,9 +3390,13 @@ private fun NetworkThroughputChart(
     val receiveColor = MaterialTheme.colorScheme.primary
     val sendColor = MaterialTheme.colorScheme.error
 
-    // 只有双击（这张图上没有长按菜单：菜单里的两项都是 CPU 主图的口径）
+    // 双击进摘要；长按与其它图表一样弹页面菜单（复制 / 资源监视器）
     val gesture = Modifier.pointerInput(Unit) {
-        detectTapGestures(onDoubleTap = { onDoubleTap() })
+        detectTapGestures(
+            onDoubleTap = { onDoubleTap() },
+
+            onLongPress = { onLongPress() }
+        )
     }
 
     Box(modifier = modifier.then(gesture)) {
@@ -4008,11 +4075,12 @@ private fun LogicalCoresChart(
  * 1) 内核图形口径：选得中、记得住；【逻辑处理器】那条曲线要等逐核数据接到 UI 才真画出来；
  * 2) 显示内核时间：状态留着，画法待定（内核时间还没采集）；
  * 3) 图形摘要视图：整页只剩图表（内存页还会带上「内存组合」分条图），双击图表退出；
- * 4) 查看：只列出 CPU / 内存两个目标，点哪个都先关菜单什么也不做 —— 切页接口还没接；
+ * 4) 查看：固定六格（CPU/内存、磁盘/网络、GPU/NPU），点哪一格就把本页切到那一类的
+ *    第一个实例（磁盘 -> 磁盘 0）；这一类没有实例时该项置灰，NPU 暂无采集也置灰；
  * 5) 复制：把当前硬件的复制文本写进系统剪贴板。CPU 走 [cpuClipboardText]，
  *    内存走 [memoryClipboardText]。
  *
- * 磁盘 / WLAN / GPU 的入口与它们的菜单项、占位复制文本已整体删除，重新设计时再加回。
+ * 磁盘 / WLAN / GPU 的入口按"类型 + 第一个实例"回到了查看列表；复制文本仍只做 CPU / 内存。
  *
  * 为什么内存页不摆 1) 和 2)：内存既没有总体利用率 / 逻辑处理器这两个口径，
  * 也没有内核时间这一说，摆上去只会在点的时候毫无反应。
@@ -4026,7 +4094,7 @@ private fun PerformanceChartDialog(
     onKernelGraphModeChange: (String) -> Unit,
     onShowKernelTimeChange: (Boolean) -> Unit,
     onEnterSummary: () -> Unit,
-    viewTargets: List<Pair<String, () -> Unit>>,
+    viewTargets: List<ChartViewTarget>,
     copyText: String,
     onDismiss: () -> Unit
 ) {
@@ -4089,18 +4157,22 @@ private fun PerformanceChartDialog(
 
             if (viewExpanded) {
 
-                // 一行两列：CPU / 内存固定两项，磁盘有几台就有几项（没有就一项都不出现）。
-                // 点一项是真的切过去，不是只关菜单。
+                // 一行两列、固定三行：CPU/内存、磁盘/网络、GPU/NPU。
+                // 点一项是真的切过去（切到该类第一个实例），不是只关菜单。
                 viewTargets.chunked(2).forEach { pair ->
 
                     Row(
                         modifier = Modifier.fillMaxWidth()
                     ) {
 
-                        pair.forEach { (label, select) ->
+                        pair.forEach { target ->
 
-                            ChartMenuTarget(label, Modifier.weight(1f)) {
-                                select()
+                            ChartMenuTarget(
+                                label = target.label,
+                                modifier = Modifier.weight(1f),
+                                enabled = target.enabled
+                            ) {
+                                target.select()
                                 onDismiss()
                             }
                         }
@@ -4267,22 +4339,30 @@ private fun ChartMenuRow(
     }
 }
 
+/** 查看列表里的一项：标签 + 能不能点（这一类一个实例都没读到时置灰）；[select] 切到该类的第一个实例。 */
+private data class ChartViewTarget(
+    val label: String,
+    val enabled: Boolean = true,
+    val select: () -> Unit
+)
+
 /**
- * 查看展开后的一个目标。
+ * 查看展开后的一个目标（CPU / 内存 / 磁盘 / 网络 / GPU / NPU 之一）。
  *
- * 这一版**故意什么都不做**：六个页面还没全部写好，先让菜单能把选项列出来；
- * 以后在这里接 UIService.setActivePage，或直接改本页的选中硬件。
+ * 点它只把本页的选中设备切成那一类的第一个实例，不跳别的页面，所以不需要"切页接口"。
+ * [enabled] = false 的项不响应点击，文字压暗，表示这一类当前没有设备可切。
  */
 @Composable
 private fun ChartMenuTarget(
     label: String,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
 
     Row(
         modifier = modifier
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(start = 20.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
 
         verticalAlignment = Alignment.CenterVertically
@@ -4293,7 +4373,11 @@ private fun ChartMenuTarget(
 
             style = MaterialTheme.typography.bodySmall,
 
-            color = MaterialTheme.colorScheme.onSurface,
+            color = if (enabled) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+            },
 
             maxLines = 1,
 
@@ -4317,4 +4401,67 @@ private fun copyChartMenuText(context: Context, text: String) {
     }
 
     clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
+}
+
+
+/**
+ * 性能页右上角的溢出菜单（DropdownMenu，点按钮从按钮下方展开）。
+ *
+ * 两项之间一条分隔线：
+ *   复制图表 —— 调页面自己的复制函数，把当前选中设备那份文本写进剪贴板；
+ *   资源监视器 —— 管理器里只有空接口，Android 目前没有这个系统组件，点了不做事。
+ *
+ * 为什么由宿主（MainActivity）画：它的位置是页名行、搜索框那一排的最右端，
+ * 性能页没有搜索框，那一行的右半段正好空着，菜单放那里才和别的页对齐；
+ * 宿主只决定按钮在哪，复制与资源监视器都由性能页管理器转发，逻辑不在这边。
+ */
+@Composable
+internal fun PerformanceOverflowMenu(
+    onCopyChart: () -> Unit,
+    onOpenResourceMonitor: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+
+    var expanded by remember { mutableStateOf(false) }
+
+    Box(modifier = modifier) {
+
+        IconButton(
+            onClick = { expanded = true }
+        ) {
+
+            Icon(
+                imageVector = Icons.Default.MoreVert,
+
+                contentDescription = "性能页菜单"
+            )
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+
+            onDismissRequest = { expanded = false }
+        ) {
+
+            DropdownMenuItem(
+                text = { Text("复制图表") },
+
+                onClick = {
+                    expanded = false
+                    onCopyChart()
+                }
+            )
+
+            HorizontalDivider()
+
+            DropdownMenuItem(
+                text = { Text("资源监视器") },
+
+                onClick = {
+                    expanded = false
+                    onOpenResourceMonitor()
+                }
+            )
+        }
+    }
 }
