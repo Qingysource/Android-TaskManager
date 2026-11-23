@@ -51,6 +51,16 @@ data class PerformanceSnapshot(
     /** 基准（最大）频率（MHz），和"当前频率"是两件事。 */
     val cpuBaseMhz: Int? = null,
 
+    /**
+     * CPU 温度（℃，整数）：底层把 /sys/class/thermal 里 type 含 cpu 的热区求了平均。
+     *
+     * null 有两种源因，页面对这两种都不显示这一项（不写「-」也不写「不支持」）：
+     *   1) 这台机器没导出 CPU 热区（平台不支持）；
+     *   2) 有热区但一个都读不出来（没权限）。
+     * 换句话说，这一格是"有才出现"，不是"没有也要占位"。
+     */
+    val cpuTemperatureC: Int? = null,
+
     /** 处理器商品名（人看得懂的名字）。由 ELF 侧补实现，现在通常是 null。 */
     val cpuName: String? = null,
 
@@ -206,6 +216,16 @@ data class PerformanceSnapshot(
     /** 基准速度。 */
     fun cpuBaseText(): String = speedText(cpuBaseMhz)
 
+    /**
+     * CPU 温度文案（`45 °C`）。
+     *
+     * 返回 null = 这一项整块不出现（没热区 / 没权限都算）。与 GPU 温度不同：
+     * 那边"读不到"还要占一格写「不支持」（Windows 也是这么摆的），
+     * CPU 页这里按约定"有才加一项"，没有就连标签都不画。
+     */
+    fun cpuTemperatureText(): String? = cpuTemperatureC?.let { "$it °C" }
+
+
     /** 一级缓存按 KB 显示。 */
     fun l1Text(): String = cacheText(l1CacheKb, l1CacheStatus) { "$it KB" }
 
@@ -344,6 +364,11 @@ data class PerformanceSnapshot(
                 cpuSpeedMhz = cpuFields.intOf("speed_mhz") ?: cpuFields.intOf("cpu_speed_mhz"),
 
                 cpuBaseMhz = cpuFields.intOf("base_mhz") ?: cpuFields.intOf("cpu_base_mhz"),
+
+                // 温度底层是一位小数的浮点（热区平均），这里四舍五入成整数：
+                // CPU 页的统计格全部是整数值，温度也跟同一套字号/写法走。
+                // 没有这一格（!状态 或老后端根本不发）就留 null，页面整项不出现。
+                cpuTemperatureC = cpuFields.floatOf("cpu_temp_c")?.let { Math.round(it) },
 
                 cpuName = cpuFields.textValueOf("name") ?: cpuFields.textValueOf("cpu_name"),
 

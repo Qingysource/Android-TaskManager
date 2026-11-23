@@ -29,6 +29,10 @@
  * - 每行的身份是 ProcessRow.pid（独立的行标识字段），不是表格里的文字；
  * - 选中 / 长按 / 排序去重 / 状态条显示，全部用它，所以隐藏「PID」列照样能定位进程。
  *
+ * 最前面那一列是"进程图标列"（[DETAIL_ICON_COLUMN_WIDTH]）：
+ * - 它不属于列定义、不出现在「选择列」里、不参与排序，固定在所有列的最左边；
+ * - 表头对应那一格留空，数据行的格子画一个定尺空槽，等图标来源接进来再往里画。
+ *
  * 预留实现接口（将来接真数据时要动的地方）：
  * - 数据源接入后不需要改本页：UIService 的 refreshDetailRows() 调 replaceProcessRows() 即可，
  *   本页照样按 refreshIntervalMs 拿快照；
@@ -42,6 +46,7 @@
 package com.android.taskmanager
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -58,10 +63,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 
 import androidx.compose.material3.AlertDialog
@@ -85,6 +92,7 @@ import androidx.compose.runtime.setValue
 
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -113,6 +121,18 @@ private const val DETAIL_IDLE_POLL_MS = 800L
 
 /** 搜索框在本页登记用的页名（与 MainActivity 的标题文案一致）。 */
 private const val SEARCH_PAGE_DETAIL = "详细信息"
+
+/**
+ * 表格最前面给进程图标留出的列宽。
+ *
+ * 这一列不在 [DetailColumn] 里，也就不参与排序、不受「选择列」勾选影响：
+ * 它跟着表格一起横向滚动，位置永远在所有列的最左边（也就是名称列之前）。
+ * 列宽固定，所以加它之后每一列的 x 起点整体右移这一段，行与表头仍然逐列对齐。
+ */
+private val DETAIL_ICON_COLUMN_WIDTH = 32.dp
+
+/** 图标槽本身的边长（留白由列宽与居中分担）。 */
+private val DETAIL_ICON_SIZE = 20.dp
 
 /** 该进程是否匹配搜索关键字：名称 / 包名（发布者）/ PID 三个口径，忽略大小写。 */
 private fun processMatchesQuery(row: ProcessRow, query: String): Boolean {
@@ -1143,9 +1163,12 @@ private fun DetailHeaderRow(
     val density = LocalDensity.current
 
     // 每一列在表头里的像素区间 [start, end)
+    // 起点从图标列右边算起：点在图标列上换算出来的 index 是 -1，不会误触发排序。
+    val iconColumnWidthPx = with(density) { DETAIL_ICON_COLUMN_WIDTH.toPx() }
+
     val columnSpansPx = remember(table.columns, density) {
 
-        var accumulated = 0f
+        var accumulated = iconColumnWidthPx
 
         table.columns.map { column ->
 
@@ -1184,6 +1207,14 @@ private fun DetailHeaderRow(
                 )
             }
     ) {
+
+        // 图标列的表头：留空。这一列没有标题，也不参与排序，
+        // 只用来跟下面每一行的图标槽对齐（宽度和行里的那一格完全一致）。
+        Box(
+            modifier = Modifier
+                .width(DETAIL_ICON_COLUMN_WIDTH)
+                .padding(vertical = 10.dp)
+        )
 
         table.columns.forEach { column ->
 
@@ -1265,6 +1296,20 @@ private fun DetailDataRow(
             }
     ) {
 
+        // 图标列：在名称（以及所有列）之前的第一个格子。
+        // 现在还没有"进程图标"的来源（ProcessRow 里没有图标字段，后端快照也不发），
+        // 所以这里只画一个定尺空槽；图标接进来时画在槽里，列宽不用再改。
+        Box(
+            modifier = Modifier
+                .width(DETAIL_ICON_COLUMN_WIDTH)
+                .padding(vertical = 8.dp),
+
+            contentAlignment = Alignment.Center
+        ) {
+
+            DetailProcessIconSlot(selected = isSelected)
+        }
+
         table.columns.forEach { column ->
 
             val text = row.values[column.id].orEmpty()
@@ -1292,6 +1337,35 @@ private fun DetailDataRow(
             }
         }
     }
+}
+
+/**
+ * 进程图标的预留槽。
+ *
+ * 定尺 [DETAIL_ICON_SIZE]，外面一圈细边框：既能看出"这里留给图标"，
+ * 又不会因为没图而塌成 0 宽（那样行高会跟着变，表格会抖）。
+ * 选中行时边框换主色，跟整行的高亮一起看。
+ */
+@Composable
+private fun DetailProcessIconSlot(selected: Boolean) {
+
+    val outline = if (selected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.outlineVariant
+    }
+
+    Box(
+        modifier = Modifier
+            .size(DETAIL_ICON_SIZE)
+            .clip(RoundedCornerShape(4.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(
+                width = 1.dp,
+                color = outline,
+                shape = RoundedCornerShape(4.dp)
+            )
+    )
 }
 
 /**
