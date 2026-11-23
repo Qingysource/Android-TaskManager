@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -57,6 +58,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -83,6 +85,75 @@ import com.android.taskmanager.manager.PageManagers
 // 图形摘要视图的开关不在本文件：它是性能页的页面状态，由性能页管理器持有
 // （manager/PerformanceManager.kt 的 summaryActive）。本文件只读它来决定
 // 导航栏 / 页名行 / 顶栏让不让位，写它的是性能页自己（双击进入、双击退出）。
+
+// ============================================================
+// Performance Overflow Menu
+// ============================================================
+
+/**
+ * 性能页右上角的溢出菜单（DropdownMenu，点按钮从按钮下方展开）。
+ *
+ * 两项之间一条分隔线：
+ *   复制图表 —— 调页面自己的复制函数，把当前选中设备那份文本写进剪贴板；
+ *   资源监视器 —— 管理器里只有空接口，Android 目前没有这个系统组件，点了不做事。
+ *
+ * 为什么写在宿主而不是性能页：按钮位置本来就是宿主定的（页名行 / 顶栏的最右端），
+ * 复制与资源监视器都由性能页管理器转发，页面侧不再留第二份实现。
+ *
+ * 图标本身是竖排三点，旋转 90° 变成横排三点，和顶栏其它动作的视觉方向一致。
+ */
+@Composable
+private fun PerformanceOverflowMenu(
+    onCopyChart: () -> Unit,
+    onOpenResourceMonitor: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+
+    var expanded by remember { mutableStateOf(false) }
+
+    Box(modifier = modifier) {
+
+        IconButton(
+            onClick = { expanded = true }
+        ) {
+
+            Icon(
+                imageVector = Icons.Default.MoreVert,
+
+                contentDescription = "性能页菜单",
+
+                modifier = Modifier.rotate(90f)
+            )
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+
+            onDismissRequest = { expanded = false }
+        ) {
+
+            DropdownMenuItem(
+                text = { Text("复制图表") },
+
+                onClick = {
+                    expanded = false
+                    onCopyChart()
+                }
+            )
+
+            HorizontalDivider()
+
+            DropdownMenuItem(
+                text = { Text("资源监视器") },
+
+                onClick = {
+                    expanded = false
+                    onOpenResourceMonitor()
+                }
+            )
+        }
+    }
+}
 
 // ============================================================
 // Activity Entry

@@ -721,6 +721,41 @@ fun DebugScreen() {
             modifier = Modifier.height(8.dp)
         )
 
+        // 显示所有网卡：临时摘掉性能页的注册规则，把底层报上来的每一块都放出来。
+        // 开关存在性能页管理器里（进程级单例），所以离开本页、切横竖屏都还在；
+        // 刻意不落盘 —— 应用重启就恢复常规筛选，这就是调试开关该有的样子。
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+
+            Checkbox(
+                checked = PageManagers.performance(context).debugShowAllNetworks,
+
+                onCheckedChange = { checked ->
+                    PageManagers.performance(context).applyDebugShowAllNetworks(checked)
+                }
+            )
+
+            Text(
+                text = "显示所有网卡设备（忽略注册规则）",
+                style = MaterialTheme.typography.bodyMedium
+            )
+        }
+
+        Text(
+            text = "勾上后，底层快照里的每一块网卡都会注册成性能页设备：p2p0、" +
+                "没连网的 wlan0、只挂着 fe80:: 的 rmnet、VPN 的 tun0 等平时被隐藏的都会出现。" +
+                "它们照样没有数据（明细写「不支持」、速率 0）。开关只在本次运行有效，重启应用即恢复。" +
+                "底层没采集到的设备（如回环 lo）不会因为勾选而出现。",
+            style = MaterialTheme.typography.bodySmall,
+
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(
+            modifier = Modifier.height(8.dp)
+        )
+
         // 注入数量：管理器里记着，这里只是按钮按下后显示一份，免得还要等一次重组
         var debugDeviceState by remember {
             mutableStateOf(PageManagers.performance(context).debugDeviceText())

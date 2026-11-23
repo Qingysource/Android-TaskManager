@@ -5180,6 +5180,25 @@ static bool cpu_name_is_usable(const char *text)
 }
 
 /**
+ * text 是否以 prefix 开头（忽略大小写），prefix 的有效长度是 prefix_length。
+ */
+static bool text_prefix_ignore_case(const char *text, const char *prefix, size_t prefix_length)
+{
+    for (size_t index = 0; index < prefix_length; index++) {
+
+        if (text[index] == '\0') {
+            return false;
+        }
+
+        if (tolower((unsigned char) text[index]) != tolower((unsigned char) prefix[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
  * 在 CPUNAME.txt 里按型号查商品名。
  *
  * 文件格式（UTF-8，一型号一行）：
@@ -5188,6 +5207,13 @@ static bool cpu_name_is_usable(const char *text)
  *   sm8635 Qualcomm(R) Snapdragon(R) 8s Gen 3
  * 约定：# 开头是注释，空行忽略，型号不分大小写，
  * 第一个空格之后的整段（含空格）都是展示名。
+ *
+ * 匹配分两档，整词优先：
+ *   1) 整词相等：型号完全对得上，最高优先级；
+ *   2) 前缀命中：型号后面还挂着变体尾巴（字母 / 斜杠 / 连字符 / 下划线），
+ *      取库里最长的那个前缀。联发科的变体写法（MT6833V/NZA、MT6877V/TTZA、
+ *      MT6899Z/ZA）就靠这一档吃下来。数字尾巴不算变体，免得 MT6833 吃掉
+ *      一个并不存在的 MT6833x。
  *
  * @param model     要查的型号，例如 SM8635
  * @param out       查到的展示名（调用方给的缓冲）
@@ -5201,6 +5227,15 @@ static bool cpu_name_database_lookup(const char *model, char *out, size_t capaci
     if (g_cpu_name_database_count == 0 || model == NULL || model[0] == '\0') {
         return false;
     }
+
+    size_t model_length = strlen(model);
+
+    // 前缀命中只是兜底，整词命中要压过它：先扫完所有库文件，
+    // 前缀只记最长的那个，整词命中当场定格。
+    size_t best_prefix_length = 0;
+    char best_name[256];
+
+    best_name[0] = '\0';
 
     for (int file_index = 0; file_index < g_cpu_name_database_count; file_index++) {
 
@@ -5217,73 +5252,96 @@ static bool cpu_name_database_lookup(const char *model, char *out, size_t capaci
         }
 
         char line[512];
-        bool found = false;
+        bool exact = false;
 
-        while (!found && fgets(line, sizeof(line), file) != NULL) {
+        while (!exact && fgets(line, sizeof(line), file) != NULL) {
 
-        size_t length = strlen(line);
+            size_t length = strlen(line);
 
-        while (length > 0) {
+            while (length > 0) {
 
-            char tail = line[length - 1];
+                char tail = line[length - 1];
 
-            if (tail != '\n' && tail != '\r') {
-                break;
+                if (tail != '\n' && tail != '\r') {
+                    break;
+                }
+
+                line[--length] = '\0';
             }
 
-            line[--length] = '\0';
-        }
+            char *cursor = line;
 
-        char *cursor = line;
+            while (*cursor == ' ' || *cursor == '\t') {
+                cursor++;
+            }
 
-        while (*cursor == ' ' || *cursor == '\t') {
-            cursor++;
-        }
+            if (*cursor == '\0' || *cursor == '#') {
+                continue;
+            }
 
-        if (*cursor == '\0' || *cursor == '#') {
-            continue;
-        }
+            // 第一段是型号
+            char *token_start = cursor;
 
-        // 第一段是型号
-        char *token_start = cursor;
+            while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+                cursor++;
+            }
 
-        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
-            cursor++;
-        }
+            char token[64];
+            size_t token_length = (size_t) (cursor - token_start);
 
-        char token[64];
-        size_t token_length = (size_t) (cursor - token_start);
+            if (token_length == 0 || token_length >= sizeof(token)) {
+                continue;
+            }
 
-        if (token_length == 0 || token_length >= sizeof(token)) {
-            continue;
-        }
+            memcpy(token, token_start, token_length);
 
-        memcpy(token, token_start, token_length);
+            token[token_length] = '\0';
 
-        token[token_length] = '\0';
+            while (*cursor == ' ' || *cursor == '\t') {
+                cursor++;
+            }
 
-        if (!text_equal_ignore_case(token, model)) {
-            continue;
-        }
+            if (*cursor == '\0') {
+                continue;
+            }
 
-        while (*cursor == ' ' || *cursor == '\t') {
-            cursor++;
-        }
+            if (text_equal_ignore_case(token, model)) {
 
-        if (*cursor == '\0') {
-            continue;
-        }
+                snprintf(best_name, sizeof(best_name), "%s", cursor);
 
-        snprintf(out, capacity, "%s", cursor);
+                exact = true;
 
-        found = true;
+                continue;
+            }
+
+            // 变体尾巴的判定：库里的型号得比要查的短、至少 4 个字符、
+            // 要查的型号在分界那一位不是数字，再比前缀，取最长的
+            if (token_length >= 4 && token_length < model_length
+                && !isdigit((unsigned char) model[token_length])
+                && token_length > best_prefix_length
+                && text_prefix_ignore_case(model, token, token_length)) {
+
+                best_prefix_length = token_length;
+
+                snprintf(best_name, sizeof(best_name), "%s", cursor);
+            }
         }
 
         fclose(file);
 
-        if (found) {
+        if (exact) {
+
+            snprintf(out, capacity, "%s", best_name);
+
             return true;
         }
+    }
+
+    if (best_prefix_length > 0) {
+
+        snprintf(out, capacity, "%s", best_name);
+
+        return true;
     }
 
     return false;
@@ -6665,9 +6723,42 @@ static bool net_signal_percent(const char *iface, const TmNetLink *link, double 
     return true;
 }
 
-/** 接口的 IPv4 / IPv6 各取第一个（getifaddrs 不需要 root，比跑 ip 命令稳）。 */
-static void net_read_addresses(const char *iface, char *ipv4, int ipv4_capacity,
-                               char *ipv6, int ipv6_capacity)
+/** IPv6 地址是不是只在本链路有效（链路本地 fe80::/10 与回环 ::1）：这类不算"能用"。 */
+static bool net_ipv6_is_local_only(const struct in6_addr *address)
+{
+    if (address == NULL) {
+        return false;
+    }
+
+    // 回环 ::1 —— 前 15 个字节全 0，最后一个字节是 1
+    bool loopback = true;
+
+    for (int i = 0; i < 15; i++) {
+
+        if (address->s6_addr[i] != 0) {
+            loopback = false;
+            break;
+        }
+    }
+
+    if (loopback) {
+        return address->s6_addr[15] == 1;
+    }
+
+    // 链路本地 fe80::/10：首字节 0xfe，次字节高两位置 10
+    return address->s6_addr[0] == 0xfe && (address->s6_addr[1] & 0xc0) == 0x80;
+}
+
+/**
+ * 接口的 IPv4 / IPv6 各取第一个（getifaddrs 不需要 root，比跑 ip 命令稳）。
+ *
+ * 顺便回答"这条链路有没有真正在用的地址"，作为事实往上报：
+ * IPv4 拿到就算有；IPv6 要看是不是链路本地 —— 手机的 rmnet 接口只要 up 就会分到
+ * fe80::，那只能说明"接口起来了"，不代表在传数据。
+ * 返回值三态：0 = 没有、1 = 有、-1 = getifaddrs 读失败（读失败不能当成"没有"）。
+ */
+static int net_read_addresses(const char *iface, char *ipv4, int ipv4_capacity,
+                              char *ipv6, int ipv6_capacity)
 {
     ipv4[0] = '\0';
     ipv6[0] = '\0';
@@ -6675,8 +6766,10 @@ static void net_read_addresses(const char *iface, char *ipv4, int ipv4_capacity,
     struct ifaddrs *list = NULL;
 
     if (getifaddrs(&list) != 0) {
-        return;
+        return -1;
     }
+
+    int has_data_address = 0;
 
     for (struct ifaddrs *item = list; item != NULL; item = item->ifa_next) {
 
@@ -6688,19 +6781,34 @@ static void net_read_addresses(const char *iface, char *ipv4, int ipv4_capacity,
             continue;
         }
 
-        if (item->ifa_addr->sa_family == AF_INET && ipv4[0] == '\0') {
+        if (item->ifa_addr->sa_family == AF_INET) {
 
-            inet_ntop(AF_INET, &((struct sockaddr_in *) item->ifa_addr)->sin_addr,
-                      ipv4, (size_t) ipv4_capacity);
+            has_data_address = 1;
 
-        } else if (item->ifa_addr->sa_family == AF_INET6 && ipv6[0] == '\0') {
+            if (ipv4[0] == '\0') {
 
-            inet_ntop(AF_INET6, &((struct sockaddr_in6 *) item->ifa_addr)->sin6_addr,
-                      ipv6, (size_t) ipv6_capacity);
+                inet_ntop(AF_INET, &((struct sockaddr_in *) item->ifa_addr)->sin_addr,
+                          ipv4, (size_t) ipv4_capacity);
+            }
+
+        } else if (item->ifa_addr->sa_family == AF_INET6) {
+
+            struct sockaddr_in6 *address6 = (struct sockaddr_in6 *) item->ifa_addr;
+
+            if (!net_ipv6_is_local_only(&address6->sin6_addr)) {
+                has_data_address = 1;
+            }
+
+            if (ipv6[0] == '\0') {
+
+                inet_ntop(AF_INET6, &address6->sin6_addr, ipv6, (size_t) ipv6_capacity);
+            }
         }
     }
 
     freeifaddrs(list);
+
+    return has_data_address;
 }
 
 /** 按接口名找（或占）一格采样槽。 */
@@ -6804,6 +6912,8 @@ static bool net_measure_rate(const char *iface_path, const char *iface,
  *   ssid           无线 SSID（没连上 / 读不到就不发）
  *   link_type      无线代际（802.11ax / 802.11ac …，同上）
  *   ipv4 / ipv6    地址各取第一个
+ *   has_data_address 这条链路有没有"真在用"的地址（0/1；非链路本地才算，手机网络用它在
+ *                  上层筛掉一堆只有 fe80:: 的 rmnet 空壳；读失败就不发这一格）
  *   signal_percent 信号强度百分比（没连上不发）
  *   freq_mhz       当前频段（没连上不发）
  *   receive_bytes_per_sec / send_bytes_per_sec  收发速率（首帧 NO_BASELINE）
@@ -6868,7 +6978,8 @@ static int build_network_devices(TmOutDevice *out, int capacity,
         char ipv4[64];
         char ipv6[96];
 
-        net_read_addresses(devices[i].name, ipv4, (int) sizeof(ipv4), ipv6, (int) sizeof(ipv6));
+        int has_data_address = net_read_addresses(devices[i].name, ipv4, (int) sizeof(ipv4),
+                                                  ipv6, (int) sizeof(ipv6));
 
         if (ipv4[0] != '\0') {
             device_put(&out[i], "ipv4", ipv4);
@@ -6876,6 +6987,14 @@ static int build_network_devices(TmOutDevice *out, int capacity,
 
         if (ipv6[0] != '\0') {
             device_put(&out[i], "ipv6", ipv6);
+        }
+
+        // "这条链路是不是真在用"：手机网络有一大串已 up 的 rmnetXX 只挂着 fe80::，
+        // 上层拿这一格筛空壳，别让它们占左栏。读失败（-1）就不发，交给上层按地址推断。
+        if (has_data_address >= 0) {
+
+            device_put_value(&out[i], "has_data_address",
+                             query_value_int(has_data_address ? 1 : 0, TM_QUERY_NOT_AVAILABLE));
         }
 
         // 无线三项：只有无线接口才有意义（有线 / 移动网络不去跑 iw）
@@ -9913,142 +10032,115 @@ static bool gpu_read_temperature(const char *device_path, long long *celsius)
 typedef unsigned int (*gpu_vulkan_version_fn)(unsigned int *);
 
 /**
- * 探测图形 API。
+ * 探测图形 API：Vulkan 与 OpenGL ES **各查各的**，谁有报谁。
  *
- * @param has_result 是否真的查过（false = 连查都没查成，页面写"-"）
- * @param api        输出 VULKAN / OPENGL / NONE
- * @param version    输出 1.1 / 3.2 这类版本串；NONE 时为空
+ * 以前是二选一（查到 Vulkan 就不再看 OpenGL），但两者并不互斥：手机上基本同时支持
+ * （ro.opengles.version 一直都在），页面就该两行都摆出来。所以这里把结果拆成两份，
+ * 由调用方各自决定摆哪一行。
+ *
+ * @param has_result     是否真的查过（false = 一条都没查成，页面写"-"）
+ * @param has_vulkan     Vulkan 可用
+ * @param vulkan_version 形如 1.1
+ * @param has_opengl     OpenGL ES 可用
+ * @param opengl_version 形如 3.2
  *
  * 结果在进程内只算一次：这个值跟硬件走，不会中途变化。
  */
-static void gpu_detect_gfx_api(bool *has_result, char *api, int api_size,
-                               char *version, int version_size)
+static void gpu_detect_gfx_api(bool *has_result,
+                               bool *has_vulkan, char *vulkan_version, int vulkan_size,
+                               bool *has_opengl, char *opengl_version, int opengl_size)
 {
     static bool cached = false;
 
     static bool cached_has_result = false;
 
-    static char cached_api[16] = {0};
+    static bool cached_has_vulkan = false;
 
-    static char cached_version[24] = {0};
+    static char cached_vulkan[24] = {0};
 
-    if (cached) {
+    static bool cached_has_opengl = false;
 
-        *has_result = cached_has_result;
+    static char cached_opengl[24] = {0};
 
-        snprintf(api, (size_t) api_size, "%s", cached_api);
+    if (!cached) {
 
-        snprintf(version, (size_t) version_size, "%s", cached_version);
+        cached = true;
 
-        return;
-    }
+        bool searched = false;
 
-    cached = true;
+        // 1) Vulkan：loader 给出 32 位版本号（major 在 bit22 起，minor 在 bit12 起）
+        void *library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
 
-    bool searched = false;
+        if (library != NULL) {
 
-    // 1) Vulkan：loader 给出 32 位版本号（major 在 bit22 起，minor 在 bit12 起）
-    void *library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+            searched = true;
 
-    if (library != NULL) {
+            gpu_vulkan_version_fn enumerate =
+                (gpu_vulkan_version_fn) dlsym(library, "vkEnumerateInstanceVersion");
 
-        searched = true;
+            unsigned int encoded = (1u << 22);   // 老 loader 没这个函数：按 Vulkan 1.0 算
 
-        gpu_vulkan_version_fn enumerate =
-            (gpu_vulkan_version_fn) dlsym(library, "vkEnumerateInstanceVersion");
+            if (enumerate != NULL) {
 
-        unsigned int encoded = (1u << 22);   // 老 loader 没这个函数：按 Vulkan 1.0 算
-
-        if (enumerate != NULL) {
-
-            encoded = 0;
-
-            if (enumerate(&encoded) != 0) {
                 encoded = 0;
+
+                if (enumerate(&encoded) != 0) {
+                    encoded = 0;
+                }
             }
-        }
 
-        if (encoded != 0) {
+            if (encoded != 0) {
 
-            unsigned int major = encoded >> 22;
+                cached_has_vulkan = true;
 
-            unsigned int minor = (encoded >> 12) & 0x3ffu;
-
-            snprintf(cached_api, sizeof(cached_api), "%s", "VULKAN");
-
-            snprintf(cached_version, sizeof(cached_version), "%u.%u", major, minor);
-
-            cached_has_result = true;
+                snprintf(cached_vulkan, sizeof(cached_vulkan), "%u.%u",
+                         encoded >> 22, (encoded >> 12) & 0x3ffu);
+            }
 
             dlclose(library);
-
-            *has_result = true;
-
-            snprintf(api, (size_t) api_size, "%s", cached_api);
-
-            snprintf(version, (size_t) version_size, "%s", cached_version);
-
-            return;
         }
 
-        dlclose(library);
-    }
+        // 2) OpenGL ES：ro.opengles.version 是十进制 0xMMmm
+        FILE *pipe = popen("getprop ro.opengles.version 2>/dev/null", "r");
 
-    // 2) OpenGL ES：ro.opengles.version 是十进制 0xMMmm
-    FILE *pipe = popen("getprop ro.opengles.version 2>/dev/null", "r");
+        if (pipe != NULL) {
 
-    if (pipe != NULL) {
+            searched = true;
 
-        searched = true;
+            char text[32] = {0};
 
-        char text[32] = {0};
+            if (fgets(text, (int) sizeof(text), pipe) == NULL) {
+                text[0] = '\0';
+            }
 
-        if (fgets(text, (int) sizeof(text), pipe) == NULL) {
-            text[0] = '\0';
-        }
+            pclose(pipe);
 
-        pclose(pipe);
+            if (text[0] != '\0') {
 
-        if (text[0] != '\0') {
+                int encoded = atoi(text);
 
-            int encoded = atoi(text);
+                if (encoded > 0) {
 
-            if (encoded > 0) {
+                    cached_has_opengl = true;
 
-                int major = encoded >> 16;
-
-                int minor = encoded & 0xffff;
-
-                snprintf(cached_api, sizeof(cached_api), "%s", "OPENGL");
-
-                snprintf(cached_version, sizeof(cached_version), "%d.%d", major, minor);
-
-                cached_has_result = true;
-
-                *has_result = true;
-
-                snprintf(api, (size_t) api_size, "%s", cached_api);
-
-                snprintf(version, (size_t) version_size, "%s", cached_version);
-
-                return;
+                    snprintf(cached_opengl, sizeof(cached_opengl), "%d.%d",
+                             encoded >> 16, encoded & 0xffff);
+                }
             }
         }
-    }
 
-    // 3) 查过了、两样都没有：明确不支持
-    if (searched) {
-
-        snprintf(cached_api, sizeof(cached_api), "%s", "NONE");
-
-        cached_has_result = true;
+        if (searched) {
+            cached_has_result = true;
+        }
     }
 
     *has_result = cached_has_result;
+    *has_vulkan = cached_has_vulkan;
+    *has_opengl = cached_has_opengl;
 
-    snprintf(api, (size_t) api_size, "%s", cached_api);
+    snprintf(vulkan_version, (size_t) vulkan_size, "%s", cached_vulkan);
 
-    snprintf(version, (size_t) version_size, "%s", cached_version);
+    snprintf(opengl_version, (size_t) opengl_size, "%s", cached_opengl);
 }
 
 /** 一格字段的读取结果：要么有数值，要么是一个状态（二者互斥）。 */
@@ -10361,7 +10453,131 @@ static GpuField gpu_field_dedicated(const TmDeviceRef *device, bool used)
     return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
 }
 
-/** 填写函数：共享显存（DRM 的 gtt 统计；手机上一般没有这一格）。 */
+/** 这个 dma-buf 是不是 GPU 自己申请的：exporter 名里带 mali / ged / mediatek / mtk。 */
+static bool gpu_dmabuf_is_gpu_exporter(const char *name)
+{
+    return gpu_text_contains(name, "mali")
+        || gpu_text_contains(name, "ged")
+        || gpu_text_contains(name, "mediatek")
+        || gpu_text_contains(name, "mtk");
+}
+
+/**
+ * 通用兜底：汇总 dma-buf 里 GPU 申请的那部分内存。
+ *
+ * 内核 4.19 起 /sys/kernel/dmabuf/buffers/<inode>/ 每项带 exp_name 与 size（字节），
+ * 这是全平台统一的统计口。高通有 KGSL mapped 就先走那边，Mali 设备（联发科 /
+ * 三星 / Google）只能靠这一格。只累加 GPU exporter 的条目 —— 相机、显示那些
+ * dma-buf 不算进来，所以这个数和"GPU 映射住的内存"同义。
+ *
+ * 扫目录要读上百个小文件，所以按 1 秒缓存：页面 1Hz 刷新，每秒算一遍足够。
+ *
+ * @return true = 确实扫到了 GPU exporter 的条目（值可能是 0）；false = 没有这个接口
+ */
+static bool gpu_dmabuf_gpu_bytes(long long *bytes)
+{
+    static bool cached = false;
+
+    static bool cached_ok = false;
+
+    static long long cached_bytes = 0;
+
+    static time_t cached_at = 0;
+
+    time_t now = time(NULL);
+
+    if (cached && now == cached_at) {
+
+        *bytes = cached_bytes;
+
+        return cached_ok;
+    }
+
+    cached = true;
+
+    cached_at = now;
+
+    cached_ok = false;
+
+    cached_bytes = 0;
+
+    const char *roots[] = {
+        "/sys/kernel/dmabuf/buffers",
+        "/sys/kernel/dma_buf/buffers",
+    };
+
+    for (int root_index = 0; root_index < 2 && !cached_ok; root_index++) {
+
+        DIR *dir = opendir(roots[root_index]);
+
+        if (dir == NULL) {
+            continue;
+        }
+
+        bool matched = false;
+
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+
+            // 只认 inode 号这类纯数字目录
+            if (!is_pure_digits(entry->d_name)) {
+                continue;
+            }
+
+            char path[TM_PATH_MAX];
+
+            snprintf(path, sizeof(path), "%s/%s/exp_name", roots[root_index], entry->d_name);
+
+            char exporter[64];
+
+            if (read_text_file(path, exporter, (int) sizeof(exporter)) <= 0) {
+                continue;
+            }
+
+            trim_disk_text(exporter);
+
+            if (!gpu_dmabuf_is_gpu_exporter(exporter)) {
+                continue;
+            }
+
+            snprintf(path, sizeof(path), "%s/%s/size", roots[root_index], entry->d_name);
+
+            long long size = 0;
+
+            if (gpu_read_first_int(path, &size) && size > 0) {
+
+                cached_bytes += size;
+
+                matched = true;
+            }
+        }
+
+        closedir(dir);
+
+        cached_ok = matched;
+    }
+
+    *bytes = cached_bytes;
+
+    return cached_ok;
+}
+
+/**
+ * 填写函数：共享显存（DRM 的 gtt -> 高通 KGSL 的 mapped -> dma-buf 汇总 -> 不支持）。
+ *
+ * 桌面卡走 DRM：<node>/device/mem_info_gtt_total / _used。
+ *
+ * 手机的 GPU 用系统内存，没有独立显存，能拿到的是"GPU 映射住的内存量"：
+ *   高通 —— /sys/class/kgsl/kgsl/mapped，一个字，语义就是 GPU Mapped Memory；
+ *   其它（Mali：联发科 / 三星 / Google）—— 没有等价的一格，退到内核统一的
+ *   dma-buf 统计，只累加 GPU exporter 申请的缓冲（见 gpu_dmabuf_gpu_bytes）。
+ *
+ * 总量厂商都不给，按"GPU 能映射的内存池"取 /proc/meminfo 的 MemTotal ——
+ * Android 上整块内存都能给 GPU 映射，没有更窄的上限，不拿一半硬套。
+ *
+ * 两样都读不到就一律"不支持"，不替没有这一格的平台编一个总量出来。
+ */
 static GpuField gpu_field_shared(const TmDeviceRef *device, bool used)
 {
     char path[TM_PATH_MAX];
@@ -10375,7 +10591,36 @@ static GpuField gpu_field_shared(const TmDeviceRef *device, bool used)
         return gpu_field_value(bytes);
     }
 
-    return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
+    long long mapped = 0;
+
+    bool has_mapped = gpu_read_first_int("/sys/class/kgsl/kgsl/mapped", &mapped) && mapped >= 0;
+
+    // 高通之外（Mali / 联发科 / 三星 / Google）没有 kgsl：退到通用 dma-buf 汇总
+    if (!has_mapped) {
+        has_mapped = gpu_dmabuf_gpu_bytes(&mapped);
+    }
+
+    if (!has_mapped) {
+        return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
+    }
+
+    if (used) {
+        return gpu_field_value(mapped);
+    }
+
+    static char meminfo[4096];
+
+    if (read_text_file("/proc/meminfo", meminfo, (int) sizeof(meminfo)) <= 0) {
+        return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+    }
+
+    long long total = meminfo_bytes(meminfo, "MemTotal");
+
+    if (total > 0) {
+        return gpu_field_value(total);
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
 }
 
 /**
@@ -10435,7 +10680,8 @@ static void gpu_put_text_field(TmOutDevice *device, const char *key,
  * 把显卡实例填进包。
  *
  * 每个实例发：name / node / gpu_usage / gpu_temp_c / dedicated_total_bytes /
- * dedicated_used_bytes / gfx_api / gfx_api_version。
+ * dedicated_used_bytes / shared_total_bytes / shared_used_bytes（高通走 KGSL
+ * mapped，总量按 MemTotal）/ gfx_api / gfx_api_version。
  * 读不到的不发（页面按"不支持 / -"显示）。
  */
 static int build_gpu_devices(TmOutDevice *out, int capacity,
@@ -10453,12 +10699,17 @@ static int build_gpu_devices(TmOutDevice *out, int capacity,
 
     bool has_api = false;
 
-    char api_name[16] = {0};
+    bool has_vulkan = false;
 
-    char api_version[24] = {0};
+    bool has_opengl = false;
 
-    gpu_detect_gfx_api(&has_api, api_name, (int) sizeof(api_name),
-                       api_version, (int) sizeof(api_version));
+    char vulkan_version[24] = {0};
+
+    char opengl_version[24] = {0};
+
+    gpu_detect_gfx_api(&has_api,
+                       &has_vulkan, vulkan_version, (int) sizeof(vulkan_version),
+                       &has_opengl, opengl_version, (int) sizeof(opengl_version));
 
     for (int i = 0; i < limit; i++) {
 
@@ -10517,12 +10768,23 @@ static int build_gpu_devices(TmOutDevice *out, int capacity,
             device_put(&out[i], "location", location);
         }
 
-        if (has_api && api_name[0] != '\0') {
+        // 图形 API：两路各报各的，页面上谁有就摆谁。
+        //   有版本串   -> 那一行显示 "Vulkan 1.1" / "OpenGL ES 3.2"
+        //   值是 NONE  -> 查过、这台机器确实没有那一样（那一行不摆）
+        //   键整格缺失 -> 这次没查成（老 so 或探测失败），由客户端退回旧的二选一
+        if (has_api) {
 
-            device_put(&out[i], "gfx_api", api_name);
+            device_put(&out[i], "vulkan_version", has_vulkan ? vulkan_version : "NONE");
 
-            if (api_version[0] != '\0') {
-                device_put(&out[i], "gfx_api_version", api_version);
+            device_put(&out[i], "opengl_version", has_opengl ? opengl_version : "NONE");
+
+            // 兼容老字段：仍发一份"首选 API"，供复制文本等旧路径使用
+            device_put(&out[i], "gfx_api", has_vulkan ? "VULKAN" : (has_opengl ? "OPENGL" : "NONE"));
+
+            if (has_vulkan) {
+                device_put(&out[i], "gfx_api_version", vulkan_version);
+            } else if (has_opengl) {
+                device_put(&out[i], "gfx_api_version", opengl_version);
             }
         }
     }

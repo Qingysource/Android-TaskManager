@@ -4,6 +4,15 @@
 #       # 开头是注释，空行忽略，UTF-8 编码。
 # 维护：只加核实过的对应关系。型号与商品名对不上，比显示型号更糟。
 # 加新平台不用改代码，追加一行就行。
+#
+# 匹配规则是**整词优先、前缀兜底**（都只忽略大小写），所以不要写 "mt6899*" 这种通配：
+#   1) 型号整词相等，直接用这一条；
+#   2) 设备报的型号带变体尾巴时（MT6833V/NZA、MT6877V/TTZA、MT6899Z/ZA），
+#      取库里最长的那个前缀来认（MT6833 / MT6877 / MT6899）；
+#   3) 数字尾巴不算变体，别指望 MT6833 吃掉一个并不存在的 MT6833x。
+#
+# 一个代号被多个商品名共用时（联发科很常见），取**最早上市/最常见**的那个名字，
+# 并在该行注释里写明还对应哪些名字 —— 宁可名字偏旧，也不要写错产品线。
 
 # Qualcomm - Snapdragon 8
 sm8450 Qualcomm(R) Snapdragon(R) 8 Gen 1
@@ -54,11 +63,62 @@ sdm730 Qualcomm(R) Snapdragon(R) 730
 sdm730g Qualcomm(R) Snapdragon(R) 730G
 sdm845 Qualcomm(R) Snapdragon(R) 845
 
-# MediaTek
-mt6991 MediaTek Dimensity 9500s
+# MediaTek - Dimensity 9000 系列（旗舰）
+mt6983 MediaTek Dimensity 9000
+mt6985 MediaTek Dimensity 9200
+mt6989 MediaTek Dimensity 9300
+mt6991 MediaTek Dimensity 9400
 mt6993 MediaTek Dimensity 9500
-mt6994 MediaTek Dimensity 9600M
 mt6995 MediaTek Dimensity 9600 Pro
+# 同代号的商品名（本表只能给一个名字，取首发的那款）：
+#   MT6983  9000 / 9000+
+#   MT6985  9200 / 9200+
+#   MT6989  9300 / 9300+
+#   MT6991  9400 / 9400+ / 9500s（9500s 与 9400+ 同架构同缓存）
+#   MT6993  9500 / 9600M（9600M 是给 OPPO 的改名版本）
+
+# MediaTek - Dimensity 8000 系列（次旗舰）
+mt6895 MediaTek Dimensity 8000
+mt6895z MediaTek Dimensity 8100
+mt6896 MediaTek Dimensity 8200
+mt6897 MediaTek Dimensity 8300
+mt6899 MediaTek Dimensity 8400
+#   MT6897  8300 / 8300 Ultra / 8350（8350 是 8300 提频改名）
+#   MT6899  8400 / 8400 Ultra（如 POCO X7 Pro）
+
+# MediaTek - Dimensity 7000 系列
+mt6878 MediaTek Dimensity 7300
+mt6886 MediaTek Dimensity 7200
+mt6858 MediaTek Dimensity 7100
+#   MT6878  7300 / 7300X / 7360
+#   MT6855  930 / 7020 / 7025 / 7060（2023 年产品线重整后 930 改名 7020）
+#   MT6879  1050 / 7030
+#   MT6877  900 / 1080 / 7050（1080 是 900 的提频版，7050 是 1080 改名）
+
+# MediaTek - Dimensity 6000 系列
+mt6835 MediaTek Dimensity 6100+
+#   MT6835  6100+ / 6300 / 6400
+#   6080 / 6020 / 6360 暂未查到可核实的内部代号，先不写，避免猜错
+
+# MediaTek - Dimensity 1000 / 900 / 800 / 700 系列（2020-2022）
+mt6889 MediaTek Dimensity 1000
+mt6885 MediaTek Dimensity 1000L
+mt6883 MediaTek Dimensity 1000C
+mt6891 MediaTek Dimensity 1100
+mt6893 MediaTek Dimensity 1200
+mt6879 MediaTek Dimensity 1050
+mt6877 MediaTek Dimensity 900
+mt6877t MediaTek Dimensity 920
+mt6855 MediaTek Dimensity 930
+mt6873 MediaTek Dimensity 800
+mt6853t MediaTek Dimensity 800U
+mt6853 MediaTek Dimensity 720
+mt6833 MediaTek Dimensity 700
+#   MT6893  1200 / 1200 Ultra / 1300（1300 是 1200 的改名）
+#   MT6833  700 / 810（810 用 MT6833P 变体）/ 6020
+
+# MediaTek - Helio（4G）
+mt6789 MediaTek Helio G99
 
 # Google
 gs101 Google Tensor G1

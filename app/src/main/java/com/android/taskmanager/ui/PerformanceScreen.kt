@@ -84,12 +84,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -244,7 +241,7 @@ private val MULTI_DEVICE_KINDS: Set<HardwareKind> =
  * 左栏 / 底部条上的一个入口。
  *
  * CPU 与内存是单实例，各占一项；磁盘 / 网卡按这一帧快照里有几台给几项
- * （一台都没有就一项都不给）。名字由管理器统一命名（磁盘 0、磁盘 1 … / WLAN、WLAN 1 …），
+ * （一台都没有就一项都不给）。名字由管理器统一命名（磁盘 0、磁盘 1 … / WLAN、手机网络 …），
  * 这里只搬运文案，不再自己拼。
  *
  * [diskIndex] 对多实例硬件是"同类里的第几台"（网卡复用它，避免为同样的语义再开一个字段）。
@@ -456,11 +453,12 @@ private fun diskClipboardText(disk: DiskSnapshot?): String {
 }
 
 /**
- * WLAN 视图"复制"写进剪贴板的文本。
+ * 网卡视图（WLAN / 手机网络 / 以太网）"复制"写进剪贴板的文本。
  *
- * 版式与磁盘那份同一个骨架，只是字段换成网卡这一套（发送 / 接收 + 六行明细）。
+ * 版式与磁盘那份同一个骨架，只是字段换成网卡这一套（发送 / 接收 + 明细行）。
  * 数值一律走 [NetworkSnapshot] 上的同一套文案方法：明细读不到写"不支持"、速率写 0。
- * 底层补了字段后这边不用再改。
+ * 手机网络与以太网没有 SSID / 信号强度，这两行整行不写
+ * （判据在模型层，底层补数据后自动出现）。
  */
 private fun networkClipboardText(
     network: NetworkSnapshot?,
@@ -478,7 +476,11 @@ private fun networkClipboardText(
 
         append("\t适配器名称:\t").appendLine(data.nameText())
 
-        append("\tSSID:\t").appendLine(data.ssidText())
+        // SSID / 信号强度是无线专有字段：手机网络没有这两样，整行不写
+        // （判据在 NetworkSnapshot.showsSsidRow / showsSignalRow）
+        if (data.showsSsidRow) {
+            append("\tSSID:\t").appendLine(data.ssidText())
+        }
 
         append("\t连接类型:\t").appendLine(data.linkTypeText())
 
@@ -486,7 +488,9 @@ private fun networkClipboardText(
 
         append("\tIPv6 地址:\t").appendLine(data.ipv6Text())
 
-        append("\t信号强度:\t").appendLine(data.signalText())
+        if (data.showsSignalRow) {
+            append("\t信号强度:\t").appendLine(data.signalText())
+        }
 
         appendLine()
 
@@ -735,17 +739,21 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         }
 
         // 网卡与磁盘同一套规矩：这一帧里有几块网卡就给几个入口，
-        // 一块都没有（绝大多数手机在飞航模式 / 无 WLAN 时）就连 WLAN 入口都不出现。
-        // 名字由管理器统一编号：第一块叫 WLAN，多块从第二块起 WLAN 1、WLAN 2 …
+        // 一块都没有（绝大多数手机在飞航模式 / 无 WLAN 时）就连网卡入口都不出现。
+        // 名字由管理器统一编号：按类型命名（WLAN / Wi-Fi、手机网络、以太网），
+        // 同类多块才从第二块起带 1、2 …（第一块不带序号），竖屏横条用的也是这份名字。
         networks.forEachIndexed { index, network ->
 
             add(
                 HardwareSlot(
                     kind = HardwareKind.NETWORK,
                     diskIndex = index,
-                    title = manager.networkTitle(index),
-                    // 第二行是类别，文案按地区：中国 WLAN、其它地区 Wi-Fi
-                    line2 = manager.networkDisplayName,
+                    // 大字是"设备类型名"（WLAN / 手机网络 / 以太网），
+                    // 同类第二块起才带序号（WLAN、WLAN 1 …）
+                    title = manager.networkTitle(networks, index),
+                    // 第二行是适配器名（wlan0 / rmnet_data0），与右栏右上角那个
+                    // name 字段同源；**不要**和上面那行写一样 —— 重复的信息没意义
+                    line2 = network.nameText(),
                     line3 = "发送: ${network.sendText()}  接收: ${network.receiveText()}",
                     // 迷你图用接收那一条（与详情页紫色曲线同一个环形缓冲）
                     history = manager.networkChart(networks, index)?.receive ?: emptyList()
@@ -809,6 +817,11 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     // 吞吐量图：两条速率曲线 + 当前量程（由管理器按"超过一半就升档"维护）
     val selectedNetworkChart: NetworkChartData? =
         if (selected == HardwareKind.NETWORK) manager.networkChart(networks, selectedDiskIndex) else null
+
+    // 网卡页的标题（页头左上角 / 摘要 / 剪贴板首行都读这一份）：跟着"选中的那块网卡"
+    // 的类型走 —— 选无线就是「WLAN」，选手机网络就是「手机网络」。
+    // 以前这里固定用 networkDisplayName，接上手机网络后会把蜂窝页也标成 WLAN。
+    val networkPageLabel: String = manager.networkTitle(networks, selectedDiskIndex)
 
     // GPU 页的整套数据（显卡 + 三张图的缓存）；当前不是 GPU 就是 null
     val gpuPageData: GpuPageData? = if (selected == HardwareKind.GPU) {
@@ -879,7 +892,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
             usageDecimals = usageDecimals,
             disk = diskPageData?.disk,
             network = selectedNetwork,
-            networkLabel = manager.networkDisplayName,
+            networkLabel = networkPageLabel,
             networkScale = selectedNetworkChart?.rangeText() ?: NETWORK_SCALE_TEXT,
             gpu = gpuPageData?.gpu
         )
@@ -971,7 +984,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                 networkChart = selectedNetworkChart,
 
-                networkLabel = manager.networkDisplayName,
+                networkLabel = networkPageLabel,
 
 
 
@@ -1103,7 +1116,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         networkChart = selectedNetworkChart,
 
-                        networkLabel = manager.networkDisplayName,
+                        networkLabel = networkPageLabel,
 
 
 
@@ -1157,7 +1170,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         networkChart = selectedNetworkChart,
 
-                        networkLabel = manager.networkDisplayName,
+                        networkLabel = networkPageLabel,
 
 
 
@@ -1237,7 +1250,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 usageDecimals = usageDecimals,
                 disk = diskPageData?.disk,
                 network = selectedNetwork,
-                networkLabel = manager.networkDisplayName,
+                networkLabel = networkPageLabel,
 
                 networkScale = selectedNetworkChart?.rangeText() ?: NETWORK_SCALE_TEXT,
 
@@ -1434,9 +1447,8 @@ private fun gpuDetailLines(gpu: GpuSnapshot?): List<Pair<String, String>> {
 
         add("驱动程序日期" to data.driverDateText())
 
-        // Vulkan 与 OpenGL 是两行独立字段，按底层报上来的图形库二选一摆：
-        // 支持 Vulkan 就只摆 Vulkan 版本（OpenGL 那行整行不画），
-        // 只有 OpenGL 就只摆 OpenGL ES 版本；两样都没查成才两行都摆"不支持" / "-"。
+        // Vulkan 与 OpenGL 是两行独立字段：底层报了什么就摆什么。
+        // 两样都报了 → 两行都摆；只报一样 → 另一行整行不画；都没报 → 两行都不摆。
         if (data.showsVulkanRow) {
             add("Vulkan 版本" to data.vulkanVersionText())
         }
@@ -1639,23 +1651,32 @@ private fun gpuClipboardText(gpu: GpuSnapshot?): String {
 }
 
 /**
- * WLAN 页的明细块：固定六行（适配器名称 / SSID / 连接类型 / IPv4 / IPv6 / 信号强度）。
+ * 网卡页的明细块：无线六行（适配器名称 / SSID / 连接类型 / IPv4 / IPv6 / 信号强度），
+ * 手机网络与以太网四行（去掉 SSID 与信号强度）。
  *
  * 顺序与截图一致；取值一律走 [NetworkSnapshot] 的文案方法 ——
  * 底层现在只发适配器名，其余读不到就写"不支持"，接了字段以后这边不用改。
+ * "连接类型"由模型层按类型兜底：手机网络写「手机网络」、以太网写「以太网」，
+ * 底层真给了值（制式 / 网口标准）就显示那个值。
  */
 private fun networkDetailLines(network: NetworkSnapshot?): List<Pair<String, String>> {
 
     val data = network ?: NetworkSnapshot()
 
-    return listOf(
-        "适配器名称" to data.nameText(),
-        "SSID" to data.ssidText(),
-        "连接类型" to data.linkTypeText(),
-        "IPv4 地址" to data.ipv4Text(),
-        "IPv6 地址" to data.ipv6Text(),
-        "信号强度" to data.signalText()
-    )
+    return buildList {
+
+        add("适配器名称" to data.nameText())
+
+        if (data.showsSsidRow) add("SSID" to data.ssidText())
+
+        add("连接类型" to data.linkTypeText())
+
+        add("IPv4 地址" to data.ipv4Text())
+
+        add("IPv6 地址" to data.ipv6Text())
+
+        if (data.showsSignalRow) add("信号强度" to data.signalText())
+    }
 }
 
 /**
@@ -2080,7 +2101,7 @@ private fun HardwareDetail(
                 text = when {
                     // 磁盘是多实例设备：标题写"磁盘 0 / 磁盘 1"，由管理器编号
                     isDisk -> diskData?.title ?: kind.displayName
-                    // 网卡的名字按地区决定：中国写 WLAN、其它地区写 Wi-Fi（管理器算好传进来）
+                    // 网卡的名字按类型（同类多块才带序号），由管理器算好传进来：WLAN / 手机网络 / 以太网
                     kind == HardwareKind.NETWORK -> networkLabel
                     // 显卡是多实例设备：标题写"GPU 0 / GPU 1"，序号同样由管理器编号
                     kind == HardwareKind.GPU -> gpuData?.title ?: kind.displayName
@@ -4401,67 +4422,4 @@ private fun copyChartMenuText(context: Context, text: String) {
     }
 
     clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
-}
-
-
-/**
- * 性能页右上角的溢出菜单（DropdownMenu，点按钮从按钮下方展开）。
- *
- * 两项之间一条分隔线：
- *   复制图表 —— 调页面自己的复制函数，把当前选中设备那份文本写进剪贴板；
- *   资源监视器 —— 管理器里只有空接口，Android 目前没有这个系统组件，点了不做事。
- *
- * 为什么由宿主（MainActivity）画：它的位置是页名行、搜索框那一排的最右端，
- * 性能页没有搜索框，那一行的右半段正好空着，菜单放那里才和别的页对齐；
- * 宿主只决定按钮在哪，复制与资源监视器都由性能页管理器转发，逻辑不在这边。
- */
-@Composable
-internal fun PerformanceOverflowMenu(
-    onCopyChart: () -> Unit,
-    onOpenResourceMonitor: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-
-    var expanded by remember { mutableStateOf(false) }
-
-    Box(modifier = modifier) {
-
-        IconButton(
-            onClick = { expanded = true }
-        ) {
-
-            Icon(
-                imageVector = Icons.Default.MoreVert,
-
-                contentDescription = "性能页菜单"
-            )
-        }
-
-        DropdownMenu(
-            expanded = expanded,
-
-            onDismissRequest = { expanded = false }
-        ) {
-
-            DropdownMenuItem(
-                text = { Text("复制图表") },
-
-                onClick = {
-                    expanded = false
-                    onCopyChart()
-                }
-            )
-
-            HorizontalDivider()
-
-            DropdownMenuItem(
-                text = { Text("资源监视器") },
-
-                onClick = {
-                    expanded = false
-                    onOpenResourceMonitor()
-                }
-            )
-        }
-    }
 }

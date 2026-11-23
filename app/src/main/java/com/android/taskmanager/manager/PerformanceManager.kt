@@ -215,6 +215,39 @@ class PerformanceManager internal constructor(appContext: Context) {
         private set
 
     /**
+     * 调试开关：把底层**报上来的每一块网卡**都注册成性能页设备，不再按注册规则隐藏。
+     *
+     * 为的是核对"哪些接口被藏了、藏得对不对"：p2p0、没连网的 wlan0、只有 fe80:: 的
+     * rmnetXX、VPN 的 tun0 平时都不在左栏，要看它们的字段就得把规则暂时摘掉。
+     * 只覆盖快照里已经有的设备 —— 底层没采集到的（lo 之类）照样不会凭空出现。
+     *
+     * 生命周期：**只活在这个进程里**，不写 settings.json / 不写任何存储，
+     * 应用一关就忘（调试功能本来就是这个口径）。挂在本管理器上而不是某个页面里，
+     * 因为管理器是进程级单例：离开调试页、横竖屏切换、甚至 UIService 重建，
+     * 这个开关都还在（本类由 PageManagers 持有，生命周期比任何 Screen 都长）。
+     */
+    var debugShowAllNetworks by mutableStateOf(false)
+        private set
+
+    /**
+     * 调试页勾选框的落点：立刻按当前原始帧重新合并一次。
+     *
+     * 名字不叫 setDebugShowAllNetworks：Kotlin 给 var 生成的 JVM setter 已经占用了
+     * 那个签名（setDebugShowAllNetworks(Z)V），同名函数会撞成 declaration clash，
+     * 所以这个"带副作用"的入口单独起名。
+     *
+     * 不等下一次采样，勾上 / 取消后性能页下一次重组就能看到效果。
+     */
+    fun applyDebugShowAllNetworks(showAll: Boolean) {
+
+        if (debugShowAllNetworks == showAll) return
+
+        debugShowAllNetworks = showAll
+
+        publishMergedSnapshot()
+    }
+
+    /**
      * 快照订阅回调。
      *
      * 用一个字段而不是每次 new lambda：attach / detach 需要能摘掉同一份引用，
@@ -343,17 +376,51 @@ class PerformanceManager internal constructor(appContext: Context) {
         copyChartHandler?.invoke()
     }
 
-    /** 这一帧里有几块网卡（0 = 连 WLAN 入口都不该出现）。 */
+    /** 这一帧里有几块网卡（0 = 连网卡入口都不该出现）。 */
     fun networkCount(): Int = snapshot.networks.size
 
     /**
-     * 网卡在切换列表里的名字：第一块不带序号，多块从第二块起编号。
+     * 一块网卡的"设备类型名"：WLAN / Wi-Fi、手机网络、以太网 …
      *
-     * 前的部分用 [networkDisplayName]：中国写「WLAN」、其它地区写「Wi-Fi」，
-     * 与页头、左栏第二行、剪贴板标题用的是同一份文案。
+     * 这是页头左上角、左栏大字、剪贴板标题、摘要视图共用的那一套**正式类型名**。
+     * 它和适配器名（wlan0 / rmnet_data0，即 `name` 字段，右栏右上角那个）是两码事：
+     * 类型名回答"这是什么设备"，适配器名回答"具体是哪一块"。
+     *
+     * 无线局域网按地区取舍（中国 WLAN、其它 Wi-Fi，见 [networkDisplayName]）；
+     * 手机网络与以太网没有地区差异，写死中文。ETHERNET 与 OTHER 都算以太网，
+     * 所以 USB 网卡、扩展坞网口、底层分不出型号的接口会共用「以太网」这个名字。
      */
-    fun networkTitle(index: Int): String =
-        if (index <= 0) networkDisplayName else "$networkDisplayName $index"
+    fun networkTypeName(network: NetworkSnapshot?): String = when {
+
+        network?.isCellular() == true -> NETWORK_TYPE_CELLULAR
+
+        network?.isWired() == true -> NETWORK_TYPE_ETHERNET
+
+        // 无线与"底层没给角色"（老后端 / 调试注入）都落到这里
+        else -> networkDisplayName
+    }
+
+    /**
+     * 网卡在切换列表里的名字：类型名 + **同类型内**的序号（第一块不带序号）。
+     *
+     * 一块无线 + 一块手机网络就是「WLAN」「手机网络」；同类型第二块起才带 1、2 …
+     * 为什么第一块不带：手机上通常只有一块无线、一张卡，时时挂个 0 只是噪音，
+     * 与磁盘 / GPU 那套"永远从 0 起"刻意不同（序号只在"确实有多块"时才有信息量）。
+     * 但一段显示里不能既有"带号"又有"不带号"的同类：一块无线 + 一块手机网络时
+     * 两条都不带号，没问题；同类出现第二块时才会看到「WLAN」「WLAN 1」。
+     */
+    fun networkTitle(networks: List<NetworkSnapshot>, index: Int): String {
+
+        val typeName = networkTypeName(networks.getOrNull(index))
+
+        var sameBefore = 0
+
+        for (i in 0 until index.coerceAtLeast(0)) {
+            if (networkTypeName(networks.getOrNull(i)) == typeName) sameBefore++
+        }
+
+        return if (sameBefore == 0) typeName else "$typeName $sameBefore"
+    }
 
     /** 这一帧里有几张显卡（0 = 连 GPU 入口都不该出现）。 */
     fun gpuCount(): Int = snapshot.gpus.size
@@ -533,9 +600,11 @@ class PerformanceManager internal constructor(appContext: Context) {
      * 注入的空盘 / 空网卡从索引末尾开始。
      *
      * 这里是"第二个过程"的落点：底层把 /sys/class/net 的全部接口都报上来
-     * （含 tun / vpn / rmnet 这类），管理器只把 [NetworkSnapshot.isWirelessLan]
-     * 为真的注册成性能页设备 —— 现在只有无线局域网这一种页面，以太网与移动网络
-     * 以后放开时，只改这一个过滤条件，底层与页面都不用动。
+     * （含 tun / vpn / rmnet / p2p0 这类），管理器按 [isRegisteredNetwork] 挑出要注册的
+     * —— 无线只收"已经连上（有 SSID）"的，手机网络与以太网只收"有地址"的。
+     * 底层照旧把这些接口全发上来，注册与否只在 Kotlin 这一层决定。
+     * 例外：调试页勾了「显示所有网卡设备」时这道筛整体跳过（见 [debugShowAllNetworks]），
+     * 用来核对"哪些被藏了、藏得对不对"。
      */
     private fun mergeDebugDevices(snapshot: PerformanceSnapshot): PerformanceSnapshot {
 
@@ -557,13 +626,56 @@ class PerformanceManager internal constructor(appContext: Context) {
             emptyList()
         }
 
-        val networks = (snapshot.networks + extraNetworks).filter { it.isWirelessLan() }
+        // 调试开关打开时：底层报了什么就注册什么（p2p0 / 未连网的 wlan0 / 只有 fe80:: 的
+        // rmnet / VPN 的 tun0 全部放出来），用来核对隐藏规则本身；关掉就恢复常规筛选。
+        // 注意只动"注册"这一步：没连网的那条照样显示"不支持"、速率照样是 0，
+        // 不会因为被放出来就凭空长出数据。
+        //
+        // 调试注入的空网卡始终拼在后面、不过这道筛（它们天生没有任何字段，
+        // 目的就是把"有一块设备但读不到细节"摆出来）。
+        val registeredNetworks = if (debugShowAllNetworks) {
+            snapshot.networks
+        } else {
+            snapshot.networks.filter { isRegisteredNetwork(it) }
+        }
+
+        val networks = registeredNetworks + extraNetworks
 
         return snapshot.copy(
             disks = snapshot.disks + extraDisks,
             networks = networks,
             gpus = snapshot.gpus + extraGpus
         )
+    }
+
+    /**
+     * 一块网卡要不要注册成性能页设备。
+     *
+     * - 无线局域网：**必须连上网（有 SSID）才注册**。理由有两层：
+     *   一是一堆名义上是无线、实际不干活的接口（p2p0 = Wi-Fi Direct、wifi-aware、
+     *   各种虚拟 wlan 分支）也带着 wireless 标记，单看标记分不出来；
+     *   二是真正的 wlan0 没连网时既没有 SSID 也没有流量，摆在左栏只是一行 0 Kbps 的空壳。
+     *   SSID 由底层 read_iw_link 给出（没连上就不发这一格），所以"SSID 有没有值"
+     *   就是"这块无线是不是真连着"的事实判据，不是猜的。
+     *   想放宽成"SSID 或 连接类型 任一有值"，只改这一行的条件即可。
+     * - 手机移动网络：只收**有地址**的那一条。手机上 rmnet_data0..7 / ccmni0 这类
+     *   接口一大串，绝大多数是空壳（没 IP、没流量），全注册会把左栏占满；
+     *   真正在通信的那条一定有 IPv4 或 IPv6；
+     * - 以太网这一族（ETHERNET + OTHER，后者含 USB 网卡、扩展坞网口、tun/vpn 等）：
+     *   同样只收**有地址**的。网线拔了、VPN 断了、扩展坞收掉，地址跟着撤掉，
+     *   下一帧就自动从左栏消失；插上再回来。没地址的一律不注册，
+     *   免得左栏出现一排"以太网 0 Kbps"空壳；
+     * - 其它（这一版已经全部归到上面三类里，else 只是兜底）：不注册。
+     */
+    private fun isRegisteredNetwork(network: NetworkSnapshot): Boolean = when {
+
+        network.isWirelessLan() -> !network.ssid.isNullOrBlank()
+
+        network.isCellular() -> network.hasAddress()
+
+        network.isWired() -> network.hasAddress()
+
+        else -> false
     }
 
     /** 空磁盘：只有 id，其它字段留空 / 置 0（"读不到"与"确实是 0"分开表达）。 */
@@ -587,8 +699,10 @@ class PerformanceManager internal constructor(appContext: Context) {
     /**
      * 空网卡：只有 id 与角色，其余全 null（明细写"不支持"、速率写 0）。
      *
-     * role 必须给 WIFI，否则会被上面那道注册过滤挡掉 —— 调试注入的目的就是
-     * 把"有一块无线网卡但读不到任何细节"这种状态摆出来。
+     * role 给 WIFI 是为了让页面按无线那一套版式画；注意它**不过注册过滤**
+     * （[mergeDebugDevices] 里注入的空网卡直接拼在筛完的真实设备后面）——
+     * 真实无线现在要求"有 SSID 才注册"，而空网卡天生没有 SSID，要是也走那道筛
+     * 就永远显示不出来，而调试注入的目的恰恰是把"有一块网卡但读不到细节"摆出来。
      */
     private fun emptyDebugNetwork(index: Int): NetworkSnapshot = NetworkSnapshot(
 
@@ -1313,6 +1427,12 @@ private fun resolveNetworkDisplayName(context: Context): String {
 
     return if (isChina) "WLAN" else "Wi-Fi"
 }
+
+/** 手机网络在界面上的正式类型名（页头 / 左栏大字 / 剪贴板标题共用）。 */
+private const val NETWORK_TYPE_CELLULAR = "手机网络"
+
+/** 以太网的正式类型名；现在不注册成页面，留着给放开那一天直接用。 */
+private const val NETWORK_TYPE_ETHERNET = "以太网"
 
 /**
  * 图表画图偏好的落盘（性能页私有设置）。

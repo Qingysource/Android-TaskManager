@@ -149,8 +149,9 @@ data class PerformanceSnapshot(
      * 网卡设备列表（WLAN，一台机器可能多块网卡，也可能没有）。
      *
      * 与磁盘同一套规矩：空表 = 性能页连 WLAN 入口都不出现。
-     * 现在的后端只发 `name` 一个字段（适配器型号），SSID / 连接类型 / 地址 / 信号强度
-     * 还没有数据源，页面写"不支持"；发送 / 接收计数没有就写 0。
+     * 后端现在发得全的是：role / iface / name / ipv4 / ipv6 / has_data_address
+     * 与收发速率；无线的 SSID / link_type / freq_mhz / signal_percent 有数据源，
+     * 移动网络这几格还没有（页面据此整行不画）。读不到的写"不支持"，速率没有写 0。
      */
     val networks: List<NetworkSnapshot> = emptyList(),
 
@@ -485,6 +486,10 @@ data class PerformanceSnapshot(
 
                 ipv6 = device.fields.textValueOf("ipv6"),
 
+                // 底层给的事实："这条链路有没有非链路本地地址"（0/1）。
+                // 手机网络靠它筛掉只有 fe80:: 的 rmnet 空壳；老后端不发这一格就是 null。
+                hasDataAddress = device.fields.intOf("has_data_address")?.let { it != 0 },
+
                 signalPercent = device.fields.floatOf("signal_percent"),
 
                 sendBytesPerSec = device.fields.doubleOf("send_bytes_per_sec"),
@@ -528,6 +533,12 @@ data class PerformanceSnapshot(
                 sharedTotalBytes = device.fields.longOf("shared_total_bytes"),
 
                 sharedUsedBytes = device.fields.longOf("shared_used_bytes"),
+
+                // 图形库：Vulkan / OpenGL ES 两路各一份版本串；
+                // "NONE" = 查过、这台机器没有那一样（不是缺失，是明确没有）
+                vulkanVersion = device.fields.textValueOf("vulkan_version"),
+
+                openglVersion = device.fields.textValueOf("opengl_version"),
 
                 driverVersion = device.fields.textValueOf("driver_version"),
 
@@ -1311,7 +1322,10 @@ private fun memoryUnitName(unitBytes: Long): String = when (unitBytes) {
  *
  * [role] 是底层给的事实分型（WIFI / ETHERNET / CELLULAR / OTHER）：
  * 底层把 /sys/class/net 里的接口**全部**报上来（虚拟网卡也算 OTHER），
- * 由 PerformanceManager 决定把哪一类注册成性能页设备 —— 现在只注册 WIFI。
+ * 由 PerformanceManager 决定把哪一类注册成性能页设备 —— 现在注册三类：
+ * 无线局域网（WIFI，页面叫 WLAN / Wi-Fi，要连上网），手机移动网络（CELLULAR，
+ * 页面叫手机网络，要有地址），有线这一族（ETHERNET 与 OTHER，页面统一叫以太网，
+ * 也要有地址）。
  */
 data class NetworkSnapshot(
     val id: String? = null,
@@ -1323,6 +1337,13 @@ data class NetworkSnapshot(
     val freqMhz: String? = null,
     val ipv4: String? = null,
     val ipv6: String? = null,
+    /**
+     * 底层事实：这条链路有没有"真在用"的地址（IPv4 或非链路本地 IPv6）。
+     *
+     * 三态：null = 底层没发（读失败或老后端），true / false = 底层查过给出的结论。
+     * 只有手机网络的注册过滤用这一格 —— 无线那边看的是 SSID（连上网才有）。
+     */
+    val hasDataAddress: Boolean? = null,
     val signalPercent: Float? = null,
     val sendBytesPerSec: Double? = null,
     val receiveBytesPerSec: Double? = null
@@ -1340,12 +1361,82 @@ data class NetworkSnapshot(
 
         val value = role?.trim()?.uppercase()
 
-        if (!value.isNullOrEmpty()) return value == "WIFI"
+        if (!value.isNullOrEmpty()) return value == NET_ROLE_WIFI
 
         val label = (iface ?: name)?.trim()?.lowercase() ?: return false
 
         return label.startsWith("wlan") || label.startsWith("wifi") || label.startsWith("wl")
     }
+
+    /**
+     * 底层给的角色键：去空白、转大写；没给就是 null。
+     *
+     * 单独抽出来是因为 [isCellular] / [isEthernet] 用同一口径，
+     * 免得一处 trim 一处不 trim，出现"同一个 role 两种判定"。
+     */
+    private fun roleKey(): String? = role?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+
+    /**
+     * 是不是手机移动网络（cellular）。
+     *
+     * 只认底层给的 role=CELLULAR：rmnet / ccmni / pdp / wwan 那一套名字判定在
+     * C 侧的 net_role_of() 里，这边不重复猜一遍 —— 两边各写一份规则，
+     * 迟早出现"底层说是 WLAN、页面说是手机网络"这种打架。
+     */
+    fun isCellular(): Boolean = roleKey() == NET_ROLE_CELLULAR
+
+    /**
+     * 是不是有线以太网（底层挂在真实总线上的那一种）。
+     *
+     * 只认 role=ETHERNET；role=OTHER 的那些也算"以太网适配器"，见 [isWired]。
+     */
+    fun isEthernet(): Boolean = roleKey() == NET_ROLE_ETHERNET
+
+    /** 是不是底层分不出型号的其它接口（tun / ipsec / dummy / 没有 device 链接的有线网口 …）。 */
+    fun isOther(): Boolean = roleKey() == NET_ROLE_OTHER
+
+    /**
+     * 是不是"以太网这一类"：ETHERNET 与 OTHER 合在一起。
+     *
+     * 手机 / 平板上的 USB 网卡、扩展坞网口，有的带 device 链接（判成 ETHERNET），
+     * 有的没有（落到 OTHER）。对用户来说都是一根网线，页面没必要分两套，
+     * 所以类型名统一写「以太网」，序号也在这两类之间连续数（以太网、以太网 1 …）。
+     *
+     * 需要知道的一层：tun0 / ipsec0 这类 VPN 接口也在 OTHER 里，只要有真地址
+     * 就会显示成「以太网」—— 这是"其它适配器也算以太网"这个口径的直接结果。
+     * 以后要单独把 VPN 排除，只需在注册过滤里加一条名字前缀判断。
+     */
+    fun isWired(): Boolean = isEthernet() || isOther()
+
+    /**
+     * 这块网卡有没有"正在用"的地址。
+     *
+     * 优先用底层给的 [hasDataAddress]：它按"非链路本地"判定，能把一堆只挂着 fe80::
+     * 的 rmnet 空壳筛掉（手机上的移动网络接口常常有七八个：rmnet_data0..7、rmnet_ipa0、
+     * ccmni0 …，全注册会把左栏塞满）。底层没发这一格（读失败 / 老后端）时才退回
+     * "有 ipv4 或 ipv6 就算有" —— 老逻辑的口径，宁可多显示一块也不漏掉真的那条。
+     */
+    fun hasAddress(): Boolean =
+        hasDataAddress ?: (!ipv4.isNullOrBlank() || !ipv6.isNullOrBlank())
+
+    /**
+     * SSID 这一行要不要出现。
+     *
+     * 只有无线有 SSID。手机网络与以太网都没有这个概念，整行不画 ——
+     * 写成"不支持"只是噪音。以后若要给移动网络补"运营商 / 网络名"，
+     * 另起一行，别直接复用 SSID 这行。
+     */
+    val showsSsidRow: Boolean get() = !isCellular() && !isWired()
+
+    /**
+     * 信号强度这一行要不要出现。
+     *
+     * 现在底层只能读无线的信号（iw 那条路），移动网络与以太网都没有这份数据，
+     * 所以这两类整行不画。判据写成"有没有值"而不是按类型写死：
+     * 以后底层把 signal_percent 补上来，这行自动出现，这里不用再改。
+     */
+    val showsSignalRow: Boolean
+        get() = signalPercent != null || (!isCellular() && !isWired())
 
     // ---------- 显示文案 ----------
 
@@ -1355,7 +1446,27 @@ data class NetworkSnapshot(
 
     fun ssidText(): String = textOrUnsupported(ssid)
 
-    fun linkTypeText(): String = textOrUnsupported(linkType)
+    /**
+     * 连接类型。
+     *
+     * 无线：底层给什么写什么（802.11ax / 802.11ac …），读不到写"不支持"。
+     * 手机网络：底层现在拿不到制式（4G / 5G / LTE 要 TelephonyManager 那边的数据，
+     * 走的是另一条通路），按产品口径默认写「手机网络」。
+     * 以太网：底层不发 link_type（网线也没有 802.11 代际这回事），默认写「以太网」。
+     * 等以后底层把 link_type 发上来（比如 "5G NR" / "1000BASE-T"），
+     * 第一个分支就直接显示真值 —— 升级点只在这一处。
+     */
+    fun linkTypeText(): String {
+
+        val value = linkType?.trim()
+
+        return when {
+            !value.isNullOrEmpty() -> value
+            isCellular() -> NETWORK_CELLULAR_LINK_TEXT
+            isWired() -> NETWORK_WIRED_LINK_TEXT
+            else -> NETWORK_UNSUPPORTED_TEXT
+        }
+    }
 
     fun ipv4Text(): String = textOrUnsupported(ipv4)
 
@@ -1376,6 +1487,31 @@ data class NetworkSnapshot(
 
 /** 网卡页里"读不到"的统一文案。模型层与页面层共用一份，免得两处写出不同字。 */
 internal const val NETWORK_UNSUPPORTED_TEXT = "不支持"
+
+/** 底层 role 字段的取值（与 C 侧 TM_NET_ROLE_* 同一个字，一边改两边都得改）。 */
+internal const val NET_ROLE_WIFI = "WIFI"
+
+internal const val NET_ROLE_CELLULAR = "CELLULAR"
+
+internal const val NET_ROLE_ETHERNET = "ETHERNET"
+
+internal const val NET_ROLE_OTHER = "OTHER"
+
+/**
+ * 手机网络的"连接类型"默认文案。
+ *
+ * 底层暂时给不出 4G / 5G / LTE 这类制式，先按产品口径写「手机网络」；
+ * 以后底层发了 link_type，[NetworkSnapshot.linkTypeText] 会优先用真值。
+ */
+internal const val NETWORK_CELLULAR_LINK_TEXT = "手机网络"
+
+/**
+ * 以太网的"连接类型"默认文案。
+ *
+ * 底层对有线接口不发 link_type（没有 802.11 代际，也没读网口速率），
+ * 先按产品口径写「以太网」；以后底层发 "1000BASE-T" 之类的真值时会自动盖过去。
+ */
+internal const val NETWORK_WIRED_LINK_TEXT = "以太网"
 
 /**
  * 网卡速率文案：按量级选 Kb / Mb（抄 Windows 的口径，写"Kbps"），
@@ -1416,7 +1552,7 @@ internal fun networkRateText(bytesPerSec: Double?): String {
  *
  * 与磁盘 / 网卡同一套规矩：字段都可以读不到。文案约定分三种，不要混：
  *   1) 读到了     —— 直接写值；0% / 0.0 GB 都是合法值，不能被当成"没有"；
- *   2) 明确不支持 —— 写「不支持」（这个平台根本没有这一格，例如共享显存、驱动日期）；
+ *   2) 明确不支持 —— 写「不支持」（这个平台根本没有这一格，例如驱动日期、专用 GPU 内存）；
  *   3) 取不到     —— 写「-」（有这一格，这次没读出来）。
  *
  * 键名与 C 侧 build_gpu_devices 一一对应：
@@ -1424,7 +1560,12 @@ internal fun networkRateText(bytesPerSec: Double?): String {
  *   dedicated_total_bytes / dedicated_used_bytes /
  *   shared_total_bytes / shared_used_bytes /
  *   driver_version / driver_date / gfx_api / gfx_api_version /
+ *   vulkan_version / opengl_version（两路各一份，NONE = 查过但没有） /
  *   location / reserved_bytes
+ *
+ * 共享显存这一格有两个来源：桌面卡的 DRM gtt；手机的 UMA 走高通 KGSL 的
+ * `mapped`（含义是 GPU 当前映射住的内存，即 GPU Mapped Memory），
+ * 总量按 MemTotal 记 —— 不是厂商给的显存上限，而是能被 GPU 映射的内存池。
  */
 data class GpuSnapshot(
     val id: String? = null,
@@ -1442,6 +1583,12 @@ data class GpuSnapshot(
     val dedicatedUsedBytes: Long? = null,
     val sharedTotalBytes: Long? = null,
     val sharedUsedBytes: Long? = null,
+
+    /** Vulkan 版本串（如 `1.1`）；`NONE` = 查过但没有，null = 这次没查成 */
+    val vulkanVersion: String? = null,
+
+    /** OpenGL ES 版本串（如 `3.2`）；`NONE` = 查过但没有，null = 这次没查成 */
+    val openglVersion: String? = null,
     val driverVersion: String? = null,
     val driverDate: String? = null,
     val gfxApi: String? = null,
@@ -1518,37 +1665,57 @@ data class GpuSnapshot(
     /** 底层报的图形库名，统一大写去空白，比较时才不用到处 trim。 */
     private fun gfxApiName(): String? = gfxApi?.trim()?.uppercase()
 
+    /** 底层是不是"分字段"报的图形库（新后端才发 vulkan_version / opengl_version）。 */
+    private val apiReportedSplit: Boolean
+        get() = vulkanVersion != null || openglVersion != null
+
+    /** 分字段报的某一路上有没有值：null = 没查成，`NONE` = 查过但确实没有。 */
+    private fun apiPresent(value: String?): Boolean {
+
+        val text = value?.trim()?.uppercase() ?: return false
+
+        return text != "NONE"
+    }
+
     /**
      * 「Vulkan 版本」这一行要不要摆出来。
      *
-     * 两块是**两个独立字段**，不是拼成一行"Vulkan/OpenGL 版本"：
-     * 设备支持 Vulkan 时只摆 Vulkan 版本，OpenGL 那一行整行不画（不留"不支持"占位）；
-     * 反过来只有 OpenGL 时只摆 OpenGL ES 版本。两样都没查成时才两行一起摆，
-     * 各自写"不支持" / "-"，绝不因为"这台机器没这个能力"把整行删掉。
+     * 两行各自独立，底层报了什么就摆什么：
+     *   - 两个都有版本 → 两行都摆；
+     *   - 只有一样 → 只摆那一样，另一行整行不画；
+     *   - 都报 `NONE`（都没有）→ 两行都不摆。
+     * 旧后端（只发 gfx_api 一个键）沿用原来的二选一，免得界面版式突变。
      */
     val showsVulkanRow: Boolean
-        get() = gfxApiName() != "OPENGL"
+        get() = if (apiReportedSplit) apiPresent(vulkanVersion) else gfxApiName() != "OPENGL"
 
     /** 「OpenGL ES 版本」这一行要不要摆出来（规则与 [showsVulkanRow] 对称）。 */
     val showsOpenGlRow: Boolean
-        get() = gfxApiName() != "VULKAN"
+        get() = if (apiReportedSplit) apiPresent(openglVersion) else gfxApiName() != "VULKAN"
 
-    /** Vulkan 版本那一行的取值：支持写版本号，明确不支持写"不支持"，没查成写"-"。 */
-    fun vulkanVersionText(): String = when (gfxApiName()) {
+    /** Vulkan 版本那一行的取值：有版本写版本，旧后端退到 gfx_api 的口径。 */
+    fun vulkanVersionText(): String = when {
 
-        "VULKAN" -> "Vulkan ${gfxApiVersion?.takeIf { it.isNotBlank() } ?: GPU_UNKNOWN_TEXT}"
+        apiPresent(vulkanVersion) -> "Vulkan ${vulkanVersion?.trim() ?: GPU_UNKNOWN_TEXT}"
 
-        "NONE" -> GPU_UNSUPPORTED_TEXT
+        !apiReportedSplit -> gfxApiText()
 
         else -> GPU_UNKNOWN_TEXT
     }
 
     /** OpenGL ES 版本那一行的取值，口径同上。 */
-    fun openGlVersionText(): String = when (gfxApiName()) {
+    fun openGlVersionText(): String = when {
 
-        "OPENGL" -> "OpenGL ES ${gfxApiVersion?.takeIf { it.isNotBlank() } ?: GPU_UNKNOWN_TEXT}"
+        apiPresent(openglVersion) -> "OpenGL ES ${openglVersion?.trim() ?: GPU_UNKNOWN_TEXT}"
 
-        "NONE" -> GPU_UNSUPPORTED_TEXT
+        !apiReportedSplit -> when (gfxApiName()) {
+
+            "OPENGL" -> "OpenGL ES ${gfxApiVersion?.takeIf { it.isNotBlank() } ?: GPU_UNKNOWN_TEXT}"
+
+            "NONE" -> GPU_UNSUPPORTED_TEXT
+
+            else -> GPU_UNKNOWN_TEXT
+        }
 
         else -> GPU_UNKNOWN_TEXT
     }
