@@ -1,5 +1,7 @@
 package com.android.taskmanager.data
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.floor
@@ -64,7 +66,11 @@ data class PerformanceSnapshot(
     /** 处理器商品名（人看得懂的名字）。由 ELF 侧补实现，现在通常是 null。 */
     val cpuName: String? = null,
 
-    /** 虚拟化方案，形如 已启用(方案名) / 已禁用 / 不支持。由 ELF 侧补实现。 */
+    /**
+     * 虚拟化状态码（协议原生形态，不保证是给人看的文案）：
+     * ENABLED_KVM / ENABLED_GUNYAH / ENABLED_GENIEZONE / ENABLED_HALLA / DISABLED / UNSUPPORTED。
+     * 显示时走 [BackendDisplayText.virtualizationText]，不要在界面上直接用它。
+     */
     val virtualization: String? = null,
 
     /** 进程总数。 */
@@ -259,15 +265,16 @@ data class PerformanceSnapshot(
     }
 
     /**
-     * 虚拟化：后端给什么就显示什么（"不支持 / 已禁用 / 已启用(KVM)" 整串直出）。
+     * 虚拟化：后端给的是状态码（ENABLED_KVM / DISABLED / UNSUPPORTED），
+     * 经 [BackendDisplayText.virtualizationText] 翻成本地语言后再显示。
      *
      * 返回 null = 整行不出现，只有一种情况：本程序自己跑在虚拟机里。
      */
     fun virtualizationText(): String? =
-        if (isVirtualMachine) null else (virtualization ?: "不支持")
+        if (isVirtualMachine) null else BackendDisplayText.virtualizationText(virtualization)
 
     /** 虚拟机：只在确实是虚拟机时给"是"，其余一律整行不出现（没有"否"这个状态）。 */
-    fun virtualMachineText(): String? = if (isVirtualMachine) "是" else null
+    fun virtualMachineText(): String? = if (isVirtualMachine) AppStrings.s(R.string.data_yes) else null
 
     /**
      * AVF 支持文案。
@@ -282,8 +289,8 @@ data class PerformanceSnapshot(
         if (!avfComponentPresent) return null
 
         return when (avfSupported) {
-            true -> "是"
-            false -> "否"
+            true -> AppStrings.s(R.string.data_yes)
+            false -> AppStrings.s(R.string.data_no)
             null -> null
         }
     }
@@ -574,7 +581,12 @@ data class PerformanceSnapshot(
 
                 gfxApiVersion = device.fields.textValueOf("gfx_api_version"),
 
-                location = device.fields.textValueOf("location"),
+                // 物理位置：只有 PCI 卡才有，三个整数各自发；SoC 核显三格全空
+                pciBus = device.fields.intOf("pci_bus"),
+
+                pciDevice = device.fields.intOf("pci_device"),
+
+                pciFunction = device.fields.intOf("pci_function"),
 
                 reservedBytes = device.fields.longOf("reserved_bytes")
             )
@@ -783,8 +795,9 @@ data class CpuUsagePoint(
  * @param totalBytes            实际内存大小（MemTotal，内核能用的量，图表顶端刻度）
  * @param nominalBytes          标称容量（高通 dt 的 ddr_size，商品上写的那个数）；Linux 给不出就是 null
  * @param specText              内存规格，如 LPDDR5 / LPDDR4X / DDR3（高通 ddr_device_type 枚举换算）
- * @param manufacturer          颗粒厂商（dt 的 ddr_manufacturer_id 按 JEDEC 编号换成名字，
- *                              如"三星（Samsung）"）；读不到 / 编码不在表里就是 null，页面不画这一行
+ * @param manufacturer          颗粒厂商代码（dt 的 ddr_manufacturer_id 按 JEDEC 编号换成英文码，
+ *                              如 SAMSUNG / MICRON）；读不到 / 编码不在表里就是 null，页面不画这一行。
+ *                              显示时走 [BackendDisplayText.memoryVendorText]
  * @param usedBytes             使用中
  * @param compressedBytes       其中已压缩的部分（Windows 的「使用中(已压缩)」括号里那个）
  * @param availableBytes        可用
@@ -806,7 +819,7 @@ data class CpuUsagePoint(
  * @param freePart
  */
 /** 内存页「不支持」的固定文案：底层明确说 Android 上没有这一项。 */
-internal const val MEMORY_UNSUPPORTED_TEXT = "不支持"
+internal val MEMORY_UNSUPPORTED_TEXT: String get() = AppStrings.s(R.string.data_unsupported)
 
 /** 没权限时的占位：一个横线，意思是"也许有，只是这次没读到"。 */
 internal const val MEMORY_ACCESS_DENIED_TEXT = "-"
@@ -821,7 +834,7 @@ internal const val FIELD_STATUS_NOT_AVAILABLE = "NOT_AVAILABLE"
 internal const val FIELD_STATUS_UNSUPPORTED = "UNSUPPORTED"
 
 /** 缓存读不到时的文案：这一级确实不存在 / 平台不导出。 */
-internal const val CACHE_UNSUPPORTED_TEXT = "不支持"
+internal val CACHE_UNSUPPORTED_TEXT: String get() = AppStrings.s(R.string.data_unsupported)
 
 /** 缓存有这一级但读不出来（多半是权限）：写「-」，表示"也许能拿到"。 */
 internal const val CACHE_UNKNOWN_TEXT = "-"
@@ -929,17 +942,25 @@ data class MemorySnapshot(
         val compressed = zramCompressedBytes ?: return null
         val used = zramUsedBytes ?: return null
 
-        val text = StringBuilder()
+        // 四种情况的文案顺序由资源串自己定：中文用"原始X → 压缩Y，实占Z"，英文用 "raw X -> Y, in use Z"
+        val capacity = zramDisksizeBytes?.takeIf { it > 0 }
 
-        text.append("原始 ").append(memorySizeText(original))
-        text.append(" → 压缩 ").append(memorySizeText(compressed))
-        text.append("，实占 ").append(memorySizeText(used))
-
-        zramDisksizeBytes?.takeIf { it > 0 }?.let {
-            text.append("，容量 ").append(memorySizeText(it))
+        return if (capacity != null) {
+            AppStrings.s(
+                R.string.perf_zram_detail_capacity,
+                memorySizeText(original),
+                memorySizeText(compressed),
+                memorySizeText(used),
+                memorySizeText(capacity)
+            )
+        } else {
+            AppStrings.s(
+                R.string.perf_zram_detail,
+                memorySizeText(original),
+                memorySizeText(compressed),
+                memorySizeText(used)
+            )
         }
-
-        return text.toString()
     }
 
     /**
@@ -1045,7 +1066,7 @@ data class MemorySnapshot(
             numeric.toString()
         }
 
-        return "$whole MT/秒"
+        return AppStrings.s(R.string.perf_unit_mt_per_sec, whole)
     }
 
     /**
@@ -1064,7 +1085,7 @@ data class MemorySnapshot(
     }
 
     /** 外观规格：底层给不出就写"其他"（比"未知"读起来像正常答案），这同样不是错误状态。 */
-    fun formFactorText(): String = formFactor?.takeIf { it.isNotBlank() } ?: "其他"
+    fun formFactorText(): String = formFactor?.takeIf { it.isNotBlank() } ?: AppStrings.s(R.string.perf_other)
 
     /**
      * 为硬件保留的内存：有值写容量；没权限写一个横线（提示"也许能拿到"）；
@@ -1213,7 +1234,7 @@ data class DiskSnapshot(
 
         val rounded = round(value * 10.0) / 10.0
 
-        if (rounded <= 0.0) return "0 毫秒"
+        if (rounded <= 0.0) return AppStrings.s(R.string.perf_zero_ms)
 
         val text = if (rounded % 1.0 == 0.0) {
             String.format(Locale.US, "%.0f", rounded)
@@ -1221,7 +1242,7 @@ data class DiskSnapshot(
             String.format(Locale.US, "%.1f", rounded)
         }
 
-        return "$text 毫秒"
+        return AppStrings.s(R.string.perf_unit_ms, text)
     }
 
     /** 读取速度：量级自动选单位（KB/秒 / MB/秒 …）。 */
@@ -1243,8 +1264,8 @@ data class DiskSnapshot(
     fun pageFileText(): String = yesNoText(pageFile)
 
     private fun yesNoText(value: Boolean?): String = when (value) {
-        true -> "是"
-        false -> "否"
+        true -> AppStrings.s(R.string.data_yes)
+        false -> AppStrings.s(R.string.data_no)
         null -> "—"
     }
 }
@@ -1311,10 +1332,10 @@ internal fun diskRateText(bytesPerSec: Double?): String {
 
     val unit = when {
 
-        bytesPerSec >= kb * kb * kb -> Triple(kb * kb * kb, "GB/秒", 3)
-        bytesPerSec >= kb * kb -> Triple(kb * kb, "MB/秒", 2)
-        bytesPerSec >= kb -> Triple(kb, "KB/秒", 1)
-        else -> Triple(1.0, "B/秒", 0)
+        bytesPerSec >= kb * kb * kb -> Triple(kb * kb * kb, AppStrings.s(R.string.perf_unit_gbps), 3)
+        bytesPerSec >= kb * kb -> Triple(kb * kb, AppStrings.s(R.string.perf_unit_mbps), 2)
+        bytesPerSec >= kb -> Triple(kb, AppStrings.s(R.string.perf_unit_kbps), 1)
+        else -> Triple(1.0, AppStrings.s(R.string.perf_unit_bps), 0)
     }
 
     val value = bytesPerSec / unit.first
@@ -1349,7 +1370,7 @@ internal fun diskRateTextNice(bytesPerSec: Double?): String {
 
     if (bytesPerSec == null || bytesPerSec < 0.0) return "—"
 
-    if (bytesPerSec == 0.0) return "0 KB/秒"
+    if (bytesPerSec == 0.0) return AppStrings.s(R.string.perf_zero_kbps)
 
     // 10 的整数次幂：量级
     val magnitude = 10.0.pow(floor(log10(bytesPerSec)))
@@ -1599,7 +1620,7 @@ data class NetworkSnapshot(
 }
 
 /** 网卡页里"读不到"的统一文案。模型层与页面层共用一份，免得两处写出不同字。 */
-internal const val NETWORK_UNSUPPORTED_TEXT = "不支持"
+internal val NETWORK_UNSUPPORTED_TEXT: String get() = AppStrings.s(R.string.data_unsupported)
 
 /** 底层 role 字段的取值（与 C 侧 TM_NET_ROLE_* 同一个字，一边改两边都得改）。 */
 internal const val NET_ROLE_WIFI = "WIFI"
@@ -1616,7 +1637,7 @@ internal const val NET_ROLE_OTHER = "OTHER"
  * 底层暂时给不出 4G / 5G / LTE 这类制式，先按产品口径写「手机网络」；
  * 以后底层发了 link_type，[NetworkSnapshot.linkTypeText] 会优先用真值。
  */
-internal const val NETWORK_CELLULAR_LINK_TEXT = "手机网络"
+internal val NETWORK_CELLULAR_LINK_TEXT: String get() = AppStrings.s(R.string.perf_link_cellular)
 
 /**
  * 以太网的"连接类型"默认文案。
@@ -1624,7 +1645,7 @@ internal const val NETWORK_CELLULAR_LINK_TEXT = "手机网络"
  * 底层对有线接口不发 link_type（没有 802.11 代际，也没读网口速率），
  * 先按产品口径写「以太网」；以后底层发 "1000BASE-T" 之类的真值时会自动盖过去。
  */
-internal const val NETWORK_WIRED_LINK_TEXT = "以太网"
+internal val NETWORK_WIRED_LINK_TEXT: String get() = AppStrings.s(R.string.perf_link_wired)
 
 /**
  * 网卡速率文案：按量级选 Kb / Mb（抄 Windows 的口径，写"Kbps"），
@@ -1674,7 +1695,7 @@ internal fun networkRateText(bytesPerSec: Double?): String {
  *   shared_total_bytes / shared_used_bytes /
  *   driver_version / driver_date / gfx_api / gfx_api_version /
  *   vulkan_version / opengl_version（两路各一份，NONE = 查过但没有） /
- *   location / reserved_bytes
+ *   pci_bus / pci_device / pci_function / reserved_bytes
  *
  * 共享显存这一格有两个来源：桌面卡的 DRM gtt；手机的 UMA 走高通 KGSL 的
  * `mapped`（含义是 GPU 当前映射住的内存，即 GPU Mapped Memory），
@@ -1706,7 +1727,13 @@ data class GpuSnapshot(
     val driverDate: String? = null,
     val gfxApi: String? = null,
     val gfxApiVersion: String? = null,
-    val location: String? = null,
+    /**
+     * PCI 物理位置的三段（后端发的是三个整数，不是现成文案）。
+     * 三个都为 null = 不是 PCI 设备（SoC 核显），页面显示「不支持」。
+     */
+    val pciBus: Int? = null,
+    val pciDevice: Int? = null,
+    val pciFunction: Int? = null,
     val reservedBytes: Long? = null
 ) {
 
@@ -1833,7 +1860,8 @@ data class GpuSnapshot(
         else -> GPU_UNKNOWN_TEXT
     }
 
-    fun locationText(): String = textOrUnsupported(location)
+    /** 物理位置：由三个整数拼成本地语言文案，缺任何一段都算「不支持」。 */
+    fun locationText(): String = BackendDisplayText.pciLocationText(pciBus, pciDevice, pciFunction)
 
     /** 为硬件保留的内存：Android 上没有这一格，读不到就「不支持」。 */
     fun reservedText(): String = reservedBytes?.let { gpuMemoryValueText(it) } ?: GPU_UNSUPPORTED_TEXT
@@ -1857,14 +1885,14 @@ data class GpuSnapshot(
 }
 
 /** GPU 页里"明确不支持"的统一文案。 */
-internal const val GPU_UNSUPPORTED_TEXT = "不支持"
+internal val GPU_UNSUPPORTED_TEXT: String get() = AppStrings.s(R.string.data_unsupported)
 
 /** GPU 页里"这次没读出来"的统一文案。 */
 internal const val GPU_UNKNOWN_TEXT = "-"
 
 /** 温度这一格的"没有这个能力"专属文案：Windows 那张页就是这么写的（"无"），
  * 与其它字段的"不支持"区分开，免得看起来像"读不到"。 */
-internal const val GPU_NO_VALUE_TEXT = "无"
+internal val GPU_NO_VALUE_TEXT: String get() = AppStrings.s(R.string.perf_none_short)
 
 /**
  * 显存数值：固定按 GB、一位小数（`4.0 GB`），和 Windows 那一页的写法一致。

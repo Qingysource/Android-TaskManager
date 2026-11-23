@@ -126,6 +126,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
+import com.android.taskmanager.data.BackendDisplayText
 import com.android.taskmanager.data.CpuUsagePoint
 import com.android.taskmanager.data.DiskSnapshot
 import com.android.taskmanager.data.GPU_UNSUPPORTED_TEXT
@@ -201,8 +204,8 @@ private const val TEST_HARDWARE_NAME = "NAME"
 // 明细读不到写"不支持"、速率没有计数写 0 Kbps，都由模型层算好。
 // 这里只留页面自己需要的一份文案：适配器名缺失时的兜底，以及吞吐量图的量程 / 预警线标注。
 
-/** 适配器名没有值时的兜底（与模型层"不支持"同一个字）。 */
-private const val NETWORK_UNSUPPORTED = NETWORK_UNSUPPORTED_TEXT
+/** 适配器名没有值时的兜底（与模型层"不支持"共用同一份文案）。 */
+private val NETWORK_UNSUPPORTED: String get() = NETWORK_UNSUPPORTED_TEXT
 
 /** 吞吐量图还没有量程时的兜底文案（有数据后由图表对象自己算）。 */
 private const val NETWORK_SCALE_TEXT = "5 Mbps"
@@ -220,9 +223,9 @@ private enum class HardwareKind(val displayName: String) {
 
     CPU("CPU"),
 
-    MEMORY("内存"),
+    MEMORY(AppStrings.s(R.string.perf_memory)),
 
-    DISK("磁盘"),
+    DISK(AppStrings.s(R.string.perf_disk)),
 
     NETWORK("WLAN"),
 
@@ -318,20 +321,20 @@ private fun cpuSummaryRows(
 ): List<List<CpuStat>> = listOf(
     listOf(
         CpuStat(
-            "利用率", snapshot.cpuUsageText(usageDecimals), emphasis = true,
+            AppStrings.s(R.string.perf_utilization), snapshot.cpuUsageText(usageDecimals), emphasis = true,
             wideWidth = 66.dp, narrowWidth = 54.dp
         ),
         CpuStat(
-            "速度", snapshot.cpuSpeedText(), emphasis = true,
+            AppStrings.s(R.string.perf_speed), snapshot.cpuSpeedText(), emphasis = true,
             wideWidth = 122.dp, narrowWidth = 98.dp
         )
     ),
 
     listOf(
-        CpuStat("进程", snapshot.processCountText(), wideWidth = 46.dp, narrowWidth = 46.dp),
-        CpuStat("线程", snapshot.threadCountText(), wideWidth = 46.dp, narrowWidth = 46.dp),
+        CpuStat(AppStrings.s(R.string.perf_processes), snapshot.processCountText(), wideWidth = 46.dp, narrowWidth = 46.dp),
+        CpuStat(AppStrings.s(R.string.perf_threads), snapshot.threadCountText(), wideWidth = 46.dp, narrowWidth = 46.dp),
         CpuStat(
-            "文件描述符", snapshot.fdCountText(),
+            AppStrings.s(R.string.perf_fd), snapshot.fdCountText(),
             wideWidth = 62.dp, narrowWidth = 46.dp
         )
     ),
@@ -339,13 +342,13 @@ private fun cpuSummaryRows(
     // 第三行：正常运行时间，右边可能还有温度
     buildList {
 
-        add(CpuStat("正常运行时间", snapshot.uptimeText(), wideWidth = 92.dp, narrowWidth = 92.dp))
+        add(CpuStat(AppStrings.s(R.string.perf_uptime), snapshot.uptimeText(), wideWidth = 92.dp, narrowWidth = 92.dp))
 
         // 温度：底层真的报了才加这一项（没有就连标签都不画，不留空格子）。
-        // 字号 / 行高跟"正常运行时间"完全一致 —— 它俩在同一行，用同一个 CpuStat 渲染。
+        // 字号 / 行高跟AppStrings.s(R.string.perf_uptime)完全一致 —— 它俩在同一行，用同一个 CpuStat 渲染。
         snapshot.cpuTemperatureText()?.let { text ->
 
-            add(CpuStat("温度", text, wideWidth = 72.dp, narrowWidth = 62.dp))
+            add(CpuStat(AppStrings.s(R.string.perf_temperature), text, wideWidth = 72.dp, narrowWidth = 62.dp))
         }
     }
 )
@@ -358,24 +361,24 @@ private fun cpuSummaryRows(
  *
  * 最后三行（虚拟机 / 虚拟化 / AVF 支持）的取舍全在数据层：
  * 是虚拟机 → 只留"虚拟机: 是"，另外两行让位；
- * 不是虚拟机 → 给"虚拟化"（不支持 / 已禁用 / 已启用(实现)），
+ * 不是虚拟机 → 给AppStrings.s(R.string.perf_virtualization)（不支持 / 已禁用 / 已启用(实现)），
  * 系统里真有 AVF 组件时才再加一行"AVF 支持: 是/否"。
  * 这里只把拿到的文案排进列表，不做任何判断。
  */
 private fun cpuDetailLines(snapshot: PerformanceSnapshot): List<Pair<String, String>> = buildList {
 
-    add("基准速度" to snapshot.cpuBaseText())
-    add("插槽" to snapshot.socketsText())
-    add("内核" to snapshot.coresText())
-    add("逻辑处理器" to snapshot.logicalCpusText())
+    add(AppStrings.s(R.string.perf_base_speed) to snapshot.cpuBaseText())
+    add(AppStrings.s(R.string.perf_sockets) to snapshot.socketsText())
+    add(AppStrings.s(R.string.perf_cores) to snapshot.coresText())
+    add(AppStrings.s(R.string.perf_logical) to snapshot.logicalCpusText())
 
-    snapshot.virtualMachineText()?.let { add("虚拟机" to it) }
-    snapshot.virtualizationText()?.let { add("虚拟化" to it) }
-    snapshot.avfText()?.let { add("AVF 支持" to it) }
+    snapshot.virtualMachineText()?.let { add(AppStrings.s(R.string.perf_vm) to it) }
+    snapshot.virtualizationText()?.let { add(AppStrings.s(R.string.perf_virtualization) to it) }
+    snapshot.avfText()?.let { add(AppStrings.s(R.string.perf_avf) to it) }
 
-    add("L1 缓存" to snapshot.l1Text())
-    add("L2 缓存" to snapshot.l2Text())
-    add("L3 缓存" to snapshot.l3Text())
+    add(AppStrings.s(R.string.perf_l1) to snapshot.l1Text())
+    add(AppStrings.s(R.string.perf_l2) to snapshot.l2Text())
+    add(AppStrings.s(R.string.perf_l3) to snapshot.l3Text())
 }
 
 /**
@@ -432,31 +435,31 @@ private fun diskClipboardText(disk: DiskSnapshot?): String {
 
     return buildString {
 
-        appendLine("磁盘")
+        appendLine(AppStrings.s(R.string.perf_disk))
 
         appendLine()
 
-        append("\t名称:\t").appendLine(data.nameText())
+        append(AppStrings.s(R.string.copy_disk_name)).appendLine(data.nameText())
 
-        append("\t容量:\t").appendLine(data.capacityText())
+        append(AppStrings.s(R.string.copy_disk_capacity)).appendLine(data.capacityText())
 
-        append("\t已格式化:\t").appendLine(data.formattedText())
+        append(AppStrings.s(R.string.copy_disk_formatted)).appendLine(data.formattedText())
 
-        append("\t系统磁盘:\t").appendLine(data.systemDiskText())
+        append(AppStrings.s(R.string.copy_disk_system)).appendLine(data.systemDiskText())
 
-        append("\t页面文件:\t").appendLine(data.pageFileText())
+        append(AppStrings.s(R.string.copy_disk_pagefile)).appendLine(data.pageFileText())
 
-        append("\t类型:\t").appendLine(data.typeText())
+        append(AppStrings.s(R.string.copy_disk_type)).appendLine(data.typeText())
 
         appendLine()
 
-        append("\t活动时间\t").appendLine(data.activityText())
+        append(AppStrings.s(R.string.copy_disk_active)).appendLine(data.activityText())
 
-        append("\t平均响应时间\t").appendLine(data.responseText())
+        append(AppStrings.s(R.string.copy_disk_response)).appendLine(data.responseText())
 
-        append("\t读取速度\t").appendLine(data.readSpeedText())
+        append(AppStrings.s(R.string.copy_disk_read)).appendLine(data.readSpeedText())
 
-        append("\t写入速度\t").appendLine(data.writeSpeedText())
+        append(AppStrings.s(R.string.copy_disk_write)).appendLine(data.writeSpeedText())
 
         appendLine()
     }
@@ -484,7 +487,7 @@ private fun networkClipboardText(
 
         appendLine()
 
-        append("\t适配器名称:\t").appendLine(data.nameText())
+        append(AppStrings.s(R.string.copy_net_name)).appendLine(data.nameText())
 
         // SSID / 信号强度是无线专有字段：手机网络没有这两样，整行不写
         // （判据在 NetworkSnapshot.showsSsidRow / showsSignalRow）
@@ -492,23 +495,23 @@ private fun networkClipboardText(
             append("\tSSID:\t").appendLine(data.ssidText())
         }
 
-        append("\t连接类型:\t").appendLine(data.linkTypeText())
+        append(AppStrings.s(R.string.copy_net_link)).appendLine(data.linkTypeText())
 
-        append("\tIPv4 地址:\t").appendLine(data.ipv4Text())
+        append(AppStrings.s(R.string.copy_net_ipv4)).appendLine(data.ipv4Text())
 
-        append("\tIPv6 地址:\t").appendLine(data.ipv6Text())
+        append(AppStrings.s(R.string.copy_net_ipv6)).appendLine(data.ipv6Text())
 
         if (data.showsSignalRow) {
-            append("\t信号强度:\t").appendLine(data.signalText())
+            append(AppStrings.s(R.string.copy_net_signal)).appendLine(data.signalText())
         }
 
         appendLine()
 
-        append("\t吞吐量\t").appendLine(scaleText)
+        append(AppStrings.s(R.string.copy_net_throughput)).appendLine(scaleText)
 
-        append("\t发送\t").appendLine(data.sendText())
+        append(AppStrings.s(R.string.copy_net_send)).appendLine(data.sendText())
 
-        append("\t接收\t").appendLine(data.receiveText())
+        append(AppStrings.s(R.string.copy_net_receive)).appendLine(data.receiveText())
 
         appendLine()
     }
@@ -541,23 +544,23 @@ private fun memoryClipboardText(snapshot: PerformanceSnapshot): String {
 
     return buildString {
 
-        append("内存")
+        append(AppStrings.s(R.string.perf_memory))
 
         append("\n\n\t").append(memory.nameText())
 
         // 规格块：静态信息，开机之后基本不变
-        memory.speedText()?.let { append("\n\t速度:\t").append(it) }
-        append("\n\t已使用的插槽:\t").append(memory.slotsText())
-        append("\n\t外观规格:\t").append(memory.formFactorText())
-        append("\n\t为硬件保留的内存:\t").append(memory.reservedText())
+        memory.speedText()?.let { append("\n" + AppStrings.s(R.string.copy_mem_speed)).append(it) }
+        append("\n" + AppStrings.s(R.string.copy_mem_slots)).append(memory.slotsText())
+        append("\n" + AppStrings.s(R.string.copy_mem_formfactor)).append(memory.formFactorText())
+        append("\n" + AppStrings.s(R.string.copy_mem_reserved)).append(memory.reservedText())
 
         // 实时块：用 Linux 的名字，顺序照任务管理器（使用中排最后）
-        append("\n\n\t可用\t").append(memory.availableText())
-        append("\n\t已缓存\t").append(memory.cachedText())
-        append("\n\t已提交\t").append(memory.committedText())
-        append("\n\t可回收内核缓存\t").append(memory.reclaimableText())
-        append("\n\t不可回收内核缓存\t").append(memory.nonReclaimableText())
-        append("\n\t使用中(已压缩)\t").append(memory.usedText())
+        append("\n\n" + AppStrings.s(R.string.copy_mem_available)).append(memory.availableText())
+        append("\n" + AppStrings.s(R.string.copy_mem_cached)).append(memory.cachedText())
+        append("\n" + AppStrings.s(R.string.copy_mem_committed)).append(memory.committedText())
+        append("\n" + AppStrings.s(R.string.copy_mem_reclaimable)).append(memory.reclaimableText())
+        append("\n" + AppStrings.s(R.string.copy_mem_nonreclaimable)).append(memory.nonReclaimableText())
+        append("\n" + AppStrings.s(R.string.copy_mem_used_compressed)).append(memory.usedText())
 
         append("\n\n")
     }
@@ -598,29 +601,29 @@ private fun cpuClipboardText(snapshot: PerformanceSnapshot, usageDecimals: Int):
         append("\n\n\t").append(name)
 
         // 规格块：静态信息，开机之后基本不变
-        append("\n\n\t基准速度:\t").append(snapshot.cpuBaseText())
-        append("\n\t插槽:\t").append(snapshot.socketsText())
-        append("\n\t内核:\t").append(snapshot.coresText())
-        append("\n\t逻辑处理器:\t").append(snapshot.logicalCpusText())
+        append("\n\n" + AppStrings.s(R.string.copy_cpu_base)).append(snapshot.cpuBaseText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_sockets)).append(snapshot.socketsText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_cores)).append(snapshot.coresText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_logical)).append(snapshot.logicalCpusText())
 
         // 与页面同一套取舍：虚拟机优先，非虚拟机才写虚拟化与 AVF
-        snapshot.virtualMachineText()?.let { append("\n\t虚拟机:\t").append(it) }
-        snapshot.virtualizationText()?.let { append("\n\t虚拟化:\t").append(it) }
-        snapshot.avfText()?.let { append("\n\tAVF 支持:\t").append(it) }
+        snapshot.virtualMachineText()?.let { append("\n" + AppStrings.s(R.string.copy_cpu_vm)).append(it) }
+        snapshot.virtualizationText()?.let { append("\n" + AppStrings.s(R.string.copy_cpu_virt)).append(it) }
+        snapshot.avfText()?.let { append("\n" + AppStrings.s(R.string.copy_cpu_avf)).append(it) }
 
-        append("\n\tL1 缓存:\t").append(snapshot.l1Text())
-        append("\n\tL2 缓存:\t").append(snapshot.l2Text())
-        append("\n\tL3 缓存:\t").append(snapshot.l3Text())
+        append("\n" + AppStrings.s(R.string.copy_cpu_l1)).append(snapshot.l1Text())
+        append("\n" + AppStrings.s(R.string.copy_cpu_l2)).append(snapshot.l2Text())
+        append("\n" + AppStrings.s(R.string.copy_cpu_l3)).append(snapshot.l3Text())
 
         // 实时块：每秒都在变，粘出去就是"复制那一刻"的值
-        append("\n\n\t利用率\t").append(snapshot.cpuUsageText(usageDecimals))
-        append("\n\t速度\t").append(snapshot.cpuSpeedText())
-        append("\n\t正常运行时间\t").append(snapshot.uptimeText())
-        append("\n\t进程\t").append(snapshot.processCountText())
-        append("\n\t线程\t").append(snapshot.threadCountText())
+        append("\n\n" + AppStrings.s(R.string.copy_cpu_util)).append(snapshot.cpuUsageText(usageDecimals))
+        append("\n" + AppStrings.s(R.string.copy_cpu_speed)).append(snapshot.cpuSpeedText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_uptime)).append(snapshot.uptimeText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_processes)).append(snapshot.processCountText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_threads)).append(snapshot.threadCountText())
 
         // 与页面统计区同名：这一项在 Linux 上是文件描述符，不套用任务管理器的"句柄"
-        append("\n\t文件描述符\t").append(snapshot.fdCountText())
+        append("\n" + AppStrings.s(R.string.copy_cpu_fds)).append(snapshot.fdCountText())
 
         append("\n\n")
     }
@@ -672,7 +675,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
     // 窗口文案 / 利用率小数位都由管理器算好了：它们跟着设置页的档位变，
     // 所以不在页面里缓存 —— 那样改完设置回来还得等一次重组才对上。
-    val windowLabel = manager.windowLabel
+    val windowCode = manager.windowCode
 
     val usageDecimals = manager.usageDecimals
 
@@ -723,7 +726,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
             HardwareSlot(
                 kind = HardwareKind.MEMORY,
                 diskIndex = 0,
-                title = "内存",
+                title = AppStrings.s(R.string.perf_memory),
                 line2 = "${snapshot.memory?.amountText() ?: "—"} " +
                     "(${snapshot.memoryUsageText(usageDecimals)})",
                 line3 = "",
@@ -764,7 +767,11 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                     // 第二行是适配器名（wlan0 / rmnet_data0），与右栏右上角那个
                     // name 字段同源；**不要**和上面那行写一样 —— 重复的信息没意义
                     line2 = network.nameText(),
-                    line3 = "发送: ${network.sendText()}  接收: ${network.receiveText()}",
+                    line3 = AppStrings.s(
+                        R.string.perf_send_receive,
+                        network.sendText(),
+                        network.receiveText()
+                    ),
                     // 迷你图用接收那一条（与详情页紫色曲线同一个环形缓冲）
                     history = manager.networkChart(networks, index)?.receive ?: emptyList()
                 )
@@ -913,10 +920,10 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
 
         clipboard?.setPrimaryClip(
-            ClipData.newPlainText("性能页图表", text)
+            ClipData.newPlainText(AppStrings.s(R.string.perf_chart), text)
         )
 
-        Toast.makeText(context, "已复制当前图表", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, AppStrings.s(R.string.perf_chart_copied), Toast.LENGTH_SHORT).show()
     }
 
     // 把这份复制函数挂到管理器上：菜单按钮现在画在宿主的页名行（搜索框那一排），
@@ -944,7 +951,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
         ) {
 
             Text(
-                text = "双击图表退出图形摘要视图",
+                text = AppStrings.s(R.string.perf_summary_hint),
 
                 style = MaterialTheme.typography.bodySmall,
 
@@ -967,7 +974,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                 history = detailHistory,
 
-                windowLabel = windowLabel,
+                windowCode = windowCode,
 
                 wide = true,
 
@@ -1114,7 +1121,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         history = detailHistory,
 
-                        windowLabel = windowLabel,
+                        windowCode = windowCode,
 
                         wide = true,
 
@@ -1165,7 +1172,7 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
 
                         history = detailHistory,
 
-                        windowLabel = windowLabel,
+                        windowCode = windowCode,
 
                         wide = false,
 
@@ -1260,9 +1267,9 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
             // NPU 目前底层还没有采集，先固定占位并置灰，等有数据源再把 enabled 打开。
             viewTargets = listOf(
                 ChartViewTarget("CPU(P)") { manager.selectKind("CPU") },
-                ChartViewTarget("内存(M)") { manager.selectKind("MEMORY") },
-                ChartViewTarget("磁盘(D)", enabled = disks.isNotEmpty()) { manager.selectDisk(0) },
-                ChartViewTarget("网络(N)", enabled = networks.isNotEmpty()) { manager.selectNetwork(0) },
+                ChartViewTarget(AppStrings.s(R.string.perf_memory_m)) { manager.selectKind("MEMORY") },
+                ChartViewTarget(AppStrings.s(R.string.perf_disk_d), enabled = disks.isNotEmpty()) { manager.selectDisk(0) },
+                ChartViewTarget(AppStrings.s(R.string.perf_network_n), enabled = networks.isNotEmpty()) { manager.selectNetwork(0) },
                 ChartViewTarget("GPU(G)", enabled = gpus.isNotEmpty()) { manager.selectGpu(0) },
                 ChartViewTarget("NPU", enabled = false) { }
             ),
@@ -1333,24 +1340,24 @@ private fun memorySummaryRows(memory: MemorySnapshot?): List<List<CpuStat>> {
     return listOf(
         listOf(
             CpuStat(
-                "使用中(已压缩)", data.usedText(),
+                AppStrings.s(R.string.perf_in_use_compressed), data.usedText(),
                 wideWidth = 118.dp, narrowWidth = 104.dp
             ),
-            CpuStat("可用", data.availableText(), wideWidth = 72.dp, narrowWidth = 62.dp)
+            CpuStat(AppStrings.s(R.string.perf_available), data.availableText(), wideWidth = 72.dp, narrowWidth = 62.dp)
         ),
 
         listOf(
-            CpuStat("已提交", data.committedText(), wideWidth = 104.dp, narrowWidth = 92.dp),
-            CpuStat("已缓存", data.cachedText(), wideWidth = 72.dp, narrowWidth = 62.dp)
+            CpuStat(AppStrings.s(R.string.perf_committed), data.committedText(), wideWidth = 104.dp, narrowWidth = 92.dp),
+            CpuStat(AppStrings.s(R.string.perf_cached), data.cachedText(), wideWidth = 72.dp, narrowWidth = 62.dp)
         ),
 
         listOf(
             CpuStat(
-                "可回收内核缓存", data.reclaimableText(),
+                AppStrings.s(R.string.perf_kernel_reclaimable), data.reclaimableText(),
                 wideWidth = 104.dp, narrowWidth = 92.dp
             ),
             CpuStat(
-                "不可回收内核缓存", data.nonReclaimableText(),
+                AppStrings.s(R.string.perf_kernel_non_reclaimable), data.nonReclaimableText(),
                 wideWidth = 118.dp, narrowWidth = 104.dp
             )
         )
@@ -1369,24 +1376,27 @@ private fun memoryDetailLines(memory: MemorySnapshot?): List<Pair<String, String
 
     return buildList {
 
-        data.speedText()?.let { add("速度" to it) }
+        data.speedText()?.let { add(AppStrings.s(R.string.perf_speed) to it) }
 
-        add("已使用的插槽" to data.slotsText())
+        add(AppStrings.s(R.string.perf_slots_used) to data.slotsText())
 
-        add("外观规格" to data.formFactorText())
+        add(AppStrings.s(R.string.perf_form_factor) to data.formFactorText())
 
-        add("为硬件保留的内存" to data.reservedText())
+        add(AppStrings.s(R.string.perf_hardware_reserved) to data.reservedText())
 
         // zram 三个实测数：真读到 mm_stat 才画这一行
-        // （没有压缩内存的机器不该出现一串 0 MB 占位，和"速度"同一规矩）
-        data.zramDetailText()?.let { add("压缩内存" to it) }
+        // （没有压缩内存的机器不该出现一串 0 MB 占位，和AppStrings.s(R.string.perf_speed)同一规矩）
+        data.zramDetailText()?.let { add(AppStrings.s(R.string.perf_compressed_memory) to it) }
 
         // 交换空间：已用/总量 一行收（例 0.8/4.0 GB），排在压缩内存下面
-        data.swapText()?.let { add("交换空间" to it) }
+        data.swapText()?.let { add(AppStrings.s(R.string.perf_swap) to it) }
 
         // 厂商这一行只在底层真报出来时才有：它来自 dt 的 ddr_manufacturer_id，
-        // 读不到或编码不在表里就整行不画（和"速度"同一规矩，不摆破折号占位）
-        data.manufacturer?.takeIf { it.isNotBlank() }?.let { add("厂商" to it.trim()) }
+        // 读不到或编码不在表里就整行不画（和AppStrings.s(R.string.perf_speed)同一规矩，不摆破折号占位）。
+        // 后端发的是英文码（SAMSUNG / MICRON …），中文名由 BackendDisplayText 映射
+        data.manufacturer?.takeIf { it.isNotBlank() }?.let {
+            add(AppStrings.s(R.string.perf_manufacturer) to BackendDisplayText.memoryVendorText(it))
+        }
     }
 }
 
@@ -1401,11 +1411,11 @@ private fun diskDetailLines(disk: DiskSnapshot?): List<Pair<String, String>> {
     val data = disk ?: DiskSnapshot()
 
     return listOf(
-        "容量" to data.capacityText(),
-        "已格式化" to data.formattedText(),
-        "系统磁盘" to data.systemDiskText(),
-        "页面文件" to data.pageFileText(),
-        "类型" to data.typeText()
+        AppStrings.s(R.string.perf_capacity) to data.capacityText(),
+        AppStrings.s(R.string.perf_formatted) to data.formattedText(),
+        AppStrings.s(R.string.perf_system_disk) to data.systemDiskText(),
+        AppStrings.s(R.string.perf_page_file) to data.pageFileText(),
+        AppStrings.s(R.string.perf_type) to data.typeText()
     )
 }
 
@@ -1435,15 +1445,15 @@ private fun gpuSummaryRows(gpu: GpuSnapshot?): List<List<CpuStat>> {
     fun cell(label: String, value: String, wide: Dp, narrow: Dp): CpuStat =
         CpuStat(label = label, value = value, wideWidth = wide, narrowWidth = narrow)
 
-    val utilization = cell("利用率", data.utilizationText(), 66.dp, 54.dp)
+    val utilization = cell(AppStrings.s(R.string.perf_utilization), data.utilizationText(), 66.dp, 54.dp)
 
-    val dedicated = cell("专用 GPU 内存", data.dedicatedUsageText(), 122.dp, 108.dp)
+    val dedicated = cell(AppStrings.s(R.string.perf_dedicated_gpu), data.dedicatedUsageText(), 122.dp, 108.dp)
 
-    val total = cell("GPU 内存", data.totalMemoryUsageText(), 122.dp, 108.dp)
+    val total = cell(AppStrings.s(R.string.perf_gpu_memory), data.totalMemoryUsageText(), 122.dp, 108.dp)
 
-    val shared = cell("共享 GPU 内存", data.sharedUsageText(), 122.dp, 108.dp)
+    val shared = cell(AppStrings.s(R.string.perf_shared_gpu), data.sharedUsageText(), 122.dp, 108.dp)
 
-    val temperature = cell("温度", data.temperatureText(), 72.dp, 62.dp)
+    val temperature = cell(AppStrings.s(R.string.perf_temperature), data.temperatureText(), 72.dp, 62.dp)
 
     return if (hasDedicated) {
         listOf(
@@ -1471,7 +1481,7 @@ private fun gpuSummaryRows(gpu: GpuSnapshot?): List<List<CpuStat>> {
  * 驱动程序版本 / 驱动程序日期 / Vulkan/OpenGL 版本 / 物理位置 / 为硬件保留的内存
  *
  * 最后一行是**可选**的：底层没给 reservedBytes 时整行不出现，
- * 与左栏"专用 GPU 内存"同一个口径（没有就不显示，不写 0 MB 冒充）。
+ * 与左栏AppStrings.s(R.string.perf_dedicated_gpu)同一个口径（没有就不显示，不写 0 MB 冒充）。
  */
 private fun gpuDetailLines(gpu: GpuSnapshot?): List<Pair<String, String>> {
 
@@ -1479,25 +1489,25 @@ private fun gpuDetailLines(gpu: GpuSnapshot?): List<Pair<String, String>> {
 
     return buildList {
 
-        add("驱动程序版本" to data.driverVersionText())
+        add(AppStrings.s(R.string.perf_driver_version) to data.driverVersionText())
 
-        add("驱动程序日期" to data.driverDateText())
+        add(AppStrings.s(R.string.perf_driver_date) to data.driverDateText())
 
         // Vulkan 与 OpenGL 是两行独立字段：底层报了什么就摆什么。
         // 两样都报了 → 两行都摆；只报一样 → 另一行整行不画；都没报 → 两行都不摆。
         if (data.showsVulkanRow) {
-            add("Vulkan 版本" to data.vulkanVersionText())
+            add(AppStrings.s(R.string.perf_vulkan_version) to data.vulkanVersionText())
         }
 
         if (data.showsOpenGlRow) {
-            add("OpenGL ES 版本" to data.openGlVersionText())
+            add(AppStrings.s(R.string.perf_opengl_version) to data.openGlVersionText())
         }
 
-        add("物理位置" to data.locationText())
+        add(AppStrings.s(R.string.perf_physical_location) to data.locationText())
 
         // 最后一行是可选的：底层没给 reservedBytes 时整行不出现
         if (data.reservedBytes != null) {
-            add("为硬件保留的内存" to data.reservedText())
+            add(AppStrings.s(R.string.perf_hardware_reserved) to data.reservedText())
         }
     }
 }
@@ -1549,7 +1559,7 @@ private fun GpuChartsSection(
         if (hasDedicated) {
 
             GpuChartHeader(
-                label = "专用 GPU 内存",
+                label = AppStrings.s(R.string.perf_dedicated_gpu),
 
                 right = gpu?.dedicatedTotalText() ?: GPU_UNSUPPORTED_TEXT
             )
@@ -1577,7 +1587,7 @@ private fun GpuChartsSection(
         run {
 
             GpuChartHeader(
-                label = "共享 GPU 内存",
+                label = AppStrings.s(R.string.perf_shared_gpu),
 
                 right = gpu?.sharedTotalText() ?: GPU_UNSUPPORTED_TEXT
             )
@@ -1656,33 +1666,33 @@ private fun gpuClipboardText(gpu: GpuSnapshot?): String {
 
         appendLine()
 
-        append("\t名称:\t").appendLine(data.nameText())
+        append(AppStrings.s(R.string.copy_gpu_name)).appendLine(data.nameText())
 
-        append("\t利用率:\t").appendLine(data.utilizationText())
+        append(AppStrings.s(R.string.copy_gpu_util)).appendLine(data.utilizationText())
 
-        append("\t专用 GPU 内存:\t").appendLine(data.dedicatedUsageText())
+        append(AppStrings.s(R.string.copy_gpu_dedicated)).appendLine(data.dedicatedUsageText())
 
-        append("\t共享 GPU 内存:\t").appendLine(data.sharedUsageText())
+        append(AppStrings.s(R.string.copy_gpu_shared)).appendLine(data.sharedUsageText())
 
-        append("\tGPU 内存:\t").appendLine(data.totalMemoryUsageText())
+        append(AppStrings.s(R.string.copy_gpu_total)).appendLine(data.totalMemoryUsageText())
 
-        append("\t驱动程序版本:\t").appendLine(data.driverVersionText())
+        append(AppStrings.s(R.string.copy_gpu_driver_version)).appendLine(data.driverVersionText())
 
-        append("\t驱动程序日期:\t").appendLine(data.driverDateText())
+        append(AppStrings.s(R.string.copy_gpu_driver_date)).appendLine(data.driverDateText())
 
         if (data.showsVulkanRow) {
-            append("\tVulkan 版本:\t").appendLine(data.vulkanVersionText())
+            append(AppStrings.s(R.string.copy_gpu_vulkan)).appendLine(data.vulkanVersionText())
         }
 
         if (data.showsOpenGlRow) {
-            append("\tOpenGL ES 版本:\t").appendLine(data.openGlVersionText())
+            append(AppStrings.s(R.string.copy_gpu_opengl)).appendLine(data.openGlVersionText())
         }
 
-        append("\t物理位置:\t").appendLine(data.locationText())
+        append(AppStrings.s(R.string.copy_gpu_location)).appendLine(data.locationText())
 
-        append("\t为硬件保留的内存:\t").appendLine(data.reservedText())
+        append(AppStrings.s(R.string.copy_gpu_reserved)).appendLine(data.reservedText())
 
-        append("\t温度:\t").appendLine(data.temperatureText())
+        append(AppStrings.s(R.string.copy_gpu_temp)).appendLine(data.temperatureText())
     }
 }
 
@@ -1692,7 +1702,7 @@ private fun gpuClipboardText(gpu: GpuSnapshot?): String {
  *
  * 顺序与截图一致；取值一律走 [NetworkSnapshot] 的文案方法 ——
  * 底层现在只发适配器名，其余读不到就写"不支持"，接了字段以后这边不用改。
- * "连接类型"由模型层按类型兜底：手机网络写「手机网络」、以太网写「以太网」，
+ * AppStrings.s(R.string.perf_connection_type)由模型层按类型兜底：手机网络写「手机网络」、以太网写「以太网」，
  * 底层真给了值（制式 / 网口标准）就显示那个值。
  */
 private fun networkDetailLines(network: NetworkSnapshot?): List<Pair<String, String>> {
@@ -1701,17 +1711,17 @@ private fun networkDetailLines(network: NetworkSnapshot?): List<Pair<String, Str
 
     return buildList {
 
-        add("适配器名称" to data.nameText())
+        add(AppStrings.s(R.string.perf_adapter_name) to data.nameText())
 
         if (data.showsSsidRow) add("SSID" to data.ssidText())
 
-        add("连接类型" to data.linkTypeText())
+        add(AppStrings.s(R.string.perf_connection_type) to data.linkTypeText())
 
-        add("IPv4 地址" to data.ipv4Text())
+        add(AppStrings.s(R.string.perf_ipv4) to data.ipv4Text())
 
-        add("IPv6 地址" to data.ipv6Text())
+        add(AppStrings.s(R.string.perf_ipv6) to data.ipv6Text())
 
-        if (data.showsSignalRow) add("信号强度" to data.signalText())
+        if (data.showsSignalRow) add(AppStrings.s(R.string.perf_signal_strength) to data.signalText())
     }
 }
 
@@ -1974,7 +1984,7 @@ private fun HardwareDetail(
     kind: HardwareKind,
     snapshot: PerformanceSnapshot,
     history: List<CpuUsagePoint>,
-    windowLabel: String,
+    windowCode: String,
     wide: Boolean,
     hostedInOverlay: Boolean,
     usageDecimals: Int,
@@ -2100,12 +2110,12 @@ private fun HardwareDetail(
         HardwareKind.GPU -> gpu?.nameText() ?: "-"
     }
 
-    // 图表上方那行小字：CPU 跟着实时更新速度写明统计窗口；内存这里改写成"内存使用量"
+    // 图表上方那行小字：CPU 跟着实时更新速度写明统计窗口；内存这里改写成AppStrings.s(R.string.perf_memory_usage)
     val chartLabel = when (kind) {
-        HardwareKind.CPU -> windowLabel
-        HardwareKind.MEMORY -> "内存使用量"
-        HardwareKind.DISK -> "活动时间"
-        HardwareKind.NETWORK -> "吞吐量"
+        HardwareKind.CPU -> windowFullText(windowCode)
+        HardwareKind.MEMORY -> AppStrings.s(R.string.perf_memory_usage)
+        HardwareKind.DISK -> AppStrings.s(R.string.perf_active_time)
+        HardwareKind.NETWORK -> AppStrings.s(R.string.perf_throughput)
 
         // Windows 那张卡第一张图左上角就是 "3D"（3D 引擎占用）
         HardwareKind.GPU -> "3D"
@@ -2209,7 +2219,7 @@ private fun HardwareDetail(
         //    宽度决定它吃多少高度：宽屏 1 份、竖屏 3 份（留 1 份给底部空白）、浮窗吃满；
         //    摘要视图里下面没有别的块，它直接吃掉整个剩余高度。
         //
-        //    WLAN 这张换成"吞吐量"图：横轴同样是固定槽位，但纵轴是速率量程（不是 0..100%），
+        //    WLAN 这张换成AppStrings.s(R.string.perf_throughput)图：横轴同样是固定槽位，但纵轴是速率量程（不是 0..100%），
         //    并且带一条 60% 预警线 —— 版式照截图来，数据这一版全为 0（不铺假曲线）。
         if (isGpu) {
 
@@ -2266,7 +2276,7 @@ private fun HardwareDetail(
                 },
 
                 // 菜单两项直接决定画法：没勾"显示内核时间"就一行都不多画；
-                // 图形口径选了"逻辑处理器"才切成逐核网格，两种口径共用同一份历史。
+                // 图形口径选了AppStrings.s(R.string.perf_logical)才切成逐核网格，两种口径共用同一份历史。
                 // logicalChart 已经把"内存不认这个口径"收口了（见上面那处），
                 // 所以内存页哪怕 CPU 那边开着逐核视图，这里拿到的仍是整机曲线。
                 showKernelTime = showKernelTime,
@@ -2285,11 +2295,11 @@ private fun HardwareDetail(
         }
 
         // WLAN 图底两角：左窗口、右起点 0（截图里就是"60 秒 / 0"）。
-        // 其它页的窗口文案在图表标签行的左边（chartLabel），这里标签行写的是"吞吐量"，
+        // 其它页的窗口文案在图表标签行的左边（chartLabel），这里标签行写的是AppStrings.s(R.string.perf_throughput)，
         // 所以窗口长度挪到图底，与磁盘那张图同一套落法。
         if (kind == HardwareKind.NETWORK) {
 
-            ChartCornerRow(left = shortWindowText(windowLabel))
+            ChartCornerRow(left = shortWindowText(windowCode))
         }
 
         // 磁盘页的第二张图（正式版式与摘要视图都画）：速率图只有主图的 1/4 高。
@@ -2297,13 +2307,13 @@ private fun HardwareDetail(
         if (isDisk) {
 
             // 主图底部的两角小字：左窗口、右起点 0（与内存图同一套落法）
-            ChartCornerRow(left = shortWindowText(windowLabel))
+            ChartCornerRow(left = shortWindowText(windowCode))
 
             Spacer(
                 modifier = Modifier.height(4.dp)
             )
 
-            // 速率图的表头：左"磁盘传输速率"，右当前量程（默认 100 KB/秒）
+            // 速率图的表头：左AppStrings.s(R.string.perf_disk_transfer)，右当前量程（默认 100 KB/秒）
             Row(
                 modifier = Modifier.fillMaxWidth(),
 
@@ -2311,7 +2321,7 @@ private fun HardwareDetail(
             ) {
 
                 Text(
-                    text = "磁盘传输速率",
+                    text = AppStrings.s(R.string.perf_disk_transfer),
 
                     style = MaterialTheme.typography.bodySmall,
 
@@ -2348,7 +2358,7 @@ private fun HardwareDetail(
                     .weight(rateChartWeight)
             )
 
-            ChartCornerRow(left = shortWindowText(windowLabel))
+            ChartCornerRow(left = shortWindowText(windowCode))
         }
 
         // 摘要视图到此为止：统计块 / 明细块 / 底部留白都不画，
@@ -2374,7 +2384,7 @@ private fun HardwareDetail(
 
         // 4) 内存专属两块：图底两角的小字，和一条「使用中 → 可用」的分条图。
         //
-        // 左角是更新频率（压短成"60 秒"这种），右角是统计起点 0：CPU 图把这两件事
+        // 左角是更新频率（压短成AppStrings.s(R.string.perf_60_seconds)这种），右角是统计起点 0：CPU 图把这两件事
         // 分别放在左上（窗口文案）与刻度上，内存图按设计把它们落到图底两角。
         if (isMemory) {
 
@@ -2385,7 +2395,7 @@ private fun HardwareDetail(
             ) {
 
                 Text(
-                    text = shortWindowText(windowLabel),
+                    text = shortWindowText(windowCode),
 
                     style = MaterialTheme.typography.bodySmall,
 
@@ -2561,28 +2571,38 @@ private fun DataPanel(
     }
 }
 
-/** 窗口文案里的"数字 + 秒 / 分钟"，只在这里用；提成常量免得每次组合都新建一个。 */
-private val WINDOW_SECONDS_PATTERN = Regex("(\\d+)\\s*(秒|分钟)")
+/**
+ * 窗口状态码 -> 图表上方那一行整句（例如「60 秒内的利用率 %」）。
+ *
+ * 码由服务层给（PAUSED / 30 / 60 / 240，单位秒），句子完全在这层用资源拼，
+ * 所以切换系统语言不用改服务层，也不存在"解析中文再翻译"这种绕不过去的做法。
+ */
+private fun windowFullText(code: String): String = when (code) {
+
+    "PAUSED" -> AppStrings.s(R.string.perf_window_paused)
+
+    "30" -> AppStrings.s(R.string.perf_window_30)
+
+    "240" -> AppStrings.s(R.string.perf_window_240)
+
+    else -> AppStrings.s(R.string.perf_window_60)
+}
 
 /**
- * 把图表的窗口文案压短，给内存图左下角用。
+ * 把图表的窗口文案压短，给图左下角用。
  *
- * "60 秒内的利用率 %" -> "60 秒"；"4 分钟内的利用率 %" -> "240 秒"（这一处要的是秒数，
- * 不写"4 分钟"）；"利用率 % (已暂停)" -> "已暂停"。
- *
- * 认不出格式时按常规档的 60 秒写：那是最常见的一档，也好过显示一串原始文案。
+ * 30 秒 -> 「30 秒」/「30 s」；常规 60 秒 -> 「60 秒」；低档 4 分钟 -> 「4 分钟」
+ * （这一处要的是人能一眼读懂的时长，不折算成 240 秒）；暂停 -> 「已暂停」。
  */
-private fun shortWindowText(windowLabel: String): String {
+private fun shortWindowText(code: String): String = when (code) {
 
-    if (windowLabel.contains("已暂停")) {
-        return "已暂停"
-    }
+    "PAUSED" -> AppStrings.s(R.string.perf_paused)
 
-    val match = WINDOW_SECONDS_PATTERN.find(windowLabel)
+    "30" -> AppStrings.s(R.string.perf_seconds_short, 30)
 
-    val count = match?.groupValues?.get(1)?.toIntOrNull() ?: return "60 秒"
+    "240" -> AppStrings.s(R.string.perf_minutes_short, 4)
 
-    return if (match.groupValues[2] == "分钟") "${count * 60} 秒" else "$count 秒"
+    else -> AppStrings.s(R.string.perf_seconds_short, 60)
 }
 
 /**
@@ -2600,7 +2620,7 @@ private fun MemoryBreakdownSection(
 ) {
 
     Text(
-        text = "内存组合",
+        text = AppStrings.s(R.string.perf_memory_composition),
 
         style = MaterialTheme.typography.bodySmall,
 
@@ -2626,7 +2646,7 @@ private fun MemoryBreakdownSection(
  * 内存分条图：一条与上方图表同宽的横条，按「使用中 / 已修改 / 备用 / 可用」切成四段。
  *
  * 四段比例来自数据（[MemorySnapshot.breakdownParts]，已经归一），整条宽度就是总容量；
- * 最右的"可用"不填充主题色，只留一层极淡的底。
+ * 最右的AppStrings.s(R.string.perf_available)不填充主题色，只留一层极淡的底。
  *
  * 按设计只画图形：图上不标任何文字、不加提示，三条竖线就是全部说明。
  */
@@ -2712,7 +2732,7 @@ private fun CpuSummaryBlock(
         rows.forEach { row ->
 
             Row(
-                // 竖屏块窄，格间距收一档，第二行"文件描述符"那一格才不至于把整块撑出可用宽度；
+                // 竖屏块窄，格间距收一档，第二行AppStrings.s(R.string.perf_fd)那一格才不至于把整块撑出可用宽度；
                 // 横屏原本 14dp 在平分铺满后显得两格之间太空，按 2/3 收到 9dp
                 horizontalArrangement = Arrangement.spacedBy(if (wide) 9.dp else 10.dp),
 
@@ -2758,7 +2778,7 @@ private fun CpuStatCell(
         else -> MaterialTheme.typography.titleLarge
     }
 
-    // 窄屏一格只有几十 dp：标题用更小一档，保证 "文件描述符" 五个字能整串显示
+    // 窄屏一格只有几十 dp：标题用更小一档，保证 AppStrings.s(R.string.perf_fd) 五个字能整串显示
     val labelStyle = if (wide) {
         MaterialTheme.typography.bodySmall
     } else {
@@ -2932,7 +2952,7 @@ private fun HardwareCompactBar(
 }
 
 /**
- * 图底两角的小字：左边写窗口长度（压成"60 秒"），右边写统计起点 0。
+ * 图底两角的小字：左边写窗口长度（压成AppStrings.s(R.string.perf_60_seconds)），右边写统计起点 0。
  *
  * 磁盘页的两张图与内存页用同一套落法，避免同一种信息在三张图上三种位置。
  */
@@ -2989,7 +3009,7 @@ private fun HardwareScrollbar(
 }
 
 /**
- * 图底两角的小字：左边写窗口长度（压成"60 秒"），右边写统计起点 0。
+ * 图底两角的小字：左边写窗口长度（压成AppStrings.s(R.string.perf_60_seconds)），右边写统计起点 0。
  */
 @Composable
 private fun ChartCornerRow(left: String) {
@@ -3267,9 +3287,9 @@ private fun DiskSummaryBlock(
             verticalAlignment = Alignment.Top
         ) {
 
-            DiskStatCell("活动时间", data.activityText(), wide)
+            DiskStatCell(AppStrings.s(R.string.perf_active_time), data.activityText(), wide)
 
-            DiskStatCell("平均响应时间", data.responseText(), wide)
+            DiskStatCell(AppStrings.s(R.string.perf_avg_response), data.responseText(), wide)
         }
 
         Row(
@@ -3278,9 +3298,9 @@ private fun DiskSummaryBlock(
             verticalAlignment = Alignment.Top
         ) {
 
-            DiskStatCell("读取速度", data.readSpeedText(), wide, readColor)
+            DiskStatCell(AppStrings.s(R.string.perf_read_speed), data.readSpeedText(), wide, readColor)
 
-            DiskStatCell("写入速度", data.writeSpeedText(), wide, writeColor)
+            DiskStatCell(AppStrings.s(R.string.perf_write_speed), data.writeSpeedText(), wide, writeColor)
         }
     }
 }
@@ -3360,9 +3380,9 @@ private fun NetworkSummaryBlock(network: NetworkSnapshot?, wide: Boolean) {
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
 
-        NetworkStatCell("发送", data.sendText(), sendColor, wide)
+        NetworkStatCell(AppStrings.s(R.string.perf_send), data.sendText(), sendColor, wide)
 
-        NetworkStatCell("接收", data.receiveText(), receiveColor, wide)
+        NetworkStatCell(AppStrings.s(R.string.perf_receive), data.receiveText(), receiveColor, wide)
     }
 }
 
@@ -3663,7 +3683,7 @@ private fun NetworkThroughputChart(
  *   共用同一套，所以切图形只换画法，统计区间不变、历史也不清。
  *
  * 内核时间（[showKernelTime]）只有菜单里勾上才画：在曲线下方再画一条更暗的曲线，
- * 并把它与底边之间的区域填色，就是任务管理器里那层"内核"色带。
+ * 并把它与底边之间的区域填色，就是任务管理器里那层AppStrings.s(R.string.perf_cores)色带。
  * 没勾就一行都不多画，保持原来的纯线条外观。
  *
  * 长按这里弹出图表菜单（[PerformanceChartDialog]）；快速双击则在图形摘要视图与原版式之间切换。
@@ -3948,7 +3968,7 @@ private fun TotalUsageChart(
  * 逻辑处理器图：每个逻辑核一格小图，网格最多 4 列。
  *
  * 每一格的横向槽位与整机图完全一致（同样是 [PERFORMANCE_CHART_POINTS] 个槽），
- * 所以"总体利用率"与"逻辑处理器"两种口径说的是同一段时间，只是拆细了。
+ * 所以"总体利用率"与AppStrings.s(R.string.perf_logical)两种口径说的是同一段时间，只是拆细了。
  *
  * 核数取最新一帧的长度：热插拔（核数变了）才换网格排布，不会因为历史里老点少一核就重排。
  *
@@ -4172,10 +4192,10 @@ private fun PerformanceChartDialog(
             // 也没有内核时间，这三行在内存页整组不画
             if (kind == HardwareKind.CPU) {
 
-                ChartMenuHeading("将图形更改为(H)")
+                ChartMenuHeading(AppStrings.s(R.string.perf_menu_change_graph))
 
                 ChartMenuRow(
-                    label = "总体利用率(O)",
+                    label = AppStrings.s(R.string.perf_menu_overall),
 
                     marked = kernelGraphMode == CPU_KERNEL_GRAPH_TOTAL,
 
@@ -4183,7 +4203,7 @@ private fun PerformanceChartDialog(
                 ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_TOTAL) }
 
                 ChartMenuRow(
-                    label = "逻辑处理器(L)",
+                    label = AppStrings.s(R.string.perf_menu_logical),
 
                     marked = kernelGraphMode == CPU_KERNEL_GRAPH_LOGICAL,
 
@@ -4191,7 +4211,7 @@ private fun PerformanceChartDialog(
                 ) { onKernelGraphModeChange(CPU_KERNEL_GRAPH_LOGICAL) }
 
                 ChartMenuRow(
-                    label = "显示内核时间(K)",
+                    label = AppStrings.s(R.string.perf_menu_kernel_time),
 
                     marked = showKernelTime
                 ) { onShowKernelTimeChange(!showKernelTime) }
@@ -4204,11 +4224,11 @@ private fun PerformanceChartDialog(
             }
 
             ChartMenuRow(
-                label = "图形摘要视图(W)"
+                label = AppStrings.s(R.string.perf_menu_summary)
             ) { onEnterSummary() }
 
             ChartMenuRow(
-                label = "查看(V)",
+                label = AppStrings.s(R.string.perf_menu_view),
 
                 trailing = if (viewExpanded) "▾" else "▸"
             ) { viewExpanded = !viewExpanded }
@@ -4250,7 +4270,7 @@ private fun PerformanceChartDialog(
             if (kind == HardwareKind.NETWORK) {
 
                 ChartMenuRow(
-                    label = "查看网络详细信息(D)"
+                    label = AppStrings.s(R.string.perf_menu_view_network)
                 ) {
                     onViewNetworkDetail()
 
@@ -4265,7 +4285,7 @@ private fun PerformanceChartDialog(
             )
 
             ChartMenuRow(
-                label = "复制(C)"
+                label = AppStrings.s(R.string.perf_menu_copy)
             ) {
                 copyChartMenuText(context, copyText)
 
@@ -4471,7 +4491,7 @@ private fun copyChartMenuText(context: Context, text: String) {
         return
     }
 
-    clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
+    clipboard.setPrimaryClip(ClipData.newPlainText(AppStrings.s(R.string.perf_title), text))
 }
 
 /**
@@ -4487,10 +4507,11 @@ private fun copyChartMenuText(context: Context, text: String) {
 private fun NetworkDetailCanvasPage(onClose: () -> Unit) {
 
     DetailCanvasPage(
-        title = "网络详细信息",
+        title = AppStrings.s(R.string.perf_network_details),
 
         onBack = onClose,
 
-        backDescription = "返回性能页"
+        backDescription = AppStrings.s(R.string.perf_back)
     )
 }
+

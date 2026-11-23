@@ -545,40 +545,44 @@ static bool read_dram_spec(char *out, int capacity)
  * 编码来自 JEDEC 的 DRAM 厂商编号，和高通内核头文件里的枚举一致；
  * 表里没有的编号（预留 / 新型号）一律返回 NULL —— 上层据此整项不发，
  * 页面连"厂商"这一行都不画，不写"未知厂商"占位。
+ *
+ * 返回值是**英文厂商码**（SAMSUNG / MICRON …），不是给人看的名字：
+ * 协议里不放本地语言，中文名（"三星（Samsung）"这类）由客户端按码映射。
+ * 码的拼写取国际通用品牌名，全大写、无空格。
  */
-static const char *dram_manufacturer_name(int code)
+static const char *dram_manufacturer_code(int code)
 {
     switch (code) {
 
-        case 0x01: return "三星（Samsung）";
+        case 0x01: return "SAMSUNG";
 
-        case 0x02: return "奇梦达（Qimonda）";
+        case 0x02: return "QIMONDA";
 
-        case 0x03: return "尔必达（Elpida）";
+        case 0x03: return "ELPIDA";
 
-        case 0x04: return "钰创（Etron）";
+        case 0x04: return "ETRON";
 
-        case 0x05: return "南亚科技（Nanya）";
+        case 0x05: return "NANYA";
 
-        case 0x06: return "海力士（Hynix）";
+        case 0x06: return "HYNIX";
 
-        case 0x07: return "茂矽电子（Mosel）";
+        case 0x07: return "MOSEL";
 
-        case 0x08: return "华邦电子（Winbond）";
+        case 0x08: return "WINBOND";
 
-        case 0x09: return "晶豪科技（ESMT）";
+        case 0x09: return "ESMT";
 
-        case 0x0B: return "飞索半导体（Spansion）";
+        case 0x0B: return "SPANSION";
 
-        case 0x0C: return "超捷半导体（SST）";
+        case 0x0C: return "SST";
 
-        case 0x0D: return "智原科技（ZMOS）";
+        case 0x0D: return "ZMOS";
 
-        case 0x0E: return "英特尔（Intel）";
+        case 0x0E: return "INTEL";
 
-        case 0xFE: return "美光旗下（Numonyx）";
+        case 0xFE: return "NUMONYX";
 
-        case 0xFF: return "美光（Micron）";
+        case 0xFF: return "MICRON";
 
         default: return NULL;
     }
@@ -634,13 +638,13 @@ static bool dram_manufacturer_from_property(const char *raw, int length, char *o
         code = (int) ((unsigned char) raw[length - 1]);
     }
 
-    const char *name = dram_manufacturer_name(code);
+    const char *code_text = dram_manufacturer_code(code);
 
-    if (name == NULL) {
+    if (code_text == NULL) {
         return false;
     }
 
-    snprintf(out, (size_t) capacity, "%s", name);
+    snprintf(out, (size_t) capacity, "%s", code_text);
 
     return true;
 }
@@ -1293,8 +1297,8 @@ int build_memory_devices(TmOutDevice *out, int capacity,
         device_put(&out[0], "spec", spec);
     }
 
-    // 颗粒厂商：dt 的 ddr_manufacturer_id 换成中文名；读不到或编码不在表里就整项不发，
-    // 页面那边"厂商"这一行跟着消失（不留"未知"占位）
+    // 颗粒厂商：dt 的 ddr_manufacturer_id 换成英文厂商码（SAMSUNG / MICRON …）；
+    // 读不到或编码不在表里就整项不发，页面那边"厂商"这一行跟着消失（不留"未知"占位）
     char manufacturer[64];
 
     if (read_dram_manufacturer(manufacturer, (int) sizeof(manufacturer))) {

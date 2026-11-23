@@ -45,6 +45,9 @@
  */
 package com.android.taskmanager
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -119,7 +122,12 @@ val DetailsPageState: PageState = PageState.IMPLEMENTED
  */
 private const val DETAIL_IDLE_POLL_MS = 800L
 
-/** 搜索框在本页登记用的页名（与 MainActivity 的标题文案一致）。 */
+/**
+ * 搜索框在本页登记用的页名。
+ *
+ * 这是**登记用的内部标识**，不是界面上显示的文字：UIService 按这个字符串存"这一页的搜索词"，
+ * 一旦跟着语言变，切语言后搜索状态就会丢。所以这里保持固定值，标题文案另走 R.string。
+ */
 private const val SEARCH_PAGE_DETAIL = "详细信息"
 
 /**
@@ -194,7 +202,7 @@ fun DetailsScreen(
      */
     var pendingSelectedIdentity by remember { mutableStateOf<String?>(null) }
 
-    // "选择列"对话框是否打开（表头任意位置长按打开）
+    // AppStrings.s(R.string.details_select_columns)对话框是否打开（表头任意位置长按打开）
     var showColumnPicker by remember { mutableStateOf(false) }
 
     // 正在等用户确认的那一行（红色按钮点了之后先弹确认框，此时还没发命令）
@@ -212,7 +220,7 @@ fun DetailsScreen(
     // 这一轮就直接跳过——不读、不改状态，Compose 也就不会重组。
     LaunchedEffect(Unit) {
 
-        // 进页面先按需采一次：默认"忽略实时更新速度"= 不自动刷新，
+        // 进页面先按需采一次：默认AppStrings.s(R.string.details_ignore_interval)= 不自动刷新，
         // 不采这一次表格会一直空着，看起来像坏了。
         var firstRefreshDone = false
 
@@ -296,7 +304,7 @@ fun DetailsScreen(
             if (pid <= 0 || ticks < 0L) {
                 null
             } else {
-                // 被筛掉的行不认：看不见的行不该还能点"结束进程"
+                // 被筛掉的行不认：看不见的行不该还能点AppStrings.s(R.string.details_end_process)
                 visibleRows.firstOrNull { it.pid == pid && it.startTicks == ticks }
             }
         }
@@ -312,9 +320,9 @@ fun DetailsScreen(
             rows = visibleRows,
 
             emptyHint = if (searchQuery.isEmpty()) {
-                "表里还没有进程（等待上游填入，或已被清空）"
+                AppStrings.s(R.string.details_empty)
             } else {
-                "没有匹配「$searchQuery」的进程（试试名称、包名或 PID）"
+                AppStrings.s(R.string.details_no_match, searchQuery)
             },
 
             selectedIdentity = selectedIdentity,
@@ -328,7 +336,7 @@ fun DetailsScreen(
                 UIService.instanceOrNull()?.sortDetailTableBy(columnId)
             },
 
-            // 表头任意位置长按：打开"选择列"对话框
+            // 表头任意位置长按：打开AppStrings.s(R.string.details_select_columns)对话框
             onOpenColumnPicker = { showColumnPicker = true },
 
             onSelectRow = { row ->
@@ -358,7 +366,7 @@ fun DetailsScreen(
 
             ignoreUpdateSpeed = table.ignoreUpdateSpeed,
 
-            // 能被"结束进程"操作的行，必须由 pid + 启动时刻双重确认：
+            // 能被AppStrings.s(R.string.details_end_process)操作的行，必须由 pid + 启动时刻双重确认：
             // 只凭 pid 时，目标已退出、PID 被新进程占用，就会结束掉另一个进程。
             killTarget = killCandidate,
 
@@ -371,7 +379,7 @@ fun DetailsScreen(
             },
 
             onRefresh = {
-                // 立即采一次（不看"忽略实时更新速度"），随后读表把状态同步过来；
+                // 立即采一次（不看AppStrings.s(R.string.details_ignore_interval)），随后读表把状态同步过来；
                 // 新包落下后下一轮轮询会读到它，不需要页面自己等待。
                 UIService.instanceOrNull()?.refreshDetailNow()
 
@@ -379,13 +387,13 @@ fun DetailsScreen(
             },
 
             onKill = { row ->
-                // 点一下只是弹确认框；真正发命令在用户点"结束进程"之后
+                // 点一下只是弹确认框；真正发命令在用户点AppStrings.s(R.string.details_end_process)之后
                 killRequest = row
             }
         )
     }
 
-    // ---------- 选择列对话框：勾完点"确定"整份报给 UIService，并立刻刷新表 ----------
+    // ---------- 选择列对话框：勾完点AppStrings.s(R.string.common_ok)整份报给 UIService，并立刻刷新表 ----------
     if (showColumnPicker) {
 
         DetailColumnPickerDialog(
@@ -413,21 +421,21 @@ fun DetailsScreen(
         DetailActionDialog(
             hostedInOverlay = hostedInOverlay,
 
-            // 点空白/返回键等同"取消"：什么都没发生，不弹失败框
+            // 点空白/返回键等同AppStrings.s(R.string.common_cancel)：什么都没发生，不弹失败框
             onDismissRequest = { killRequest = null },
 
-            title = "你希望结束 ${target.name} 吗?",
+            title = AppStrings.s(R.string.details_end_confirm, target.name),
 
             body = {
                 Text(
-                    text = "如果某个打开的程序与此进程关联，则会关闭此程序并且将丢失所有未保存的数据。" +
-                        "如果结束某个系统进程，则可能导致系统不稳定。你确定要继续吗？",
+                    text = AppStrings.s(R.string.details_end_warning_app) +
+                        AppStrings.s(R.string.details_end_warning_system),
 
                     style = MaterialTheme.typography.bodyMedium
                 )
             },
 
-            confirmText = "结束进程",
+            confirmText = AppStrings.s(R.string.details_end_process),
 
             onConfirm = {
 
@@ -439,7 +447,7 @@ fun DetailsScreen(
                         UIService.instanceOrNull()?.killDetailProcess(
                             target.pid,
                             target.startTicks
-                        ) ?: ProcessActionResult(false, "服务未就绪。")
+                        ) ?: ProcessActionResult(false, AppStrings.s(R.string.details_service_not_ready))
                     }
 
                     // 成功什么都不提示：UIService 会在 1 秒后自己重采一次，
@@ -450,7 +458,7 @@ fun DetailsScreen(
                 }
             },
 
-            dismissText = "取消",
+            dismissText = AppStrings.s(R.string.common_cancel),
 
             onDismiss = { killRequest = null }
         )
@@ -465,7 +473,7 @@ fun DetailsScreen(
             // 这是结果通知，不看一次不该消失
             onDismissRequest = { },
 
-            title = "无法完成该操作。",
+            title = AppStrings.s(R.string.details_operation_failed),
 
             body = {
                 Row(
@@ -505,7 +513,7 @@ fun DetailsScreen(
                 }
             },
 
-            confirmText = "确定",
+            confirmText = AppStrings.s(R.string.common_ok),
 
             onConfirm = { killFailure = null },
 
@@ -524,7 +532,7 @@ fun DetailsScreen(
 
             title = {
                 Text(
-                    text = "长按测试"
+                    text = AppStrings.s(R.string.details_long_press_test)
                 )
             },
 
@@ -532,7 +540,7 @@ fun DetailsScreen(
                 Column {
 
                     Text(
-                        text = "进程：${hit.row.name}（PID=${hit.row.displayPid}）"
+                        text = AppStrings.s(R.string.details_process_line, hit.row.name, hit.row.displayPid)
                     )
 
                     Spacer(
@@ -540,7 +548,7 @@ fun DetailsScreen(
                     )
 
                     Text(
-                        text = "该 PID 已通过 onDetailRowLongPressed(pid) 上报给 UIService。",
+                        text = AppStrings.s(R.string.details_reported),
 
                         style = MaterialTheme.typography.bodySmall,
 
@@ -555,7 +563,7 @@ fun DetailsScreen(
                     onClick = { longPressHit = null }
                 ) {
                     Text(
-                        text = "确定"
+                        text = AppStrings.s(R.string.common_ok)
                     )
                 }
             }
@@ -582,31 +590,31 @@ private fun DetailStatusBar(
 
     val summary = buildString {
 
-        append("列 ${table.columns.size} / 共 43 项")
+        append(AppStrings.s(R.string.details_columns_count, table.columns.size))
 
         // 筛选中时同时给出"筛出多少 / 一共多少"，否则用户会以为进程真的只剩这几个
         if (searchQuery.isEmpty()) {
-            append(" · 行 ${table.rows.size}")
+            append(AppStrings.s(R.string.details_rows_count, table.rows.size))
         } else {
-            append(" · 行 $visibleRowCount / ${table.rows.size}（筛选：「$searchQuery」）")
+            append(AppStrings.s(R.string.details_rows_filtered, visibleRowCount, table.rows.size, searchQuery))
         }
 
-        append(" · 排序：")
+        append(AppStrings.s(R.string.details_sort_prefix))
 
         if (sortedTitle == null) {
-            append("默认顺序")
+            append(AppStrings.s(R.string.details_sort_default))
         } else {
             append(sortedTitle)
             append(if (table.sortDescending) " ↓" else " ↑")
         }
 
-        append(" · 选中：")
+        append(AppStrings.s(R.string.details_selected_prefix))
 
         // 选中进程按行身份（pid + startTicks）找，不依赖"PID"这一列是否显示
         val selected = table.rows.firstOrNull { it.identity() == selectedIdentity }
 
         if (selected == null) {
-            append("无")
+            append(AppStrings.s(R.string.common_none))
         } else {
             // 这里显示给人看的是「PID」列的**显示值**，不是行标识本身。
             // 两者刻意分开：测试行的行标识用 9000+N（防与真实进程 pid 撞车、防 pid=0），
@@ -631,7 +639,7 @@ private fun DetailStatusBar(
 
         // 操作提示：这一句是"选择列对话框"的唯一入口说明，长按表头任意位置即可打开
         Text(
-            text = "点表头排序（同列再点翻转）· 长按表头任意位置可选择列",
+            text = AppStrings.s(R.string.details_sort_hint),
 
             style = MaterialTheme.typography.bodySmall,
 
@@ -734,7 +742,7 @@ private fun DetailActionDialog(
     Box(
         modifier = Modifier.fillMaxSize()
     ) {
-        // 遮罩层：点击空白处等同"取消"
+        // 遮罩层：点击空白处等同AppStrings.s(R.string.common_cancel)
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -785,7 +793,7 @@ private fun DetailActionDialog(
 }
 
 /**
- * 底部工具条：左下 = 进程范围三档，中间 = "忽略实时更新速度"，右下 = 「刷新」。
+ * 底部工具条：左下 = 进程范围三档，中间 = AppStrings.s(R.string.details_ignore_interval)，右下 = 「刷新」。
  *
  * 宽度自适应：手机竖屏 / 横屏 / 悬浮窗都是同一棵树，按可用宽度决定排一行还是两行
  * （浮窗只有三百来 dp，硬挤一行会折字；折成两行后范围与刷新仍在一行，开关落到第二行）。
@@ -918,7 +926,7 @@ private fun ScopeSelector(
 }
 
 /**
- * "忽略实时更新速度"开关。
+ * AppStrings.s(R.string.details_ignore_interval)开关。
  *
  * 勾上（默认）= 详细信息页不跟着设置页的速度自动刷，只有「刷新」按钮会采；
  * 取消勾选 = 回到定时自动刷新。
@@ -943,7 +951,7 @@ private fun IgnoreSpeedToggle(
         )
 
         Text(
-            text = "忽略实时更新速度",
+            text = AppStrings.s(R.string.details_ignore_interval),
 
             style = MaterialTheme.typography.labelMedium,
 
@@ -959,7 +967,7 @@ private fun RefreshAction(onRefresh: () -> Unit) {
     TextButton(onClick = onRefresh) {
 
         Text(
-            text = "刷新",
+            text = AppStrings.s(R.string.common_refresh),
 
             style = MaterialTheme.typography.labelMedium,
 
@@ -997,7 +1005,7 @@ private fun KillAction(
         )
     ) {
         Text(
-            text = "结束进程",
+            text = AppStrings.s(R.string.details_end_process),
 
             style = MaterialTheme.typography.labelMedium,
 
@@ -1037,7 +1045,7 @@ private fun DetailTableBody(
     val verticalState = rememberScrollState()
 
     // 没列可画（用户把所有列都取消勾选，或服务还没起来）时给一句明确的话，别画成空白，
-    // 并且这里仍然允许长按表头打开"选择列"——否则用户一旦全取消勾选就再也开不回列
+    // 并且这里仍然允许长按表头打开AppStrings.s(R.string.details_select_columns)——否则用户一旦全取消勾选就再也开不回列
     if (table.columns.isEmpty()) {
 
         Box(
@@ -1050,7 +1058,7 @@ private fun DetailTableBody(
             ) {
 
                 Text(
-                    text = "暂无可见列（服务未就绪，或所有列都被取消勾选）",
+                    text = AppStrings.s(R.string.details_no_visible_columns),
 
                     style = MaterialTheme.typography.bodyMedium,
 
@@ -1062,7 +1070,7 @@ private fun DetailTableBody(
                 )
 
                 Text(
-                    text = "长按表头区域打开「选择列」重新勾选",
+                    text = AppStrings.s(R.string.details_choose_columns_hint),
 
                     style = MaterialTheme.typography.bodySmall,
 
@@ -1147,7 +1155,7 @@ private fun DetailTableBody(
 /**
  * 表头一行。
  *
- * 点任意一格 = 请求按该列排序；长按任意位置 = 打开"选择列"对话框。
+ * 点任意一格 = 请求按该列排序；长按任意位置 = 打开AppStrings.s(R.string.details_select_columns)对话框。
  *
  * 手势只挂一个（在整行上），点击位置自己换算成"第几列"：
  * 43 个格子各挂一个 pointerInput 的话，每次按下都要让 43 个检测器参与命中测试，
@@ -1378,8 +1386,8 @@ private fun DetailProcessIconSlot(selected: Boolean) {
  *   右下角「确定」
  *
  * 交互约定：
- * - 勾选状态先改本地草稿（draft），点"确定"才生效——避免边勾边抖动表头；
- * - 点"确定"：把整份勾选集合报给 UIService（setDetailVisibleColumns），页面立刻刷新一次快照；
+ * - 勾选状态先改本地草稿（draft），点AppStrings.s(R.string.common_ok)才生效——避免边勾边抖动表头；
+ * - 点AppStrings.s(R.string.common_ok)：把整份勾选集合报给 UIService（setDetailVisibleColumns），页面立刻刷新一次快照；
  * - 点外部 / 返回：丢弃草稿，不改表。
  *
  * 为什么复选框用 [DetailTable.allColumns]：列集合在设计期固定 43 项，
@@ -1401,7 +1409,7 @@ private fun DetailColumnPickerDialog(
 
         title = {
             Text(
-                text = "选择列"
+                text = AppStrings.s(R.string.details_select_columns)
             )
         },
 
@@ -1411,7 +1419,7 @@ private fun DetailColumnPickerDialog(
 
                 // 小标题
                 Text(
-                    text = "选择将显示在表上的列。",
+                    text = AppStrings.s(R.string.details_select_columns_desc),
 
                     style = MaterialTheme.typography.bodySmall,
 
@@ -1425,7 +1433,7 @@ private fun DetailColumnPickerDialog(
                 if (allColumns.isEmpty()) {
 
                     Text(
-                        text = "列定义尚未就绪（UIService 没有返回 allColumns）",
+                        text = AppStrings.s(R.string.details_columns_not_ready),
 
                         style = MaterialTheme.typography.bodySmall,
 
@@ -1502,7 +1510,7 @@ private fun DetailColumnPickerDialog(
                 onClick = { onConfirm(draft) }
             ) {
                 Text(
-                    text = "确定"
+                    text = AppStrings.s(R.string.common_ok)
                 )
             }
         }

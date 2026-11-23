@@ -11,7 +11,7 @@
  *
  * 实现状态：`StartupAppPageState` 目前是 NOT_IMPLEMENTED。
  *  - MainActivity 的 PageContent() 看到这个值就不渲染本页，
- *    改为显示"此页面不受支持"占位（图标在上、文案在下）；
+ *    改为显示AppStrings.s(R.string.main_page_unsupported)占位（图标在上、文案在下）；
  *  - 本页写完那天，把下面那个常量改成 PageState.IMPLEMENTED 即可，MainActivity 不用动。
  *
  * TODO: 接入启动项数据并实现开关管理（在下面的 PageShell 正文里替换占位内容）。
@@ -19,6 +19,9 @@
  * 说明：文件位于 ui 目录，但包名为 com.android.taskmanager，与 MainActivity 同包。
  */
 package com.android.taskmanager
+
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -37,7 +40,7 @@ fun StartupAppScreen() {
         // 2) 操作：开关即时生效并回写状态；失败时给出原因（权限 / 系统限制）
         // 3) 兜底：没有 Root / Shizuku 时开关置灰，并说明为什么不能改
         Text(
-            text = "页面骨架已就绪，启动项数据尚未接入。",
+            text = AppStrings.s(R.string.stub_startup),
 
             style = MaterialTheme.typography.bodyMedium,
 

@@ -7,6 +7,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import com.android.taskmanager.SettingsCatalog
 import com.android.taskmanager.SettingsDefaults
 import com.android.taskmanager.data.CpuUsagePoint
@@ -73,8 +75,12 @@ class PerformanceManager internal constructor(appContext: Context) {
     var memoryHistory by mutableStateOf<List<CpuUsagePoint>>(emptyList())
         private set
 
-    /** 图表标签行文案，例如「60 秒内的利用率 %」；跟着设置页的更新速度变。 */
-    var windowLabel by mutableStateOf("$DEFAULT_WINDOW_SECONDS 秒内的利用率 %")
+    /**
+     * 图表窗口状态码（**不是文案**）：`PAUSED` / `30` / `60` / `240`，单位秒。
+     * 界面用 R.string 里的固定句子与短标签显示它，因此切换系统语言后自然跟着变；
+     * 跟着设置页的实时更新速度变，每次进性能页取一次。
+     */
+    var windowCode by mutableStateOf(DEFAULT_WINDOW_SECONDS.toString())
         private set
 
     /** 利用率显示位数（设置页「利用率精确度」）。只在进页面时取一次。 */
@@ -348,7 +354,11 @@ class PerformanceManager internal constructor(appContext: Context) {
 
         val block = node?.trim()?.takeIf { it.isNotBlank() }
 
-        return if (block == null) "磁盘 $index" else "磁盘 $index ($block)"
+        return if (block == null) {
+            AppStrings.s(R.string.perf_disk_index, index)
+        } else {
+            AppStrings.s(R.string.perf_disk_index_block, index, block)
+        }
     }
 
     /**
@@ -392,9 +402,9 @@ class PerformanceManager internal constructor(appContext: Context) {
      */
     fun networkTypeName(network: NetworkSnapshot?): String = when {
 
-        network?.isCellular() == true -> NETWORK_TYPE_CELLULAR
+        network?.isCellular() == true -> AppStrings.s(R.string.perf_type_cellular)
 
-        network?.isWired() == true -> NETWORK_TYPE_ETHERNET
+        network?.isWired() == true -> AppStrings.s(R.string.perf_type_ethernet)
 
         // 无线与"底层没给角色"（老后端 / 调试注入）都落到这里
         else -> networkDisplayName
@@ -585,7 +595,12 @@ class PerformanceManager internal constructor(appContext: Context) {
 
     /** 调试页显示用：现在注入了几台空设备。 */
     fun debugDeviceText(): String =
-        "空磁盘 $debugDiskCount 台 · 空网卡 $debugNetworkCount 块 · 空 GPU $debugGpuCount 张"
+        AppStrings.s(
+            R.string.dbg_inject_counts,
+            debugDiskCount,
+            debugNetworkCount,
+            debugGpuCount
+        )
 
     /** 按最新原始帧重新合并一次（注入 / 撤销后立即生效，不等下一次采样）。 */
     private fun publishMergedSnapshot() {
@@ -1307,10 +1322,10 @@ class PerformanceManager internal constructor(appContext: Context) {
 
     private fun refreshWindowLabel() {
 
-        val label = service?.performanceChartWindowLabel() ?: return
+        val code = service?.performanceChartWindowLabel() ?: return
 
-        if (label != windowLabel) {
-            windowLabel = label
+        if (code != windowCode) {
+            windowCode = code
         }
     }
 
@@ -1427,12 +1442,6 @@ private fun resolveNetworkDisplayName(context: Context): String {
 
     return if (isChina) "WLAN" else "Wi-Fi"
 }
-
-/** 手机网络在界面上的正式类型名（页头 / 左栏大字 / 剪贴板标题共用）。 */
-private const val NETWORK_TYPE_CELLULAR = "手机网络"
-
-/** 以太网的正式类型名；现在不注册成页面，留着给放开那一天直接用。 */
-private const val NETWORK_TYPE_ETHERNET = "以太网"
 
 /**
  * 图表画图偏好的落盘（性能页私有设置）。

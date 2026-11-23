@@ -73,8 +73,8 @@
  *     没值的项发 `I key=!状态`（UNSUPPORTED / NOT_AVAILABLE / NO_BASELINE），
  *     客户端按"这一格没数据"处理，绝不当作 0。
  *     cpu_name（处理器商品名）由 ELF 这一侧后续补实现，现在固定回 UNSUPPORTED。
- *     virtualization 的取值是"整串状态"，客户端不做加工直接显示：
- *       不支持 / 已禁用 / 已启用(Gunyah) / 已启用(KVM) / 已启用(GenieZone) / 已启用(Halla)
+ *     virtualization 一律发英文状态码（协议不放本地语言，显示文案由客户端映射）：
+ *       ENABLED_GUNYAH / ENABLED_KVM / ENABLED_GENIEZONE / ENABLED_HALLA / DISABLED / UNSUPPORTED
  *     判定见 probe_virtualization_internal（只看 /dev 节点）。
  *     is_vm 恒为 0：客户端见到 1 才显示"虚拟机"，见到 0 时虚拟化与 AVF 两行才显示。
  *

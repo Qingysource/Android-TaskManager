@@ -53,6 +53,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
+import com.android.taskmanager.SettingsCatalog
 import com.android.taskmanager.ApphistoryScreen
 import com.android.taskmanager.DebugScreen
 import com.android.taskmanager.DetailsScreen
@@ -75,15 +78,15 @@ import com.android.taskmanager.UsersScreen
  * 因此不会去碰 Activity 的窗口令牌，在浮窗里可以安全地改设置。
  */
 internal val OVERLAY_PAGES: List<String> = listOf(
-    "进程",
-    "性能",
-    "应用历史记录",
-    "启动应用",
-    "用户",
-    "详细信息",
-    "服务",
-    "调试",
-    "设置"
+    SettingsCatalog.PAGE_PROCESSES,
+    SettingsCatalog.PAGE_PERFORMANCE,
+    SettingsCatalog.PAGE_APP_HISTORY,
+    SettingsCatalog.PAGE_STARTUP,
+    SettingsCatalog.PAGE_USERS,
+    SettingsCatalog.PAGE_DETAILS,
+    SettingsCatalog.PAGE_SERVICES,
+    SettingsCatalog.PAGE_DEBUG,
+    SettingsCatalog.PAGE_SETTINGS
 )
 
 /**
@@ -120,7 +123,7 @@ internal fun OverlayPageFrame(
                     // 开关是性能页管理器的页面状态：主界面、浮窗、横竖屏读的都是同一份。
                     val chartSummary =
                         PageManagers.performance(LocalContext.current).summaryActive &&
-                            pageName == "性能"
+                            pageName == SettingsCatalog.PAGE_PERFORMANCE
 
                     // ---------- 标题栏：唯一拖动区 ----------
                     // 摘要视图里不隐藏：这一条是浮窗唯一能拖的地方，藏了窗口就挪不动。
@@ -139,7 +142,10 @@ internal fun OverlayPageFrame(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "任务管理器 · $pageName",
+                            text = AppStrings.s(
+                                R.string.overlay_title,
+                                SettingsCatalog.optionLabel(pageName)
+                            ),
                             style = MaterialTheme.typography.titleSmall,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -150,7 +156,10 @@ internal fun OverlayPageFrame(
                             onClick = actions.close,
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                         ) {
-                            Text("退出", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                AppStrings.s(R.string.overlay_exit),
+                                style = MaterialTheme.typography.labelMedium
+                            )
                         }
                     }
 
@@ -176,7 +185,7 @@ internal fun OverlayPageFrame(
                                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                                 ) {
                                     Text(
-                                        text = name,
+                                        text = SettingsCatalog.optionLabel(name),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = if (selected) {
                                             MaterialTheme.colorScheme.primary
@@ -243,23 +252,23 @@ private fun OverlayPageBody(
     onSettingChanged: (SettingKey, Any) -> Unit
 ) {
     when (pageName) {
-        "性能" -> PerformanceScreen(hostedInOverlay = true)
+        SettingsCatalog.PAGE_PERFORMANCE -> PerformanceScreen(hostedInOverlay = true)
 
-        "应用历史记录" -> ApphistoryScreen()
+        SettingsCatalog.PAGE_APP_HISTORY -> ApphistoryScreen()
 
-        "启动应用" -> StartupAppScreen()
+        SettingsCatalog.PAGE_STARTUP -> StartupAppScreen()
 
-        "用户" -> UsersScreen()
+        SettingsCatalog.PAGE_USERS -> UsersScreen()
 
-        "详细信息" -> DetailsScreen(hostedInOverlay = true)
+        SettingsCatalog.PAGE_DETAILS -> DetailsScreen(hostedInOverlay = true)
 
-        "服务" -> ServicesScreen()
+        SettingsCatalog.PAGE_SERVICES -> ServicesScreen()
 
-        "调试" -> DebugScreen()
+        SettingsCatalog.PAGE_DEBUG -> DebugScreen()
 
         // "设置"：同一份 SettingsScreen，但走"窗口内对话框"模式
         // （浮窗没有 Activity 窗口令牌，AlertDialog / DropdownMenu 会崩）
-        "设置" -> SettingsScreen(
+        SettingsCatalog.PAGE_SETTINGS -> SettingsScreen(
             initialValues = settingsProvider(),
             onSettingChanged = onSettingChanged,
             hostedInOverlay = true

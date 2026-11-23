@@ -19,6 +19,8 @@
  */
 package com.android.taskmanager.data
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import java.util.Locale
 
 /**
@@ -38,9 +40,9 @@ data class CpuClusterExt(
 
     /** 分区说明：`policy0 · 4 个核心`；没有 policy 时只剩核数。 */
     fun subtitle(): String {
-        val policyText = policy?.let { "policy$it" } ?: "拓扑分组"
+        val policyText = policy?.let { "policy$it" } ?: AppStrings.s(R.string.cpuext_topology_group)
 
-        return "$policyText · ${coreIds.size} 个核心"
+        return AppStrings.s(R.string.cpuext_cluster_subtitle, policyText, coreIds.size)
     }
 }
 

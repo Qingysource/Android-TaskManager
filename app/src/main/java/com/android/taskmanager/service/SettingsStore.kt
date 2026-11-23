@@ -145,6 +145,14 @@ object SettingsStore {
         val alwaysOnTop: Boolean,
 
         /**
+         * 是否"用无障碍权限置顶"（决定置顶走哪条通路）。
+         *
+         * 只是意向：真正能不能走无障碍通路，还要看无障碍权限在不在
+         * （MainActivity 拿它和 A11yTopWindow.isEnabled 一起判断）。
+         */
+        val a11yTopWindow: Boolean,
+
+        /**
          * 一次性"回原位"记录（空串 = 没有待办）。
          *
          * 非空表示"上一程是在另一侧界面上的，这一程要回到那一页"：
@@ -165,6 +173,7 @@ object SettingsStore {
     val startupDefaults: StartupSettings = StartupSettings(
         startPage = SettingsDefaults.defaultStartPage,
         alwaysOnTop = SettingsDefaults.windowAlwaysOnTop,
+        a11yTopWindow = SettingsDefaults.a11yTopWindow,
         lastPage = SettingsDefaults.lastPage,
         appTheme = SettingsDefaults.appTheme
     )
@@ -188,6 +197,7 @@ object SettingsStore {
         StartupSettings(
             startPage = values.defaultStartPage,
             alwaysOnTop = values.windowAlwaysOnTop,
+            a11yTopWindow = values.a11yTopWindow,
             lastPage = values.lastPage,
             appTheme = values.appTheme
         )
@@ -474,8 +484,17 @@ object SettingsStore {
     /**
      * 修正"设置说开着、但系统已经不给"的组合（属于运行时约束，不是文件损坏）。
      *
-     * 目前一条规则：
-     *     置顶（window_always_on_top）= true，但悬浮窗权限已经不在 -> 强制改回 false。
+     * 两条规则，顺序不能换（先收无障碍，再判置顶）：
+     *
+     * 1. 无障碍置顶窗口（a11y_top_window）= true，但无障碍权限已经不在
+     *    -> 这个选项改回 false。置顶是否跟着关，看它还有没有别的成立条件：
+     *    有悬浮窗权限就继续（窗口换成悬浮窗那只，页都不变）；
+     *    没有悬浮窗权限才由规则 2 连置顶一起关——否则会留下"置顶开着、窗口却建不出来"的错位。
+     *
+     * 2. 置顶 = true，但没有悬浮窗权限，且无障碍这条通路也不可用
+     *    -> 置顶改回 false。
+     *    "可用"= 选项开着 + 权限真的在（两个条件缺一不可）：
+     *    用户有权限但把选项关了，说明他要的就是悬浮窗通路，那就仍然要求悬浮窗权限。
      *
      * 为什么必须在**读盘/缓存命中**时都做：
      * 1. MainActivity 拿这个值决定"要不要以浮窗启动"。权限没了而值仍是 true，
@@ -491,14 +510,38 @@ object SettingsStore {
         values: SettingsValues,
         problems: MutableList<String>? = null
     ): SettingsValues {
-        if (values.windowAlwaysOnTop && !mayDrawOverlays(context)) {
-            problems?.add("悬浮窗权限已不在，已把「置于顶层」改回关闭")
+        var result = values
 
-            return values.copy(windowAlwaysOnTop = false)
+        // 规则 1：无障碍权限没了 -> 这条通路失去意义，选项改回关闭。
+        // 但「置于顶层」**不在这里**一刀切：还有悬浮窗权限时它依然成立（窗口换成悬浮窗跑），
+        // 只有连悬浮窗权限也没有时，才由下面的规则 2 连它一起关。
+        if (result.a11yTopWindow && !mayUseA11yTopWindow(context)) {
+            problems?.add("无障碍权限已不在，已把「使用无障碍权限置顶」改回关闭")
+
+            result = result.copy(a11yTopWindow = false)
         }
 
-        return values
+        if (result.windowAlwaysOnTop && !mayDrawOverlays(context) && !a11yTopWindowUsable(context, result)) {
+            problems?.add("悬浮窗权限已不在，已把「置于顶层」改回关闭")
+
+            result = result.copy(windowAlwaysOnTop = false)
+        }
+
+        return result
     }
+
+    /**
+     * 置顶的权限判据：要不要悬浮窗权限。
+     *
+     * 返回 false 表示"不需要悬浮窗权限"——只有当无障碍置顶窗口开着、**并且**无障碍权限真的在，
+     * 才会走无障碍那条更高层级的窗口通路（TYPE_ACCESSIBILITY_OVERLAY，由无障碍服务自己建）。
+     * 设置页、存储层、UIService、MainActivity 用的是同一个判据，不会各算各的。
+     */
+    private fun a11yTopWindowUsable(context: Context, values: SettingsValues): Boolean =
+        values.a11yTopWindow && mayUseA11yTopWindow(context)
+
+    /** 本应用的无障碍服务是否已被用户启用（查询异常按"没启用"处理，见 A11yTopWindow）。 */
+    private fun mayUseA11yTopWindow(context: Context): Boolean = A11yTopWindow.isEnabled(context)
 
     /**
      * 当前有没有悬浮窗权限。
@@ -538,13 +581,15 @@ object SettingsStore {
 
             SettingKey.MINIMIZE_WHEN_IN_USE -> values.copy(minimizeWhenInUse = asBoolean(values.minimizeWhenInUse))
 
-            SettingKey.HIDE_WHEN_MINIMIZED -> values.copy(hideWhenMinimized = asBoolean(values.hideWhenMinimized))
+            SettingKey.A11Y_TOP_WINDOW -> values.copy(a11yTopWindow = asBoolean(values.a11yTopWindow))
 
             SettingKey.SHOW_FULL_ACCOUNT_NAME -> values.copy(showFullAccountName = asBoolean(values.showFullAccountName))
 
             SettingKey.SHOW_ALL_PROCESS_HISTORY -> values.copy(showAllProcessHistory = asBoolean(values.showAllProcessHistory))
 
             SettingKey.CONFIRM_EFFICIENCY_MODE -> values.copy(confirmEfficiencyMode = asBoolean(values.confirmEfficiencyMode))
+
+            SettingKey.BACKGROUND_STATS -> values.copy(backgroundStats = asBoolean(values.backgroundStats))
 
             SettingKey.ABORT_ON_INSUFFICIENT_MEMORY -> values.copy(abortOnInsufficientMemory = asBoolean(values.abortOnInsufficientMemory))
 
@@ -848,3 +893,4 @@ object DetailViewStore {
         }
     }
 }
+

@@ -98,7 +98,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.service.A11yTopWindow
 import com.android.taskmanager.service.UIService
+import kotlinx.coroutines.delay
 
 // =========================================================
 // 设置数据结构
@@ -131,12 +134,20 @@ data class SettingsValues(
     // —— 窗口管理 ——
     val windowAlwaysOnTop: Boolean,
     val minimizeWhenInUse: Boolean,
-    val hideWhenMinimized: Boolean,
+    val a11yTopWindow: Boolean,
 
     // —— 其他选项 ——
     val showFullAccountName: Boolean,
     val showAllProcessHistory: Boolean,
     val confirmEfficiencyMode: Boolean,
+
+    /**
+     * 后台统计：应用不在前台时是否继续采样性能数据。
+     *
+     * 只影响"看不见界面时要不要采"：界面可见（普通界面在前台或顶层窗口在显示）时永远照常采。
+     * 关闭后后台不采集、不发请求，省 CPU 与电；默认开启，因为性能页要的是一段连续历史。
+     */
+    val backgroundStats: Boolean,
 
     // —— 高级：实时内核内存转储 ——
     val abortOnInsufficientMemory: Boolean,
@@ -167,20 +178,24 @@ data class SettingsValues(
  * 以后加字段时才不会漏掉某一处同步。
  */
 val SettingsDefaults = SettingsValues(
-    appTheme = "使用系统设置",
-    defaultStartPage = "进程",
-    updateSpeed = "常规",
+    // 默认值写的是**内部标识**，不是界面文案：它们会和 settings.json 里的旧值直接比较
+    appTheme = SettingsCatalog.THEME_SYSTEM,
+    defaultStartPage = SettingsCatalog.PAGE_PROCESSES,
+    updateSpeed = SettingsCatalog.SPEED_NORMAL,
 
     // 默认不保留小数：要看细节的用户自己去设置页改成一位 / 两位
-    cpuUsagePrecision = "默认",
+    cpuUsagePrecision = SettingsCatalog.PRECISION_DEFAULT,
 
     windowAlwaysOnTop = false,
     minimizeWhenInUse = true,
-    hideWhenMinimized = false,
+    a11yTopWindow = false,
 
     showFullAccountName = false,
     showAllProcessHistory = true,
     confirmEfficiencyMode = true,
+
+    // 默认继续在后台采样：图表要连续，关掉是用户主动省电的选择
+    backgroundStats = true,
 
     abortOnInsufficientMemory = true,
     captureHypervisorPages = false,
@@ -213,11 +228,14 @@ enum class SettingKey(val storageKey: String) {
 
     WINDOW_ALWAYS_ON_TOP("window_always_on_top"),
     MINIMIZE_WHEN_IN_USE("minimize_when_in_use"),
-    HIDE_WHEN_MINIMIZED("hide_when_minimized"),
+    A11Y_TOP_WINDOW("a11y_top_window"),
 
     SHOW_FULL_ACCOUNT_NAME("show_full_account_name"),
     SHOW_ALL_PROCESS_HISTORY("show_all_process_history"),
     CONFIRM_EFFICIENCY_MODE("confirm_efficiency_mode"),
+
+    /** 后台统计：不在前台时是否继续采样性能数据（默认 true）。 */
+    BACKGROUND_STATS("background_stats"),
 
     ABORT_ON_INSUFFICIENT_MEMORY("abort_on_insufficient_memory"),
     CAPTURE_HYPERVISOR_PAGES("capture_hypervisor_pages"),
@@ -299,11 +317,12 @@ object SettingsApi : ISettingsApi {
 
             SettingKey.WINDOW_ALWAYS_ON_TOP -> d.windowAlwaysOnTop
             SettingKey.MINIMIZE_WHEN_IN_USE -> d.minimizeWhenInUse
-            SettingKey.HIDE_WHEN_MINIMIZED -> d.hideWhenMinimized
+            SettingKey.A11Y_TOP_WINDOW -> d.a11yTopWindow
 
             SettingKey.SHOW_FULL_ACCOUNT_NAME -> d.showFullAccountName
             SettingKey.SHOW_ALL_PROCESS_HISTORY -> d.showAllProcessHistory
             SettingKey.CONFIRM_EFFICIENCY_MODE -> d.confirmEfficiencyMode
+            SettingKey.BACKGROUND_STATS -> d.backgroundStats
 
             SettingKey.ABORT_ON_INSUFFICIENT_MEMORY -> d.abortOnInsufficientMemory
             SettingKey.CAPTURE_HYPERVISOR_PAGES -> d.captureHypervisorPages
@@ -328,11 +347,12 @@ object SettingsApi : ISettingsApi {
 
         SettingKey.WINDOW_ALWAYS_ON_TOP.storageKey to values.windowAlwaysOnTop,
         SettingKey.MINIMIZE_WHEN_IN_USE.storageKey to values.minimizeWhenInUse,
-        SettingKey.HIDE_WHEN_MINIMIZED.storageKey to values.hideWhenMinimized,
+        SettingKey.A11Y_TOP_WINDOW.storageKey to values.a11yTopWindow,
 
         SettingKey.SHOW_FULL_ACCOUNT_NAME.storageKey to values.showFullAccountName,
         SettingKey.SHOW_ALL_PROCESS_HISTORY.storageKey to values.showAllProcessHistory,
         SettingKey.CONFIRM_EFFICIENCY_MODE.storageKey to values.confirmEfficiencyMode,
+        SettingKey.BACKGROUND_STATS.storageKey to values.backgroundStats,
 
         SettingKey.ABORT_ON_INSUFFICIENT_MEMORY.storageKey to values.abortOnInsufficientMemory,
         SettingKey.CAPTURE_HYPERVISOR_PAGES.storageKey to values.captureHypervisorPages,
@@ -366,7 +386,7 @@ object SettingsApi : ISettingsApi {
 
             windowAlwaysOnTop = readBoolean(SettingKey.WINDOW_ALWAYS_ON_TOP, d.windowAlwaysOnTop),
             minimizeWhenInUse = readBoolean(SettingKey.MINIMIZE_WHEN_IN_USE, d.minimizeWhenInUse),
-            hideWhenMinimized = readBoolean(SettingKey.HIDE_WHEN_MINIMIZED, d.hideWhenMinimized),
+            a11yTopWindow = readBoolean(SettingKey.A11Y_TOP_WINDOW, d.a11yTopWindow),
 
             showFullAccountName = readBoolean(SettingKey.SHOW_FULL_ACCOUNT_NAME, d.showFullAccountName),
             showAllProcessHistory = readBoolean(
@@ -377,6 +397,7 @@ object SettingsApi : ISettingsApi {
                 SettingKey.CONFIRM_EFFICIENCY_MODE,
                 d.confirmEfficiencyMode
             ),
+            backgroundStats = readBoolean(SettingKey.BACKGROUND_STATS, d.backgroundStats),
 
             abortOnInsufficientMemory = readBoolean(
                 SettingKey.ABORT_ON_INSUFFICIENT_MEMORY,
@@ -491,8 +512,8 @@ fun SettingsScreen(
         mutableStateOf(initialValues.minimizeWhenInUse)
     }
 
-    var hideWhenMinimized by remember(layoutEpoch, initialValues) {
-        mutableStateOf(initialValues.hideWhenMinimized)
+    var a11yTopWindow by remember(layoutEpoch, initialValues) {
+        mutableStateOf(initialValues.a11yTopWindow)
     }
 
     // =====================================================
@@ -513,6 +534,10 @@ fun SettingsScreen(
 
     var confirmEfficiencyMode by remember(layoutEpoch, initialValues) {
         mutableStateOf(initialValues.confirmEfficiencyMode)
+    }
+
+    var backgroundStats by remember(layoutEpoch, initialValues) {
+        mutableStateOf(initialValues.backgroundStats)
     }
 
     // =====================================================
@@ -602,8 +627,30 @@ fun SettingsScreen(
         mutableStateOf(false)
     }
 
+    // 用户勾了"使用无障碍权限置顶"但还没有无障碍权限时，弹这个说明对话框
+    // （无障碍权限同样没有运行时申请接口，只能引导用户去系统无障碍设置页手动打开）
+    var showA11yPermissionDialog by rememberSaveable {
+        mutableStateOf(false)
+    }
+
     // 授权成功后提示"重启应用才生效"（浮窗在启动时创建）
     var showOverlayRestartDialog by rememberSaveable {
+        mutableStateOf(false)
+    }
+
+    /**
+     * 用户点过那个复选框、但当时还没有对应权限（说明框已经把他导向系统页）。
+     *
+     * 为什么单独记两个标记：授权这件事没有返回值，用户可能在应用内跳转后返回，
+     * 也可能自己跑去系统页再回来——没有标记就分不清"他点过、在等权限"和
+     * "他根本没想开、只是顺手给了权限"。只有前一种情况才允许自动勾上并落盘。
+     * 点"取消"会清掉标记：取消 = 不打算开了。
+     */
+    var pendingEnableOverlay by rememberSaveable {
+        mutableStateOf(false)
+    }
+
+    var pendingEnableA11y by rememberSaveable {
         mutableStateOf(false)
     }
 
@@ -621,22 +668,82 @@ fun SettingsScreen(
     val context = LocalContext.current
 
     /**
-     * [OVERLAY-v1] 进页面时校正「置于顶层」：显示的是"已开启"，但权限已经被收回。
+     * 把两条置顶相关选项与真实权限对齐一次。
      *
-     * 为什么页面自己也要查一次：
-     * - 存储层（SettingsStore.load）已经在读盘/缓存命中时修过一次，正常不会走到这里；
-     * - 但设置页可能是"一直开着"的那一个（用户在这个页面期间去别处撤了权限），
-     *   这时内存里的值仍然是 true，页面上勾也还是勾着的——用户看到的就是老 bug 的界面部分。
-     * 所以进页面时再核一次：不一致就当场改回关闭并落盘（走的是同一条 onSettingChanged）。
+     * 什么时候跑：① 每次进入本页（含从别的页切回来、横竖屏重建）；
+     * ② 页面可见期间每 [TOP_WINDOW_PERMISSION_RECHECK_MS] 一次。
+     *
+     * 规则只有一条硬要求：**原本勾着的按钮，权限被收回就立刻取消勾选并落盘**。
+     * 没勾的一律不动——用户只是给了权限、并没有要求进这些模式，
+     * 就不该被自动勾上、更不该被弹"重启生效"。
+     *
+     * 唯一会"自动勾上"的情形：用户自己点过那个复选框（[pendingEnableOverlay] /
+     * [pendingEnableA11y] 记着这次点击），随后确实把权限授了——那是他在等的那个结果，
+     * 所以要补上并落盘（与手动勾选走同一条 onSettingChanged）。
+     *
+     * 两条撤销规则顺序不能换（与 SettingsStore.applyRuntimeConstraints 一致）：
+     * 1. 无障碍权限没了 -> 无障碍选项关掉；「置于顶层」只有在**没有悬浮窗权限**时才跟着关
+     *    （有悬浮窗权限的话，窗口换成悬浮窗继续置顶，和用户手动关掉这条选项是同一个结果）；
+     * 2. 置顶还开着，但既没有悬浮窗权限、也不能靠无障碍豁免 -> 置顶改回关闭。
      *
      * 注意：这里不改"回原位"记录（不写 LAST_PAGE）——用户并没有主动退出浮窗，
      * 只是权限没了，不该给他留下一次"下次回到这页"的便条。
      */
-    LaunchedEffect(Unit) {
-        if (windowAlwaysOnTop && !Settings.canDrawOverlays(context)) {
+    fun reconcileTopWindowPermissions() {
+        val a11yEnabledNow = A11yTopWindow.isEnabled(context)
+
+        // 1. 无障碍权限被收回：先关掉这条通路（置顶要不要跟着关，交给下面的规则 2 判）
+        if (a11yTopWindow && !a11yEnabledNow) {
+            a11yTopWindow = false
+
+            onSettingChanged(SettingKey.A11Y_TOP_WINDOW, false)
+
+            pendingEnableA11y = false
+        }
+
+        val canDrawOverlaysNow = Settings.canDrawOverlays(context)
+
+        // 2. 用户点过复选框、权限也真的到了：补上这次勾选（只认"点过"的意图）
+        if (pendingEnableA11y && a11yEnabledNow && !a11yTopWindow) {
+            pendingEnableA11y = false
+
+            a11yTopWindow = true
+
+            onSettingChanged(SettingKey.A11Y_TOP_WINDOW, true)
+        }
+
+        if (pendingEnableOverlay && canDrawOverlaysNow && !windowAlwaysOnTop) {
+            pendingEnableOverlay = false
+
+            windowAlwaysOnTop = true
+
+            onSettingChanged(SettingKey.WINDOW_ALWAYS_ON_TOP, true)
+
+            // 普通界面里勾上还不等于窗口在跑（窗口在启动时建），仍旧提示重启；
+            // 浮窗 / 无障碍窗口里本来就有窗口，不打扰
+            if (!hostedInOverlay) {
+                showOverlayRestartDialog = true
+            }
+        }
+
+        // 3. 置顶失去依据：没有悬浮窗权限，也不能走无障碍通路
+        val a11yUsableNow = a11yTopWindow && a11yEnabledNow
+
+        if (windowAlwaysOnTop && !canDrawOverlaysNow && !a11yUsableNow) {
             windowAlwaysOnTop = false
 
             onSettingChanged(SettingKey.WINDOW_ALWAYS_ON_TOP, false)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        // 进页面立刻核一次（从别的页切回来、横竖屏重建都会重跑这段），
+        // 之后在页面可见期间持续核：权限可能被用户在系统设置里随时收回，
+        // 而系统**不会通知应用**。与 UIService 的巡检是同一套判据，两边谁先发现都行。
+        while (true) {
+            reconcileTopWindowPermissions()
+
+            delay(TOP_WINDOW_PERMISSION_RECHECK_MS)
         }
     }
 
@@ -644,27 +751,23 @@ fun SettingsScreen(
      * [OVERLAY-v1] 从"悬浮窗设置页"返回后的回调。
      *
      * 系统页没有返回值（这个特殊权限不通过 ActivityResult 回传结果），
-     * 所以回来后自己再查一次 canDrawOverlays：
-     * - 拿到权限 -> 这时才真正勾上并落盘，再提示重启；
+     * 所以回来后统一交给 [reconcileTopWindowPermissions] 复核：
+     * - 拿到了 -> 补上那次勾选并落盘（它还会顺手提示重启，因为窗口在启动时建）；
      * - 没拿到   -> 弹共享的"权限请求失败"框（再试一次 / 取消），勾选保持未勾。
      */
     // [OVERLAY-v1] 浮窗里不能创建 ActivityResultLauncher：
     // 浮窗的 Composition 没有 ActivityResultRegistryOwner，一建就抛异常。
     // 条件只取决于参数 hostedInOverlay（组合期间恒定），所以条件式 remember 是安全的。
-    // 浮窗里这个对话框本来也不会出现（浮窗能显示就说明权限已经授予）。
+    // 浮窗里没有 launcher，跳系统页改用直接 startActivity（见 openOverlayPermissionPage）。
     val overlayPermissionLauncher = if (hostedInOverlay) {
         null
     } else {
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.StartActivityForResult()
         ) {
-            if (Settings.canDrawOverlays(context)) {
-                windowAlwaysOnTop = true
+            reconcileTopWindowPermissions()
 
-                onSettingChanged(SettingKey.WINDOW_ALWAYS_ON_TOP, true)
-
-                showOverlayRestartDialog = true
-            } else {
+            if (!windowAlwaysOnTop) {
                 // 用户在系统页里没打开开关就返回了：按"没拿到权限"处理，
                 // 让用户能就地再试一次，而不是只留一个"什么都没发生"的界面
                 failedPermissionTarget = PermissionRetryTarget.OVERLAY
@@ -674,14 +777,70 @@ fun SettingsScreen(
 
     /** 打开系统的悬浮窗权限页（个别 ROM 没有这个 Activity，跳不动也不该崩）。 */
     fun openOverlayPermissionPage() {
-        runCatching {
-            overlayPermissionLauncher?.launch(
-                Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + context.packageName)
-                )
-            )
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:" + context.packageName)
+        )
+
+        val launcher = overlayPermissionLauncher
+
+        if (launcher != null) {
+            runCatching { launcher.launch(intent) }
+
+            return
         }
+
+        // 浮窗 / 无障碍窗口里没有 ActivityResult launcher：
+        // 直接起系统页（窗口本身可见，属于"有可见窗口"的启动，多数系统放行；
+        // 个别 ROM 拦下也只是没跳过去，不会崩）。
+        runCatching { context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
+
+    /**
+     * 从"无障碍设置页"返回后的回调。
+     *
+     * 无障碍权限也没有返回值（同样不通过 ActivityResult 回传结果），所以回来同样交给
+     * [reconcileTopWindowPermissions] 复核：
+     * - 拿到了 -> 补上那次勾选并落盘。若此刻正有顶层窗口在跑（走的还是悬浮窗通路），
+     *   UIService 收到这次变更后会当场把窗口换成无障碍那只，不用重启；
+     * - 没拿到   -> 弹共享的"权限请求失败"框（再试一次 / 取消），勾选保持未勾。
+     *
+     * 与悬浮窗 launcher 同一套路：浮窗里没有 ActivityResultRegistryOwner，
+     * 建 launcher 会抛异常，所以 hostedInOverlay 时置 null（跳转改走直接 startActivity）。
+     */
+    val a11yPermissionLauncher = if (hostedInOverlay) {
+        null
+    } else {
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.StartActivityForResult()
+        ) {
+            reconcileTopWindowPermissions()
+
+            if (!a11yTopWindow) {
+                failedPermissionTarget = PermissionRetryTarget.A11Y
+            }
+        }
+    }
+
+    /**
+     * 打开系统的无障碍设置页。
+     *
+     * 无障碍权限只能由用户在系统页里手动打开（应用无法自行授予），所以这里只跳页面。
+     * 个别 ROM 没有这个 Activity（少数定制系统把入口藏起来），跳不动也不该崩。
+     */
+    fun openA11yPermissionPage() {
+        val intent = A11yTopWindow.settingsIntent()
+
+        val launcher = a11yPermissionLauncher
+
+        if (launcher != null) {
+            runCatching { launcher.launch(intent) }
+
+            return
+        }
+
+        // 浮窗 / 无障碍窗口里没有 launcher：直接起系统页（见 openOverlayPermissionPage 的说明）
+        runCatching { context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
     }
 
     /**
@@ -740,6 +899,8 @@ fun SettingsScreen(
         when (target) {
             PermissionRetryTarget.OVERLAY -> openOverlayPermissionPage()
 
+            PermissionRetryTarget.A11Y -> openA11yPermissionPage()
+
             PermissionRetryTarget.SHIZUKU -> requestShizukuPermission()
 
             PermissionRetryTarget.ROOT -> requestRootPermission()
@@ -785,11 +946,12 @@ fun SettingsScreen(
 
         windowAlwaysOnTop = windowAlwaysOnTop,
         minimizeWhenInUse = minimizeWhenInUse,
-        hideWhenMinimized = hideWhenMinimized,
+        a11yTopWindow = a11yTopWindow,
 
         showFullAccountName = showFullAccountName,
         showAllProcessHistory = showAllProcessHistory,
         confirmEfficiencyMode = confirmEfficiencyMode,
+        backgroundStats = backgroundStats,
 
         abortOnInsufficientMemory = abortOnInsufficientMemory,
         captureHypervisorPages = captureHypervisorPages,
@@ -841,7 +1003,7 @@ fun SettingsScreen(
 
         // 服务没起来：不知道真实权限，宁可不动，也不猜"应该可以"
         if (api == null) {
-            identityRejectedNote = "任务管理器服务尚未就绪，暂时无法切换身份，请稍后再试。"
+            identityRejectedNote = AppStrings.s(R.string.setting_identity_no_service)
 
             showIdentityRejectedDialog = true
 
@@ -854,30 +1016,38 @@ fun SettingsScreen(
                 CredentialDecision.ALLOWED -> Unit
 
                 CredentialDecision.MISSING_SHIZUKU -> {
-                    identityRejectedNote =
-                        "「$value」需要 Shizuku 授权。请先在下方「Shizuku」一栏请求权限，获得授权后再选择该身份。"
+                    identityRejectedNote = AppStrings.s(
+                        R.string.setting_identity_need_shizuku,
+                        SettingsCatalog.optionLabel(value)
+                    )
 
                     showIdentityRejectedDialog = true
                 }
 
                 // Shizuku 已经授权，但它跑在 root 上：给得出 root 能力，给不出 uid 2000 的 shell 身份
                 CredentialDecision.SHELL_UNAVAILABLE -> {
-                    identityRejectedNote =
-                        "「$value」不可用：Shizuku 当前以 root 身份运行，它提供给本应用的是 root 能力，" +
-                            "拿不到 shell(adb) 的 uid 2000 身份。请改用「root」或「普通权限」。"
+                    identityRejectedNote = AppStrings.s(
+                        R.string.setting_identity_shell_unavailable,
+                        SettingsCatalog.optionLabel(value)
+                    )
 
                     showIdentityRejectedDialog = true
                 }
 
                 CredentialDecision.MISSING_ROOT -> {
-                    identityRejectedNote =
-                        "「$value」需要 Root 权限。请先在下方「Root」一栏请求权限，获得授权后再选择该身份。"
+                    identityRejectedNote = AppStrings.s(
+                        R.string.setting_identity_need_root,
+                        SettingsCatalog.optionLabel(value)
+                    )
 
                     showIdentityRejectedDialog = true
                 }
 
                 CredentialDecision.INVALID -> {
-                    identityRejectedNote = "无法识别的身份选项「$value」，已保留原来的选择。"
+                    identityRejectedNote = AppStrings.s(
+                        R.string.setting_identity_invalid,
+                        SettingsCatalog.optionLabel(value)
+                    )
 
                     showIdentityRejectedDialog = true
                 }
@@ -925,10 +1095,19 @@ fun SettingsScreen(
     fun updateWindowAlwaysOnTop(value: Boolean) {
         if (windowAlwaysOnTop == value) return
 
-        // [OVERLAY-v1] 开"置于顶层"= 要用悬浮窗，先确认有没有这个权限。
+        // 开"置于顶层"= 要一个顶层窗口，得先确认有没有相应的权限。
         // SYSTEM_ALERT_WINDOW 是"特殊应用权限"，没有运行时申请接口，只能跳系统设置页；
         // 所以这里：不勾选、不落盘、只弹说明，等用户授权返回后由 launcher 补上这次变更。
-        if (value && !Settings.canDrawOverlays(context)) {
+        //
+        // 免悬浮窗权限的唯一情形：无障碍置顶窗口开着 **且** 无障碍权限真的在。
+        // 那种情况下窗口走无障碍通路（层级更高），不需要 SYSTEM_ALERT_WINDOW。
+        // 用户只是"有权限但把选项关了"不算豁免——选项决定走哪条通路，关掉就回到悬浮窗。
+        val a11yUsable = a11yTopWindow && A11yTopWindow.isEnabled(context)
+
+        if (value && !Settings.canDrawOverlays(context) && !a11yUsable) {
+            // 记下"用户点过"，这样他真去授了权、回到这页时能补上这次勾选（并落盘）
+            pendingEnableOverlay = true
+
             showOverlayPermissionDialog = true
 
             return
@@ -939,8 +1118,12 @@ fun SettingsScreen(
         // 交给 UIService：落盘 + 生效（页面不碰存储）
         onSettingChanged(SettingKey.WINDOW_ALWAYS_ON_TOP, value)
 
-        // [OVERLAY-v1] 置顶不是立刻生效：浮窗由下一次启动时的 MainActivity 决定创建
-        if (value) showOverlayRestartDialog = true
+        // 置顶不是立刻生效：窗口由下一次启动时的 MainActivity 决定创建。
+        // 只要这次勾选真的能建出窗口（有悬浮窗权限，或走无障碍通路），就提示重启；
+        // 两条通路都不满足时这次勾选会被存储层改回关闭，弹重启框只会让人白高兴。
+        if (value && (Settings.canDrawOverlays(context) || a11yUsable)) {
+            showOverlayRestartDialog = true
+        }
     }
 
     /**
@@ -967,15 +1150,52 @@ fun SettingsScreen(
         // TODO(预留): 使用时最小化，由 Compose 窗口层读取快照
     }
 
-    fun updateHideWhenMinimized(value: Boolean) {
-        if (hideWhenMinimized == value) return
+    /**
+     * 改"使用无障碍权限置顶"。
+     *
+     * 这个选项只决定"置顶窗口用哪条通路"，本身不建窗——所以它有两条特殊规则：
+     *
+     * 开启：
+     * - 先查无障碍权限。没有就**不勾、不落盘**，只弹说明框，等用户去系统无障碍页
+     *   手动打开本应用的服务（应用无法自行授予），返回后由 launcher 补上这次变更；
+     * - 有权限就直接勾上并落盘（像「置于顶层」一样需要保存）。
+     *
+     * 关闭（含"权限还在但用户主动关掉"）：
+     * - 选项本身写回 false；
+     * - 如果「置于顶层」当时是靠它豁免悬浮窗权限（即没有悬浮窗权限），那么置顶也会失去依据，
+     *   必须一起关掉并收窗——否则会出现"设置里置顶还开着，但权限条件已经不满足"的错位。
+     *   有悬浮窗权限时置顶照旧，只是回到"用悬浮窗建顶层窗口"的老通路。
+     */
+    fun updateA11yTopWindow(value: Boolean) {
+        if (a11yTopWindow == value) return
 
-        hideWhenMinimized = value
+        // 开：先要无障碍权限（与「置于顶层」同样的"先权限、后勾选"顺序）
+        if (value && !A11yTopWindow.isEnabled(context)) {
+            // 记下"用户点过"：他真去系统页打开了本应用的服务、回到这页时补上这次勾选。
+            // 若此刻正有顶层窗口在跑（悬浮窗通路），这次勾选会让 UIService 当场换成无障碍窗口。
+            pendingEnableA11y = true
+
+            showA11yPermissionDialog = true
+
+            return
+        }
+
+        a11yTopWindow = value
 
         // 交给 UIService：落盘 + 生效（页面不碰存储）
-        onSettingChanged(SettingKey.HIDE_WHEN_MINIMIZED, value)
+        onSettingChanged(SettingKey.A11Y_TOP_WINDOW, value)
 
-        // TODO(预留): 最小化时隐藏，由 Compose 窗口层读取快照
+        if (!value) {
+            // 关掉这条路：置顶若只靠无障碍豁免（没有悬浮窗权限），就留不住了。
+            // 现在无障碍窗口自己也会占着窗口，所以这里必须真的收窗 + 把置顶关掉并落盘
+            // （由 UIService 的 collapseTopWindow 负责收窗与拉回普通界面）。
+            if (windowAlwaysOnTop && !Settings.canDrawOverlays(context)) {
+                updateWindowAlwaysOnTop(false)
+            }
+        }
+
+        // 这里没有"重启生效"提示：勾选本身不建窗，真正建窗与换通路都由「置于顶层」那条流程负责
+        // （窗口已经挂着时，这条选项的改动从下一次启动开始生效）。
     }
 
     fun updateShowFullAccountName(value: Boolean) {
@@ -1009,6 +1229,22 @@ fun SettingsScreen(
         onSettingChanged(SettingKey.CONFIRM_EFFICIENCY_MODE, value)
 
         // TODO(预留): 效率模式对话框读取该值
+    }
+
+    /**
+     * 改"后台统计"。
+     *
+     * 只决定"看不见界面时还要不要采"：关闭后定时器照跑，但每轮进来先被门禁挡回，
+     * 不取快照、不发请求（见 UIService.refreshPerformanceStatsIfEnabled）。
+     * 采集是服务侧的常驻行为，所以这里只落盘 + 让服务重排一次定时器即可。
+     */
+    fun updateBackgroundStats(value: Boolean) {
+        if (backgroundStats == value) return
+
+        backgroundStats = value
+
+        // 交给 UIService：落盘 + 生效（页面不碰存储）
+        onSettingChanged(SettingKey.BACKGROUND_STATS, value)
     }
 
     fun updateAbortOnInsufficientMemory(value: Boolean) {
@@ -1072,11 +1308,12 @@ fun SettingsScreen(
 
         updateWindowAlwaysOnTop(SettingsDefaults.windowAlwaysOnTop)
         updateMinimizeWhenInUse(SettingsDefaults.minimizeWhenInUse)
-        updateHideWhenMinimized(SettingsDefaults.hideWhenMinimized)
+        updateA11yTopWindow(SettingsDefaults.a11yTopWindow)
 
         updateShowFullAccountName(SettingsDefaults.showFullAccountName)
         updateShowAllProcessHistory(SettingsDefaults.showAllProcessHistory)
         updateConfirmEfficiencyMode(SettingsDefaults.confirmEfficiencyMode)
+        updateBackgroundStats(SettingsDefaults.backgroundStats)
 
         updateAbortOnInsufficientMemory(SettingsDefaults.abortOnInsufficientMemory)
         updateCaptureHypervisorPages(SettingsDefaults.captureHypervisorPages)
@@ -1103,12 +1340,12 @@ fun SettingsScreen(
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            SettingsSection(title = "外观")
+            SettingsSection(title = AppStrings.s(R.string.setting_appearance))
 
             SettingsDropdown(
                 icon = Icons.Outlined.Palette,
-                title = "应用主题",
-                description = "选择应用使用的颜色主题",
+                title = AppStrings.s(R.string.setting_theme),
+                description = AppStrings.s(R.string.setting_theme_desc),
                 selected = appTheme,
                 // 选项名单与存储层校验共用 SettingsCatalog，避免两处名单不一致
                 options = SettingsCatalog.THEMES,
@@ -1124,12 +1361,12 @@ fun SettingsScreen(
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            SettingsSection(title = "常规")
+            SettingsSection(title = AppStrings.s(R.string.setting_general))
 
             SettingsDropdown(
                 icon = Icons.Outlined.Home,
-                title = "默认起始页",
-                description = "启动应用时默认打开的页面",
+                title = AppStrings.s(R.string.setting_start_page),
+                description = AppStrings.s(R.string.setting_start_page_desc),
                 selected = defaultStartPage,
                 options = SettingsCatalog.START_PAGES,
                 onSelected = ::updateDefaultStartPage,
@@ -1138,8 +1375,8 @@ fun SettingsScreen(
 
             SettingsDropdown(
                 icon = Icons.Outlined.Speed,
-                title = "实时更新速度",
-                description = "指定更新系统资源使用情况报告的频率",
+                title = AppStrings.s(R.string.setting_update_speed),
+                description = AppStrings.s(R.string.setting_update_speed_desc),
                 selected = updateSpeed,
                 options = SettingsCatalog.UPDATE_SPEEDS,
                 onSelected = ::updateUpdateSpeed,
@@ -1150,8 +1387,8 @@ fun SettingsScreen(
             // 所以改这个选项不会触发重新采样，也不会清掉图表上已经画出来的曲线。
             SettingsDropdown(
                 icon = Icons.Outlined.Percent,
-                title = "利用率精确度",
-                description = "控制 CPU 利用率显示的小数位数：默认不保留小数，一位 / 两位依次增加",
+                title = AppStrings.s(R.string.setting_precision),
+                description = AppStrings.s(R.string.setting_precision_desc),
                 selected = cpuUsagePrecision,
                 options = SettingsCatalog.CPU_USAGE_PRECISIONS,
                 onSelected = ::updateCpuUsagePrecision,
@@ -1161,60 +1398,68 @@ fun SettingsScreen(
             // 窗口管理
             SettingsExpandableGroup(
                 icon = Icons.Filled.GridView,
-                title = "窗口管理",
-                description = "指定默认任务管理器窗口行为",
+                title = AppStrings.s(R.string.setting_window_manage),
+                description = AppStrings.s(R.string.setting_window_manage_desc),
                 expanded = windowExpanded,
                 onExpandedChange = { windowExpanded = it }
             ) {
                 SettingsCheckbox(
-                    title = "置于顶层",
-                    description = "以悬浮窗形式显示在其他应用上方，便于边用边监控（需悬浮窗权限）",
+                    title = AppStrings.s(R.string.setting_always_top),
+                    description = AppStrings.s(R.string.setting_always_top_desc),
                     checked = windowAlwaysOnTop,
                     onCheckedChange = ::updateWindowAlwaysOnTop
                 )
 
                 SettingsCheckbox(
-                    title = "使用时最小化",
-                    description = "在使用其他窗口时自动最小化应用",
+                    title = AppStrings.s(R.string.setting_minimize_in_use),
+                    description = AppStrings.s(R.string.setting_minimize_in_use_desc),
                     checked = minimizeWhenInUse,
                     onCheckedChange = ::updateMinimizeWhenInUse
                 )
 
                 SettingsCheckbox(
-                    title = "最小化时隐藏",
-                    description = "最小化应用时将其隐藏",
-                    checked = hideWhenMinimized,
-                    onCheckedChange = ::updateHideWhenMinimized
+                    title = AppStrings.s(R.string.setting_a11y_top_window),
+                    description = AppStrings.s(R.string.setting_a11y_top_window_desc),
+                    checked = a11yTopWindow,
+                    onCheckedChange = ::updateA11yTopWindow
                 )
             }
 
             // 其他选项
             SettingsExpandableGroup(
                 icon = Icons.AutoMirrored.Filled.FormatListBulleted,
-                title = "其他选项",
-                description = "显示完整账户名，显示所有进程的历史记录，确认对话框设置",
+                title = AppStrings.s(R.string.setting_others),
+                description = AppStrings.s(R.string.setting_others_desc),
                 expanded = otherOptionsExpanded,
                 onExpandedChange = { otherOptionsExpanded = it }
             ) {
                 SettingsCheckbox(
-                    title = "显示完整账户名",
-                    description = "显示用户账户的完整名称",
+                    title = AppStrings.s(R.string.setting_full_account_name),
+                    description = AppStrings.s(R.string.setting_full_account_name_desc),
                     checked = showFullAccountName,
                     onCheckedChange = ::updateShowFullAccountName
                 )
 
                 SettingsCheckbox(
-                    title = "显示所有进程的历史记录",
-                    description = "保留并显示所有进程的历史信息",
+                    title = AppStrings.s(R.string.setting_all_process_history),
+                    description = AppStrings.s(R.string.setting_all_process_history_desc),
                     checked = showAllProcessHistory,
                     onCheckedChange = ::updateShowAllProcessHistory
                 )
 
                 SettingsCheckbox(
-                    title = "应用效率模式前询问我",
-                    description = "启用效率模式前显示确认提示",
+                    title = AppStrings.s(R.string.setting_ask_efficiency),
+                    description = AppStrings.s(R.string.setting_ask_efficiency_desc),
                     checked = confirmEfficiencyMode,
                     onCheckedChange = ::updateConfirmEfficiencyMode
+                )
+
+                // 最后一个：后台统计
+                SettingsCheckbox(
+                    title = AppStrings.s(R.string.setting_background_stats),
+                    description = AppStrings.s(R.string.setting_background_stats_desc),
+                    checked = backgroundStats,
+                    onCheckedChange = ::updateBackgroundStats
                 )
             }
         }
@@ -1226,40 +1471,40 @@ fun SettingsScreen(
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            SettingsSection(title = "高级")
+            SettingsSection(title = AppStrings.s(R.string.setting_advanced))
 
             SettingsExpandableGroup(
                 icon = Icons.Filled.Memory,
-                title = "实时内核内存转储选项",
-                description = "如果内存不足，则中止，捕获虚拟机监控程序页面，包括非必要页面，捕获用户页面",
+                title = AppStrings.s(R.string.setting_kernel_dump),
+                description = AppStrings.s(R.string.setting_kernel_dump_desc),
                 expanded = dumpOptionsExpanded,
                 onExpandedChange = { dumpOptionsExpanded = it }
             ) {
                 SettingsCheckbox(
-                    title = "如果内存不足则中止",
-                    description = "可用内存不足以完成转储时中止操作",
+                    title = AppStrings.s(R.string.setting_dump_abort_lowmem),
+                    description = AppStrings.s(R.string.setting_dump_abort_lowmem_desc),
                     checked = abortOnInsufficientMemory,
                     onCheckedChange = ::updateAbortOnInsufficientMemory
                 )
 
                 SettingsCheckbox(
-                    title = "捕获虚拟机监控程序页面",
-                    description = "在内存转储中包含虚拟机监控程序页面",
+                    title = AppStrings.s(R.string.setting_dump_hypervisor),
+                    description = AppStrings.s(R.string.setting_dump_hypervisor_desc),
                     checked = captureHypervisorPages,
                     onCheckedChange = ::updateCaptureHypervisorPages
                 )
 
                 SettingsCheckbox(
-                    title = "包括非必要页面",
-                    description = "同时捕获非必要的虚拟机监控程序页面",
+                    title = AppStrings.s(R.string.setting_dump_nonessential),
+                    description = AppStrings.s(R.string.setting_dump_nonessential_desc),
                     checked = captureNonEssentialPages,
                     enabled = captureHypervisorPages,
                     onCheckedChange = ::updateCaptureNonEssentialPages
                 )
 
                 SettingsCheckbox(
-                    title = "捕获用户页面",
-                    description = "在内存转储中包含用户页面",
+                    title = AppStrings.s(R.string.setting_dump_user_pages),
+                    description = AppStrings.s(R.string.setting_dump_user_pages_desc),
                     checked = captureUserPages,
                     onCheckedChange = ::updateCaptureUserPages
                 )
@@ -1280,16 +1525,16 @@ fun SettingsScreen(
         ) {
             SettingsExpandableGroup(
                 icon = Icons.Filled.Security,
-                title = "用户凭据",
-                description = "决定任务管理器运行的身份与可管理的资源",
+                title = AppStrings.s(R.string.setting_credentials),
+                description = AppStrings.s(R.string.setting_credentials_desc),
                 expanded = credentialExpanded,
                 onExpandedChange = { credentialExpanded = it }
             ) {
                 // ① 用户身份：三选一（普通权限 / Shell(adb) / root）
                 SettingsDropdown(
                     icon = Icons.Filled.AccountCircle,
-                    title = "用户身份",
-                    description = "以哪个身份读取与管理系统资源；权限不足的身份会被拒绝，并保留原来的选择",
+                    title = AppStrings.s(R.string.setting_identity),
+                    description = AppStrings.s(R.string.setting_identity_desc),
                     selected = credentialIdentity,
                     options = SettingsCatalog.CREDENTIAL_IDENTITIES,
                     onSelected = ::updateUserIdentity,
@@ -1305,19 +1550,19 @@ fun SettingsScreen(
                     description = when {
 
                         shizukuGranted && shizukuRoot ->
-                            "已授权，但 Shizuku 服务以 root 身份运行：提供的是 root 能力，不提供 Shell(adb)"
+                            AppStrings.s(R.string.setting_shizuku_root_only)
 
                         shizukuGranted ->
-                            "以 shell / adb 身份访问受限接口；已授权"
+                            AppStrings.s(R.string.setting_shizuku_ready)
 
                         !shizukuInstalled ->
-                            "未检测到 Shizuku 应用：需要先安装 Shizuku，本应用才能借用 shell / adb 身份"
+                            AppStrings.s(R.string.setting_shizuku_missing)
 
                         !shizukuRunning ->
-                            "Shizuku 已安装，但服务没有启动：请打开 Shizuku 并点「启动服务」，回来再请求权限"
+                            AppStrings.s(R.string.setting_shizuku_not_running)
 
                         else ->
-                            "以 shell / adb 身份访问受限接口；需在 Shizuku 应用里给本应用授权"
+                            AppStrings.s(R.string.setting_shizuku_need_grant)
                     },
 
                     granted = shizukuGranted,
@@ -1331,7 +1576,7 @@ fun SettingsScreen(
                         }
                     },
 
-                    actionText = if (shizukuInstalled && !shizukuRunning) "打开 Shizuku" else "请求权限"
+                    actionText = if (shizukuInstalled && !shizukuRunning) AppStrings.s(R.string.setting_shizuku_open) else AppStrings.s(R.string.setting_request_perm)
                 )
 
                 // ③ Root：后台探测 su，逻辑与 Shizuku 一致（共用同一个失败框）。
@@ -1339,11 +1584,11 @@ fun SettingsScreen(
                 SettingsPermissionRow(
                     title = "Root",
                     description = if (shizukuGranted && shizukuRoot && !rootGranted) {
-                        "以超级用户身份管理系统资源；需设备已 Root 并允许本应用提权"
+                        AppStrings.s(R.string.setting_root_ready)
                     } else if (shizukuGranted && shizukuRoot) {
-                        "已通过 Shizuku（root 身份）获得 root 能力，可直接选用「root」"
+                        AppStrings.s(R.string.setting_root_via_shizuku)
                     } else {
-                        "以超级用户身份管理系统资源；需设备已 Root 并允许本应用提权"
+                        AppStrings.s(R.string.setting_root_ready)
                     },
                     granted = rootGranted,
                     onRequest = ::requestRootPermission
@@ -1358,10 +1603,10 @@ fun SettingsScreen(
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            SettingsSection(title = "重置设置")
+            SettingsSection(title = AppStrings.s(R.string.setting_reset))
 
             NeutralOutlinedButton(
-                text = "将所有设置重置为默认设置",
+                text = AppStrings.s(R.string.setting_reset_desc),
                 enabled = hasSettingsChanged,
                 onClick = {
                     showResetDialog = true
@@ -1376,7 +1621,7 @@ fun SettingsScreen(
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            SettingsSection(title = "反馈")
+            SettingsSection(title = AppStrings.s(R.string.setting_feedback))
 
             // 反馈直接跳到项目的问题页面，用户在浏览器里自己开 issue。
             // 浮窗里没有 Activity 令牌，所以必须带 FLAG_ACTIVITY_NEW_TASK，
@@ -1384,7 +1629,7 @@ fun SettingsScreen(
             val context = LocalContext.current
 
             NeutralOutlinedButton(
-                text = "发送反馈",
+                text = AppStrings.s(R.string.setting_send_feedback),
                 onClick = {
                     val intent = Intent(
                         Intent.ACTION_VIEW,
@@ -1411,19 +1656,19 @@ fun SettingsScreen(
             onDismissRequest = {
                 showResetDialog = false
             },
-            title = "是否要将所有设置重置为默认设置？",
+            title = AppStrings.s(R.string.setting_reset_title),
             body = {
                 Text(
-                    text = "此操作会将所有设置重置为默认值，是否要继续？",
+                    text = AppStrings.s(R.string.setting_reset_body),
                     style = MaterialTheme.typography.bodyMedium
                 )
             },
-            confirmText = "重置",
+            confirmText = AppStrings.s(R.string.setting_reset_action),
             onConfirm = {
                 resetSettings()
                 showResetDialog = false
             },
-            dismissText = "取消",
+            dismissText = AppStrings.s(R.string.common_cancel),
             onDismiss = {
                 showResetDialog = false
             }
@@ -1443,16 +1688,16 @@ fun SettingsScreen(
             onDismissRequest = {
                 showIdentityRejectedDialog = false
             },
-            title = "选项不可以！",
+            title = AppStrings.s(R.string.setting_rejected_title),
             body = {
                 Text(
                     text = identityRejectedNote.ifBlank {
-                        "需要先请求对应权限后，才能使用这个选项。"
+                        AppStrings.s(R.string.setting_rejected_body)
                     },
                     style = MaterialTheme.typography.bodyMedium
                 )
             },
-            confirmText = "知道了",
+            confirmText = AppStrings.s(R.string.setting_got_it),
             onConfirm = {
                 showIdentityRejectedDialog = false
             },
@@ -1475,44 +1720,104 @@ fun SettingsScreen(
             hostedInOverlay = hostedInOverlay,
             onDismissRequest = {
                 showOverlayPermissionDialog = false
+
+                // 关掉说明框 = 这次不打算开了，别让"以后给了权限"把它自动勾上
+                pendingEnableOverlay = false
             },
-            title = "需要“显示在其他应用上层”权限",
+            title = AppStrings.s(R.string.setting_overlay_title),
             body = {
                 Column(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "开启“置于顶层”后，任务管理器会以悬浮窗显示在其他应用上方，" +
-                            "可以一边使用别的应用、一边观察进程与资源占用。",
+                        text = AppStrings.s(R.string.setting_overlay_body_usage),
                         style = MaterialTheme.typography.bodyMedium
                     )
 
                     Text(
-                        text = "这个权限 Android 不允许应用自己申请，需要你手动打开：\n" +
-                            "1. 点“去开启”，进入系统的悬浮窗管理页；\n" +
-                            "2. 找到“任务管理器”，打开那个开关；\n" +
-                            "3. 返回本页，会自动完成设置，重启应用就能看到浮窗。",
+                        text = AppStrings.s(R.string.setting_overlay_body_steps),
                         style = MaterialTheme.typography.bodyMedium
                     )
 
                     Text(
-                        text = "说明：浮窗只在启动时创建，四边会留出空隙，随时能点到系统和别的应用；" +
-                            "不需要时把“置于顶层”关掉并重启应用，就回到普通界面，不必去关这个权限。",
+                        text = AppStrings.s(R.string.setting_overlay_body_note),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             },
-            confirmText = "去开启",
+            confirmText = AppStrings.s(R.string.setting_overlay_go),
             onConfirm = {
                 showOverlayPermissionDialog = false
 
-                // 直达本应用那一项的悬浮窗设置页
+                // 直达本应用那一项的悬浮窗设置页。
+                // pendingEnableOverlay 留着：授权回来后由复核补上这次勾选并落盘。
                 openOverlayPermissionPage()
             },
-            dismissText = "取消",
+            dismissText = AppStrings.s(R.string.common_cancel),
             onDismiss = {
                 showOverlayPermissionDialog = false
+
+                pendingEnableOverlay = false
+            }
+        )
+    }
+
+    // =====================================================
+    // 无障碍权限说明对话框
+    //
+    // 与悬浮窗那个框同一个套路：无障碍权限也没有运行时申请接口，
+    // 用户必须自己去系统无障碍设置页把本应用的服务打开——所以照样要把原因、路径、用途讲清楚。
+    // 差别只有两处：
+    // - 这个权限不是"特殊应用权限"，而是无障碍服务开关，所以跳的是无障碍设置列表页；
+    // - 撤销无障碍权限只关掉这条选项；「置于顶层」有悬浮窗权限就继续（窗口换成悬浮窗），
+    //   没有才一起关（正文里写清楚了，避免用户以为撤销权限等于退出置顶）。
+    // =====================================================
+
+    if (showA11yPermissionDialog) {
+        SettingsDialog(
+            hostedInOverlay = hostedInOverlay,
+            onDismissRequest = {
+                showA11yPermissionDialog = false
+
+                // 关掉说明框 = 这次不打算开了，别让"以后给了权限"把它自动勾上
+                pendingEnableA11y = false
+            },
+            title = AppStrings.s(R.string.setting_a11y_title),
+            body = {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = AppStrings.s(R.string.setting_a11y_body_usage),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    Text(
+                        text = AppStrings.s(R.string.setting_a11y_body_steps),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    Text(
+                        text = AppStrings.s(R.string.setting_a11y_body_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmText = AppStrings.s(R.string.setting_overlay_go),
+            onConfirm = {
+                showA11yPermissionDialog = false
+
+                // 跳系统的无障碍设置页（浮窗 / 无障碍窗口里没有 launcher，改走直接 startActivity）。
+                // pendingEnableA11y 留着：等权限真的开了，复核时补上这次勾选并落盘。
+                openA11yPermissionPage()
+            },
+            dismissText = AppStrings.s(R.string.common_cancel),
+            onDismiss = {
+                showA11yPermissionDialog = false
+
+                pendingEnableA11y = false
             }
         )
     }
@@ -1530,23 +1835,21 @@ fun SettingsScreen(
 
                 cancelAlwaysOnTopChange()
             },
-            title = "需要重启",
+            title = AppStrings.s(R.string.setting_restart_title),
             body = {
                 Text(
-                    text = "“置于顶层”已保存。点“重启”会立即重启应用，" +
-                        "重新打开后即为悬浮窗界面；点“取消”会撤回本次更改，" +
-                        "不保存置顶状态，界面保持原样。",
+                    text = AppStrings.s(R.string.setting_restart_body),
                     style = MaterialTheme.typography.bodyMedium
                 )
             },
-            confirmText = "重启",
+            confirmText = AppStrings.s(R.string.setting_restart_action),
             onConfirm = {
                 // 设置已在 updateWindowAlwaysOnTop 里落盘，这里只负责重启
                 showOverlayRestartDialog = false
 
                 restartApplication()
             },
-            dismissText = "取消",
+            dismissText = AppStrings.s(R.string.common_cancel),
             onDismiss = {
                 showOverlayRestartDialog = false
 
@@ -1589,16 +1892,14 @@ fun SettingsScreen(
                 onDismissRequest = {
                     failedPermissionTarget = PermissionRetryTarget.NONE
                 },
-                title = "没有 Shizuku",
+                title = AppStrings.s(R.string.setting_no_shizuku_title),
                 body = {
                     Text(
-                        text = "本机没有安装 Shizuku，无法借用 Shell(adb) 身份。\n" +
-                            "请先安装 Shizuku 并启动它的服务，再回来请求权限。" +
-                            "（没有 Shizuku 时可以直接用「root」或「普通权限」）",
+                        text = AppStrings.s(R.string.setting_no_shizuku_body),
                         style = MaterialTheme.typography.bodyMedium
                     )
                 },
-                confirmText = "知道了",
+                confirmText = AppStrings.s(R.string.setting_got_it),
                 onConfirm = {
                     failedPermissionTarget = PermissionRetryTarget.NONE
                 },
@@ -1613,21 +1914,20 @@ fun SettingsScreen(
                 onDismissRequest = {
                     failedPermissionTarget = PermissionRetryTarget.NONE
                 },
-                title = "Shizuku 服务未启动",
+                title = AppStrings.s(R.string.setting_shizuku_stopped_title),
                 body = {
                     Text(
-                        text = "Shizuku 已经安装，但服务没有运行，所以无法申请授权。\n" +
-                            "点“打开 Shizuku”去到它的应用里点“启动服务”，看到“服务运行中”之后再回来请求权限。",
+                        text = AppStrings.s(R.string.setting_shizuku_stopped_body),
                         style = MaterialTheme.typography.bodyMedium
                     )
                 },
-                confirmText = "打开 Shizuku",
+                confirmText = AppStrings.s(R.string.setting_shizuku_open),
                 onConfirm = {
                     credentialApiRef?.openShizukuManager()
 
                     failedPermissionTarget = PermissionRetryTarget.NONE
                 },
-                dismissText = "取消",
+                dismissText = AppStrings.s(R.string.common_cancel),
                 onDismiss = {
                     failedPermissionTarget = PermissionRetryTarget.NONE
                 }
@@ -1638,40 +1938,53 @@ fun SettingsScreen(
                 onDismissRequest = {
                     failedPermissionTarget = PermissionRetryTarget.NONE
                 },
-                title = "权限请求失败",
+                title = AppStrings.s(R.string.setting_perm_failed_title),
                 body = {
                     Text(
                         text = when (failedPermissionTargetValue) {
                             PermissionRetryTarget.OVERLAY ->
-                                "没有拿到“显示在其他应用上层”权限，暂时无法开启“置于顶层”。\n" +
-                                    "点“再试一次”会重新打开系统的悬浮窗权限页；点“取消”则保持原样，置顶不会开启。"
+                                AppStrings.s(R.string.setting_fail_overlay_body)
+
+                            PermissionRetryTarget.A11Y ->
+                                AppStrings.s(R.string.setting_fail_a11y_body)
 
                             PermissionRetryTarget.SHIZUKU ->
-                                "没有拿到 Shizuku 授权，暂时无法以 Shell(adb) 身份工作。\n" +
-                                    "请先确认 Shizuku 服务已在本机启动（打开 Shizuku 应用，看到“服务运行中”），" +
-                                    "再回来点“再试一次”发起授权；点“取消”保持原样。"
+                                AppStrings.s(R.string.setting_fail_shizuku_body)
 
                             PermissionRetryTarget.ROOT ->
-                                "没有拿到 Root 权限（设备未 Root，或授权被拒绝）。\n" +
-                                    "点“再试一次”会重新探测一次；点“取消”保持原样。"
+                                AppStrings.s(R.string.setting_fail_root_body)
 
                             PermissionRetryTarget.NONE -> ""
                         },
                         style = MaterialTheme.typography.bodyMedium
                     )
                 },
-                confirmText = "再试一次",
+                confirmText = AppStrings.s(R.string.setting_retry),
                 onConfirm = {
                     retryFailedPermission()
                 },
-                dismissText = "取消",
+                dismissText = AppStrings.s(R.string.common_cancel),
                 onDismiss = {
+                    // 放弃这次申请：把"用户点过"的意图一起清掉，
+                    // 免得以后再给权限时被自动勾上
                     failedPermissionTarget = PermissionRetryTarget.NONE
+
+                    pendingEnableOverlay = false
+                    pendingEnableA11y = false
                 }
             )
         }
     }
 }
+
+/**
+ * 设置页"权限还在不在"的复核间隔。
+ *
+ * 3 秒一次、只在设置页可见期间跑：悬浮窗权限与无障碍权限都可能被用户在系统设置里随时收回，
+ * 而系统不会通知应用。查询本身很轻（一次 appops 查询 + 一次无障碍状态），
+ * 取 3 秒是为了不和 UIService 那条 2 秒巡检撞在一起（两边判据相同，谁先发现都一样）。
+ */
+private const val TOP_WINDOW_PERMISSION_RECHECK_MS = 3_000L
 
 /**
  * "权限请求失败"框的来源标记。
@@ -1681,11 +1994,15 @@ fun SettingsScreen(
  */
 private enum class PermissionRetryTarget {
 
+
     /** 没有待处理的失败（框不显示）。 */
     NONE,
 
     /** 悬浮窗（显示在其他应用上层）权限。 */
     OVERLAY,
+
+    /** 无障碍权限（设置页「使用无障碍权限置顶」用）。 */
+    A11Y,
 
     /** Shizuku 授权。 */
     SHIZUKU,
@@ -1985,7 +2302,7 @@ private fun SettingsDropdown(
                             expanded = !expanded
                         }
                     ) {
-                        Text(selected)
+                        Text(SettingsCatalog.optionLabel(selected))
                     }
                 } else {
                     Box {
@@ -1994,7 +2311,8 @@ private fun SettingsDropdown(
                                 expanded = true
                             }
                         ) {
-                            Text(selected)
+                            // 按钮上显示的是映射后的文案，selected 本身仍是内部标识
+                            Text(SettingsCatalog.optionLabel(selected))
                         }
 
                         DropdownMenu(
@@ -2006,7 +2324,7 @@ private fun SettingsDropdown(
                             options.forEach { option ->
                                 DropdownMenuItem(
                                     text = {
-                                        Text(option)
+                                        Text(SettingsCatalog.optionLabel(option))
                                     },
                                     onClick = {
                                         expanded = false
@@ -2035,7 +2353,7 @@ private fun SettingsDropdown(
                         val isSelected = option == selected
 
                         Text(
-                            text = option,
+                            text = SettingsCatalog.optionLabel(option),
                             style = MaterialTheme.typography.bodyMedium,
                             color = if (isSelected) {
                                 MaterialTheme.colorScheme.primary
@@ -2086,7 +2404,7 @@ private fun SettingsPermissionRow(
      * 默认"请求权限"；Shizuku 服务没在跑时改成"打开 Shizuku" ——
      * 因为那种情况下点"请求权限"只会立刻失败，先让用户去启动服务才是正路。
      */
-    actionText: String = "请求权限"
+    actionText: String = AppStrings.s(R.string.setting_request_perm)
 ) {
     Row(
         modifier = Modifier
@@ -2128,7 +2446,7 @@ private fun SettingsPermissionRow(
             )
         ) {
             Text(
-                text = if (granted) "已授权" else actionText,
+                text = if (granted) AppStrings.s(R.string.setting_granted) else actionText,
                 textAlign = TextAlign.Center
             )
         }
@@ -2279,3 +2597,5 @@ internal object UserCredentialState {
         shizukuRunning.value = snapshot.shizukuRunning
     }
 }
+
+

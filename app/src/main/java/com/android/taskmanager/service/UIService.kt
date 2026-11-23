@@ -52,8 +52,11 @@ import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import com.android.taskmanager.ChannelHealth
 import com.android.taskmanager.CredentialDecision
 import com.android.taskmanager.CredentialRecord
@@ -85,6 +88,7 @@ import com.android.taskmanager.UserCredentialState
 import com.android.taskmanager.normalizeThemeMode
 
 import com.android.taskmanager.data.AndroidService
+import com.android.taskmanager.data.BackendDisplayText
 import com.android.taskmanager.data.ProcessKey
 import com.android.taskmanager.data.LinuxService
 import com.android.taskmanager.data.LinuxControlCode
@@ -154,11 +158,13 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         )
 
         /**
-         * [OVERLAY-v1] 浮窗显示期间"权限还在不在"的巡检间隔。
+         * 置顶相关权限的巡检间隔（悬浮窗权限 + 无障碍权限）。
          *
-         * 只有浮窗真正挂着时才跑（收窗即停），2 秒一次 appops 查询的开销可以忽略。
+         * 服务活着的期间一直跑，2 秒一次的开销可以忽略（一次 appops 查询 + 一次无障碍状态）。
+         * 不能只在"窗挂着"时跑：权限可能在你还没开窗的时候就被收回，
+         * 那样设置里会一直留着"已开启"，直到下次启动才被发现。
          */
-        private const val OVERLAY_PERMISSION_CHECK_MS = 2_000L
+        private const val TOP_WINDOW_PERMISSION_CHECK_MS = 2_000L
 
         /**
          * 启动时自动请求权限的兜底超时。
@@ -336,6 +342,10 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         // 3.5 让已加载的设置立刻生效
         applySettingsToRuntime(settingsSnapshot)
 
+        // 3.5.1 置顶权限巡检就此开始（服务活多久就盯多久，见 permissionWatchdog 上的说明）：
+        //        悬浮窗权限、无障碍权限都可能被用户在系统里随时收回，而系统不会通知应用。
+        startPermissionWatchdog()
+
         // 3.6 用户凭据：把真实授权状态推一次给界面（设置页"用户凭据"分组的按钮据此显示）
         //     之后每次 credentialSnapshot() 调用都会再推，服务侧一发现授权变化，界面自然跟着变。
         credentialSnapshot()
@@ -382,6 +392,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         // 先摘掉前台标记：这样下面的 hideOverlay() 只收窗口，不会再去刷新通知文案
         foregroundStarted = false
+
+        // 巡检定时任务必须在这里停掉：Handler 是主线程全局的，留着会持续持有本实例
+        stopPermissionWatchdog()
 
         // [OVERLAY-v1] 服务销毁前必须收掉浮窗，否则会留下一个没有归属的窗口
         hideOverlay()
@@ -1048,49 +1061,49 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
     /** 全部列的定义：表头文案、列宽、按数值还是按字符串排序。 */
     private val detailColumns: List<DetailColumn> = listOf(
-        DetailColumn(DetailColumnId.NAME, "名称", numeric = false, width = 180),
-        DetailColumn(DetailColumnId.PACKAGE_NAME, "程序包名称", numeric = false, width = 160),
+        DetailColumn(DetailColumnId.NAME, AppStrings.s(R.string.dcol_name), numeric = false, width = 180),
+        DetailColumn(DetailColumnId.PACKAGE_NAME, AppStrings.s(R.string.dcol_package), numeric = false, width = 160),
         DetailColumn(DetailColumnId.PID, "PID", width = 72),
-        DetailColumn(DetailColumnId.STATE, "状态", numeric = false, width = 88),
-        DetailColumn(DetailColumnId.USER, "用户名", numeric = false, width = 120),
-        DetailColumn(DetailColumnId.SESSION, "会话ID", width = 80),
-        DetailColumn(DetailColumnId.PGID, "进程组ID", width = 88),
-        DetailColumn(DetailColumnId.CGROUP, "cgroup标识", numeric = false, width = 180),
-        DetailColumn(DetailColumnId.CPU_USAGE, "CPU使用率", width = 96),
-        DetailColumn(DetailColumnId.CPU_TIME, "CPU时间", width = 96),
-        DetailColumn(DetailColumnId.CPU_CYCLES, "CPU周期数", width = 104),
-        DetailColumn(DetailColumnId.RSS, "常驻内存大小", width = 120),
-        DetailColumn(DetailColumnId.PEAK_RSS, "峰值常驻内存", width = 120),
-        DetailColumn(DetailColumnId.RSS_DELTA, "常驻内存增量", width = 120),
-        DetailColumn(DetailColumnId.ACTIVE_PRIVATE_RSS, "活动私有常驻内存", width = 136),
-        DetailColumn(DetailColumnId.PRIVATE_RSS, "私有常驻内存", width = 120),
-        DetailColumn(DetailColumnId.SHARED_RSS, "共享常驻内存", width = 120),
-        DetailColumn(DetailColumnId.VSS, "虚拟内存大小", width = 120),
-        DetailColumn(DetailColumnId.PAGE_FAULTS, "页面错误总数", width = 120),
-        DetailColumn(DetailColumnId.PAGE_FAULTS_DELTA, "页面错误增量", width = 120),
-        DetailColumn(DetailColumnId.NICE, "基本优先级(Linux)", width = 136),
-        DetailColumn(DetailColumnId.ANDROID_PRIORITY, "基本优先级(Android)", width = 144),
-        DetailColumn(DetailColumnId.FD_COUNT, "文件描述符数", width = 112),
-        DetailColumn(DetailColumnId.THREAD_COUNT, "线程数", width = 80),
-        DetailColumn(DetailColumnId.IO_READ_COUNT, "I/O读取次数", width = 104),
-        DetailColumn(DetailColumnId.IO_WRITE_COUNT, "I/O写入次数", width = 104),
-        DetailColumn(DetailColumnId.IO_READ_BYTES, "I/O读取字节", width = 112),
-        DetailColumn(DetailColumnId.IO_WRITE_BYTES, "I/O写入字节", width = 112),
-        DetailColumn(DetailColumnId.EXE_PATH, "路径名称", numeric = false, width = 220),
-        DetailColumn(DetailColumnId.CMDLINE, "命令行", numeric = false, width = 220),
-        DetailColumn(DetailColumnId.SELINUX, "安全上下文", numeric = false, width = 160),
-        DetailColumn(DetailColumnId.TARGET_SDK, "目标API版本", width = 120),
-        DetailColumn(DetailColumnId.PLATFORM, "平台", numeric = false, width = 80),
-        DetailColumn(DetailColumnId.ARCH, "体系架构", numeric = false, width = 96),
-        DetailColumn(DetailColumnId.IS_ADMIN, "管理员特权", numeric = false, width = 104),
-        DetailColumn(DetailColumnId.DESCRIPTION, "描述", numeric = false, width = 160),
-        DetailColumn(DetailColumnId.NX_PROTECT, "NX保护", numeric = false, width = 96),
-        DetailColumn(DetailColumnId.GPU_USAGE, "GPU使用率", width = 96),
-        DetailColumn(DetailColumnId.GPU_ENGINE, "GPU引擎", numeric = false, width = 96),
-        DetailColumn(DetailColumnId.GPU_DEDICATED_MEM, "专用GPU内存", width = 112),
-        DetailColumn(DetailColumnId.GPU_SHARED_MEM, "共享GPU内存", width = 112),
-        DetailColumn(DetailColumnId.CET_PROTECT, "CET控制流强制保护", numeric = false, width = 156),
-        DetailColumn(DetailColumnId.ISOLATION, "隔离状态", numeric = false, width = 96)
+        DetailColumn(DetailColumnId.STATE, AppStrings.s(R.string.dcol_state), numeric = false, width = 88),
+        DetailColumn(DetailColumnId.USER, AppStrings.s(R.string.dcol_user), numeric = false, width = 120),
+        DetailColumn(DetailColumnId.SESSION, AppStrings.s(R.string.dcol_session), width = 80),
+        DetailColumn(DetailColumnId.PGID, AppStrings.s(R.string.dcol_pgid), width = 88),
+        DetailColumn(DetailColumnId.CGROUP, AppStrings.s(R.string.dcol_cgroup), numeric = false, width = 180),
+        DetailColumn(DetailColumnId.CPU_USAGE, AppStrings.s(R.string.dcol_cpu_usage), width = 96),
+        DetailColumn(DetailColumnId.CPU_TIME, AppStrings.s(R.string.dcol_cpu_time), width = 96),
+        DetailColumn(DetailColumnId.CPU_CYCLES, AppStrings.s(R.string.dcol_cpu_cycles), width = 104),
+        DetailColumn(DetailColumnId.RSS, AppStrings.s(R.string.dcol_rss), width = 120),
+        DetailColumn(DetailColumnId.PEAK_RSS, AppStrings.s(R.string.dcol_peak_rss), width = 120),
+        DetailColumn(DetailColumnId.RSS_DELTA, AppStrings.s(R.string.dcol_rss_delta), width = 120),
+        DetailColumn(DetailColumnId.ACTIVE_PRIVATE_RSS, AppStrings.s(R.string.dcol_active_private), width = 136),
+        DetailColumn(DetailColumnId.PRIVATE_RSS, AppStrings.s(R.string.dcol_private), width = 120),
+        DetailColumn(DetailColumnId.SHARED_RSS, AppStrings.s(R.string.dcol_shared), width = 120),
+        DetailColumn(DetailColumnId.VSS, AppStrings.s(R.string.dcol_vss), width = 120),
+        DetailColumn(DetailColumnId.PAGE_FAULTS, AppStrings.s(R.string.dcol_page_faults), width = 120),
+        DetailColumn(DetailColumnId.PAGE_FAULTS_DELTA, AppStrings.s(R.string.dcol_page_faults_delta), width = 120),
+        DetailColumn(DetailColumnId.NICE, AppStrings.s(R.string.dcol_nice), width = 136),
+        DetailColumn(DetailColumnId.ANDROID_PRIORITY, AppStrings.s(R.string.dcol_android_priority), width = 144),
+        DetailColumn(DetailColumnId.FD_COUNT, AppStrings.s(R.string.dcol_fd), width = 112),
+        DetailColumn(DetailColumnId.THREAD_COUNT, AppStrings.s(R.string.dcol_threads), width = 80),
+        DetailColumn(DetailColumnId.IO_READ_COUNT, AppStrings.s(R.string.dcol_io_reads), width = 104),
+        DetailColumn(DetailColumnId.IO_WRITE_COUNT, AppStrings.s(R.string.dcol_io_writes), width = 104),
+        DetailColumn(DetailColumnId.IO_READ_BYTES, AppStrings.s(R.string.dcol_io_read_bytes), width = 112),
+        DetailColumn(DetailColumnId.IO_WRITE_BYTES, AppStrings.s(R.string.dcol_io_write_bytes), width = 112),
+        DetailColumn(DetailColumnId.EXE_PATH, AppStrings.s(R.string.dcol_path), numeric = false, width = 220),
+        DetailColumn(DetailColumnId.CMDLINE, AppStrings.s(R.string.dcol_cmdline), numeric = false, width = 220),
+        DetailColumn(DetailColumnId.SELINUX, AppStrings.s(R.string.dcol_selinux), numeric = false, width = 160),
+        DetailColumn(DetailColumnId.TARGET_SDK, AppStrings.s(R.string.dcol_target_sdk), width = 120),
+        DetailColumn(DetailColumnId.PLATFORM, AppStrings.s(R.string.dcol_platform), numeric = false, width = 80),
+        DetailColumn(DetailColumnId.ARCH, AppStrings.s(R.string.dcol_arch), numeric = false, width = 96),
+        DetailColumn(DetailColumnId.IS_ADMIN, AppStrings.s(R.string.dcol_admin), numeric = false, width = 104),
+        DetailColumn(DetailColumnId.DESCRIPTION, AppStrings.s(R.string.dcol_desc), numeric = false, width = 160),
+        DetailColumn(DetailColumnId.NX_PROTECT, AppStrings.s(R.string.dcol_nx), numeric = false, width = 96),
+        DetailColumn(DetailColumnId.GPU_USAGE, AppStrings.s(R.string.dcol_gpu_usage), width = 96),
+        DetailColumn(DetailColumnId.GPU_ENGINE, AppStrings.s(R.string.dcol_gpu_engine), numeric = false, width = 96),
+        DetailColumn(DetailColumnId.GPU_DEDICATED_MEM, AppStrings.s(R.string.dcol_gpu_dedicated), width = 112),
+        DetailColumn(DetailColumnId.GPU_SHARED_MEM, AppStrings.s(R.string.dcol_gpu_shared), width = 112),
+        DetailColumn(DetailColumnId.CET_PROTECT, AppStrings.s(R.string.dcol_cet), numeric = false, width = 156),
+        DetailColumn(DetailColumnId.ISOLATION, AppStrings.s(R.string.dcol_isolation), numeric = false, width = 96)
     )
 
     /** 表数据与界面状态的锁：tick 在 Handler 线程写，页面在 UI 线程读。 */
@@ -1187,7 +1200,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      * 启动时表是空的（测试数据只在调试页按钮里加），所以第一句是"等待上游填入"；
      * 之后 append / replace / 调试加测试行都会覆盖它。
      */
-    private var detailNote: String = "等待上游填入进程（调试页可一键加入 Test0 ~ Test10）"
+    private var detailNote: String = AppStrings.s(R.string.svc_detail_waiting_upstream)
 
     // ── 页面数据区 · 服务（ServicesScreen）────────────────────────
     //   用途：系统 / 应用服务的运行状态与控制
@@ -1223,8 +1236,22 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     // ！！          前台服务部分**不要一起删**（它已经与服务常驻绑定）。
     // ============================================================
 
-    /** 浮窗宿主。懒加载：没开浮窗时不创建窗口管理器相关对象。 */
+    /** 浮窗宿主（TYPE_APPLICATION_OVERLAY，需要悬浮窗权限）。懒加载：没开浮窗时不创建窗口管理器相关对象。 */
     private val overlayHost: OverlayHost by lazy { OverlayHost(this) }
+
+    /**
+     * 无障碍置顶窗口的宿主（TYPE_ACCESSIBILITY_OVERLAY）。
+     *
+     * 为什么单独一个、而且懒建：
+     * 1. 窗口类型不同，WindowManager 的权限校验走的是"无障碍服务"那条路，
+     *    所以 Context 必须是 [A11yTopWindowService] 自己（用它 getSystemService(WINDOW_SERVICE)）；
+     * 2. 服务实例可能换（用户关掉再打开会重建），Context 跟着换，宿主就必须重建；
+     *    重建前先把旧窗收掉，避免留下一个没有归属的窗口。
+     */
+    private var a11yWindowHost: OverlayHost? = null
+
+    /** [a11yWindowHost] 当初是用哪个服务实例建的（用来判断"服务换人了"）。 */
+    private var a11yHostService: A11yTopWindowService? = null
 
     /** 浮窗当前显示哪一页。必须是 Compose 状态，切页才会触发重组。 */
     private val overlayPageState = mutableStateOf("进程")
@@ -1236,6 +1263,105 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      * 通知文案要读它，读 overlayHost 会顺带把那一坨窗口管理器对象创建出来。
      */
     private var overlayVisible = false
+
+    /**
+     * 当前有没有顶层窗口挂在屏幕上（两条通路算同一个"有没有"）。
+     *
+     * 通知文案、收窗回原位、退出逻辑都只关心"有没有一只顶层窗口"，
+     * 不关心它是悬浮窗还是无障碍窗口——两种窗口的界面与交互本来就一样。
+     */
+    private fun isTopWindowShowing(): Boolean =
+        overlayHost.isShowing || a11yWindowHost?.isShowing == true
+
+    /**
+     * 当前挂着的窗口是不是"无障碍那只"。
+     *
+     * false 有两种意思：挂着的是悬浮窗，或者根本没挂窗——调用方要判断"换通路"时
+     * 用 [isTopWindowShowing] 先确认有没有窗口。
+     */
+    private fun isShowingA11yWindow(): Boolean = a11yWindowHost?.isShowing == true
+
+    /**
+     * 窗口还挂着的时候换了通路：当场把旧窗口收掉、按新通路重建一只，页不动。
+     *
+     * 这就是"已经用悬浮窗跑着，用户在设置里给了无障碍权限"的那条路：
+     * 用户期望的是立刻变成无障碍窗口，而不是等下次启动。
+     * 页名沿用窗口当前那一页，所以界面看起来只是闪了一下。
+     */
+    private fun switchTopWindowKind() {
+        val page = overlayPageState.value.ifBlank { settingsSnapshot.defaultStartPage }
+
+        Log.i(TAG, "switchTopWindowKind: 换通路重建窗口 page=$page")
+
+        hideOverlay()
+
+        showOverlay(page)
+    }
+
+    /**
+     * 按当前设置核对"窗口该用哪条通路"，不一致就当场换。
+     *
+     * 只在两个设置项变化后调用；没有窗口时什么都不做（建窗是启动时的事）。
+     * 想换到无障碍通路、但服务还没连上时先不动：那只窗口还能用，
+     * 等服务连上会由 [onAccessibilityWindowReady] 补上这次切换。
+     */
+    private fun syncTopWindowKind() {
+        if (!isTopWindowShowing()) return
+
+        val values = settingsSnapshot
+
+        val wantedA11y = values.a11yTopWindow && hasAccessibilityPermission()
+
+        if (wantedA11y == isShowingA11yWindow()) return
+
+        if (wantedA11y && a11yWindowHostOrNull() == null) {
+            Log.i(TAG, "syncTopWindowKind: 无障碍服务还没连上，先留着当前窗口，等服务回调再换")
+
+            return
+        }
+
+        switchTopWindowKind()
+    }
+
+    /**
+     * 取（必要时新建）无障碍窗口宿主；无障碍服务没连上时返回 null。
+     *
+     * 服务实例换了就重建宿主：窗口的"权限凭证"其实就绑在那个服务上，
+     * 用旧服务的 Context 去 addView 会被 WindowManager 拒绝。
+     */
+    private fun a11yWindowHostOrNull(): OverlayHost? {
+        val service = A11yTopWindowService.instanceOrNull() ?: return null
+
+        val current = a11yWindowHost
+
+        if (current != null && a11yHostService === service) return current
+
+        current?.hide()
+
+        a11yWindowHost = OverlayHost(service, WindowKind.ACCESSIBILITY_OVERLAY)
+        a11yHostService = service
+
+        return a11yWindowHost
+    }
+
+    /** 只收无障碍那只窗口（浮窗那只与它无关）。幂等。 */
+    private fun hideA11yWindow() {
+        a11yWindowHost?.hide()
+
+        a11yWindowHost = null
+        a11yHostService = null
+    }
+
+    /** 窗口没能建起来：把普通界面拉回来，别让用户面对空屏。 */
+    private fun startNormalUiFallback() {
+        runCatching {
+            startActivity(
+                Intent(this, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra(EXTRA_FORCE_NORMAL, true)
+            )
+        }
+    }
 
     /** 常驻前台通知的渠道 id / 通知 id（整个应用只有这一条，浮窗只是换文案）。 */
     private val serviceChannelId = "tm_service_v1"
@@ -1319,10 +1445,10 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         manager.createNotificationChannel(
             NotificationChannel(
                 serviceChannelId,
-                "后台运行",
+                AppStrings.s(R.string.svc_channel_name),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "任务管理器数据中枢的常驻通知（关闭界面后仍在采集数据）"
+                description = AppStrings.s(R.string.svc_channel_desc)
                 setShowBadge(false)
             }
         )
@@ -1355,13 +1481,13 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         return builder
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(
-                if (showingOverlay) "任务管理器浮窗运行中" else "任务管理器后台运行中"
+                if (showingOverlay) AppStrings.s(R.string.svc_notif_overlay_title) else AppStrings.s(R.string.svc_notif_bg_title)
             )
             .setContentText(
                 if (showingOverlay) {
-                    "正在其他应用上方显示监控面板"
+                    AppStrings.s(R.string.svc_notif_overlay_text)
                 } else {
-                    "正在采集进程数据，关闭界面后仍会继续"
+                    AppStrings.s(R.string.svc_notif_bg_text)
                 }
             )
             .setOngoing(true)
@@ -1371,40 +1497,128 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     }
 
     /**
-     * [OVERLAY-v1] 浮窗权限巡检：确认"窗口还挂着，但权限已经被收回"。
+     * 置顶权限巡检：确认"设置还开着，但权限已经被收回"。
      *
-     * 为什么需要它：用户在系统设置里关掉"显示在其他应用上层"时，
-     * 系统会把我们的浮窗撤掉、但**不会通知应用**；如果进程还活着，
-     * isShowing 仍是 true、设置里也还是 true，用户下次启动就会看到
-     * "置顶明明开着，却没有浮窗"。所以边显示边巡检，一发现就当场回退。
+     * 为什么需要它：用户在系统设置里关掉"显示在其他应用上层"、或在无障碍设置里关掉本应用的
+     * 服务时，系统会把窗口撤掉、但**不会通知应用**；如果进程还活着，
+     * 设置里仍是 true，用户下次启动就会看到"置顶明明开着，却没有窗口"。
+     *
+     * 和旧版的区别：旧版只在浮窗挂着的期间巡检（窗收了就停），
+     * 但"设置说开着"这件事与"窗挂没挂"无关——用户可能还没开窗就把权限撤了；
+     * 所以改成服务活着的期间一直巡检（2 秒一次，查询很轻：一次权限调用 + 一次无障碍状态）。
+     *
+     * 检查顺序（先收无障碍，再判置顶），与 SettingsStore.applyRuntimeConstraints 保持一致：
+     * 1. 无障碍置顶窗口开着，但无障碍权限没了 -> 关掉那条通路；
+     *    置顶有悬浮窗权限就继续（窗口换成悬浮窗），没有才连置顶一起关（见 onA11yPermissionLost）；
+     * 2. 置顶还开着，但既没有悬浮窗权限、也不能走无障碍豁免 -> 关置顶（见 onOverlayPermissionLost）。
      */
-    private val overlayWatchdogHandler = Handler(Looper.getMainLooper())
+    private val permissionWatchdogHandler = Handler(Looper.getMainLooper())
 
-    private val overlayWatchdog = object : Runnable {
+    private val permissionWatchdog = object : Runnable {
         override fun run() {
-            // 窗已经收了：巡检自然结束，不要留下一个空转的定时任务
-            if (!overlayHost.isShowing) return
+            enforceTopWindowPermissions("巡检")
 
-            if (!hasOverlayPermission()) {
-                onOverlayPermissionLost("巡检")
-
-                return
-            }
-
-            overlayWatchdogHandler.postDelayed(this, OVERLAY_PERMISSION_CHECK_MS)
+            permissionWatchdogHandler.postDelayed(this, TOP_WINDOW_PERMISSION_CHECK_MS)
         }
     }
 
     /** 开始巡检（重复调用不会叠加多个定时任务）。 */
-    private fun startOverlayWatchdog() {
-        overlayWatchdogHandler.removeCallbacks(overlayWatchdog)
+    private fun startPermissionWatchdog() {
+        permissionWatchdogHandler.removeCallbacks(permissionWatchdog)
 
-        overlayWatchdogHandler.postDelayed(overlayWatchdog, OVERLAY_PERMISSION_CHECK_MS)
+        permissionWatchdogHandler.postDelayed(permissionWatchdog, TOP_WINDOW_PERMISSION_CHECK_MS)
     }
 
-    /** 停止巡检（收窗 / 服务销毁时都要调，避免 Handler 持有已废弃的实例）。 */
-    private fun stopOverlayWatchdog() {
-        overlayWatchdogHandler.removeCallbacks(overlayWatchdog)
+    /** 停止巡检（只在服务销毁时调；收窗不再停，否则无障碍那条通路就没人盯了）。 */
+    private fun stopPermissionWatchdog() {
+        permissionWatchdogHandler.removeCallbacks(permissionWatchdog)
+    }
+
+    /**
+     * 按当前权限把"置顶"相关状态拉回一致。返回是否改动过（只用于日志）。
+     *
+     * 判据只有两条，顺序不能换：先判无障碍（它可能让置顶失效），再判悬浮窗（要考虑无障碍豁免）。
+     */
+    private fun enforceTopWindowPermissions(reason: String): Boolean {
+        val values = settingsSnapshot
+
+        // 1. 无障碍权限被收回：选项失去意义，连同置顶一起关（这一步可能已经把置顶关掉）
+        if (values.a11yTopWindow && !hasAccessibilityPermission()) {
+            onA11yPermissionLost(reason)
+
+            return true
+        }
+
+        // 2. 置顶还在，但权限条件不满足了：没有悬浮窗权限，且不能靠无障碍豁免
+        if (values.windowAlwaysOnTop && !hasOverlayPermission() && !a11yTopWindowUsable(values)) {
+            onOverlayPermissionLost(reason)
+
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * 无障碍这条通路能不能用来建顶层窗口 = 选项开着 **且** 权限真的在。
+     *
+     * 两个条件缺一不可：只有权限、选项关着，说明用户要的是悬浮窗通路（仍然要求悬浮窗权限）；
+     * 只有选项、权限被撤，通路根本建不出窗。
+     *
+     * 这个判据同时是"用哪种窗口"的开关：为 true 时 [showOverlay] 建 TYPE_ACCESSIBILITY_OVERLAY
+     * 窗口（由无障碍服务自己 addView，层级高于普通悬浮窗、不需要悬浮窗权限）。
+     */
+    private fun a11yTopWindowUsable(values: SettingsValues): Boolean =
+        values.a11yTopWindow && A11yTopWindow.isEnabled(this)
+
+    /**
+     * 无障碍权限被收回：只关「使用无障碍权限置顶」这条通路。
+     *
+     * 置顶本身要不要跟着关，取决于它还有没有别的成立条件：
+     * - 有悬浮窗权限 -> 置顶继续有效，窗口当场换成悬浮窗那只（页不动、不回普通界面）。
+     *   这跟"用户自己把这条选项关掉"是同一种结果，不该两种入口走成两种样子；
+     * - 没有悬浮窗权限 -> 置顶失去依据，跟选项一起关掉，收窗后按老规矩回普通界面。
+     *
+     * 只有后一种情况才写 LAST_PAGE（那才算一次真正的退出）；回退到悬浮窗时不写，
+     * 窗口还在跑、页也没变，留一条"下次回这页"的便条没有意义。
+     *
+     * @param reason 谁发现的（巡检 / 无障碍服务解绑），只用于日志
+     */
+    private fun onA11yPermissionLost(reason: String) {
+        val wasShowing = isTopWindowShowing()
+        val page = overlayPageState.value
+
+        // 先关掉这条通路。存储层的 applyRuntimeConstraints 会把"没有悬浮窗权限
+        // 时置顶也失效"一并处理，所以下面以改完的快照为准。
+        settingsSnapshot = SettingsStore.update(this, SettingKey.A11Y_TOP_WINDOW, false)
+
+        val keepTopWindow = settingsSnapshot.windowAlwaysOnTop && hasOverlayPermission()
+
+        if (keepTopWindow) {
+            Log.w(TAG, "无障碍权限已不在（$reason）：关闭无障碍通路，窗口回退到悬浮窗")
+
+            hideA11yWindow()
+
+            if (wasShowing) {
+                overlayVisible = false
+
+                showOverlay(page.ifBlank { settingsSnapshot.defaultStartPage })
+            } else {
+                refreshServiceNotification()
+            }
+
+            return
+        }
+
+        Log.w(TAG, "无障碍权限已不在（$reason）：关闭「使用无障碍权限置顶」与「置于顶层」")
+
+        if (wasShowing) {
+            SettingsStore.update(this, SettingKey.LAST_PAGE, page)
+        }
+
+        hideOverlay()
+
+        settingsSnapshot = SettingsStore.update(this, SettingKey.WINDOW_ALWAYS_ON_TOP, false)
     }
 
     /**
@@ -1422,8 +1636,6 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      */
     private fun onOverlayPermissionLost(reason: String) {
         Log.w(TAG, "悬浮窗权限已不在（$reason）：收窗并关闭「置于顶层」")
-
-        stopOverlayWatchdog()
 
         SettingsStore.update(this, SettingKey.LAST_PAGE, overlayPageState.value)
 
@@ -1764,9 +1976,13 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     /**
      * 性能页的后台采集：采一帧设备快照（当前只有 CPU 那一组）。
      *
-     * 采样通道的规矩，两条别混：
-     * - **采**（这里）：不受前台、不受是否选中约束。性能页要的是一段连续的历史，
-     *   切页、退到后台都不能断，断了切回来就少一段。
+     * 采样通道的规矩，三条别混：
+     * - **采**（这里）：默认不受前台、不受是否选中约束。性能页要的是一段连续的历史，
+     *   切页、退到后台都不能断，断了切回来就少一段。这条默认行为由设置项
+     *   「后台统计」（[SettingsValues.backgroundStats]）控制，默认开着。
+     * - **后台统计关掉**：看不见界面时这一轮什么都不做——不取快照、不发请求，
+     *   省掉 CPU 与电。"看得见"= 普通界面在前台，或顶层窗口（悬浮窗 / 无障碍窗口）正在显示，
+     *   判据就是 [isUiRefreshAllowed]；用户主动点「刷新」（force）不受这条限制。
      * - **画**（[pushPerformanceSnapshot]）：只看页面可见不可见。看不见就不写可观察状态，
      *   后台每秒让一个没人在看的组合树重组一次纯属白烧电。
      *
@@ -1775,6 +1991,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     private fun refreshPerformanceStatsIfEnabled(force: Boolean = false) {
 
         if (pollIntervalMs(settingsSnapshot.updateSpeed) <= 0L) return
+
+        // 后台统计关掉 + 现在没人看得见 -> 不采、不发请求（force 是用户主动刷新，放行）
+        if (!force && !settingsSnapshot.backgroundStats && !isUiRefreshAllowed()) return
 
         val linux = LinuxService.instanceOrNull() ?: return
 
@@ -1815,23 +2034,21 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     }
 
     /**
-     * 实时更新速度 -> 图表标签行文案。
+     * 实时更新速度 -> 图表窗口状态码（**给人看的句子不在这里拼**）。
      *
-     *   高 30 秒内的利用率 % / 常规 60 秒内的利用率 % / 低 4 分钟内的利用率 %
+     *   高 = 30 / 常规 = 60 / 低 = 240（秒）；暂停 = PAUSED。
      *
-     * 暂停时整段换成 利用率 % (已暂停)：这时候没有窗口可言，写成 0 秒的利用率反而像窗口是 0。
+     * 为什么只发码：这一行要跟着系统语言走，句子必须在 UI 层用 R.string 拼；
+     * 服务层只说明"这一档覆盖多少秒"，界面据此取「60 秒内的利用率 %」或短标签「60 秒」。
      *
-     * 注意 60 秒这一档**不折成 1 分钟**：秒和分钟的写法是按人眼读起来最顺来的，
-     * 不是按数学换算来的，所以这里用固定的几个文案，而不是从秒数算。
-     *
-     * 这行字是**换档位时唯一变化的东西**：图本身（点数、宽度、布局）三个档位完全一样，
-     * 为什么写着 30 秒 / 60 秒 / 4 分钟，那是三种采样间隔 × 固定点数算出来的实际覆盖时长。
+     * 注意 60 秒这一档**不折成 1 分钟**：秒/分钟的写法是按人眼读起来最顺来的，
+     * 不是按数学换算来的，所以 UI 侧用固定资源，而不是从秒数算着拼。
      */
     internal fun performanceChartWindowLabel(speed: String): String = when (speed) {
-        "已暂停" -> "利用率 % (已暂停)"
-        "高" -> "30 秒内的利用率 %"
-        "低" -> "4 分钟内的利用率 %"
-        else -> "60 秒内的利用率 %"
+        "已暂停" -> "PAUSED"
+        "高" -> "30"
+        "低" -> "240"
+        else -> "60"
     }
 
     override fun performanceChartWindowLabel(): String =
@@ -2219,7 +2436,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     /** 后端最近输出；未拉起时给出明确状态文案（不返回 null，页面不用判空）。 */
     override fun linuxBackendOutput(): String {
         val linux = LinuxService.instanceOrNull()
-            ?: return "Linux 服务尚未就绪（UIService 正在启动上游）"
+            ?: return AppStrings.s(R.string.svc_linux_not_ready_starting)
 
         return linux.recentOutput()
     }
@@ -2239,7 +2456,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
     /** 后端身份说明文案；Linux 服务没起来时给"未启动"。 */
     override fun linuxBackendIdentity(): String {
-        val linux = LinuxService.instanceOrNull() ?: return "未启动"
+        val linux = LinuxService.instanceOrNull() ?: return AppStrings.s(R.string.svc_not_started)
 
         return linux.backendIdentity()
     }
@@ -2341,6 +2558,13 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             detailColumns.forEach { column ->
                 values[column.id] = record.displayOf(column.id)
             }
+
+            // 僵尸进程：后端只发内核风格的名字 `[comm]`，说明文字在这里补，
+            // 位置是"名称"这一列；判据是同一行的 state == Z
+            values[DetailColumnId.NAME] = BackendDisplayText.processNameText(
+                record.fieldOf(DetailColumnId.NAME),
+                record.fieldOf(DetailColumnId.STATE)
+            )
 
             // Android 侧字段的接入点（现在什么都不做，见 enrichWithAndroid）
             enrichWithAndroid(values, record)
@@ -2567,6 +2791,37 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     // ---------- ISettingsChangeSink：设置页变更的落盘入口 ----------
 
     /**
+     * 关掉"置顶"之后收窗并把普通界面拉回前台。
+     *
+     * 两个入口共用：设置页关「置于顶层」，以及关「使用无障碍权限置顶」导致置顶失去依据。
+     * 做法与点"退出"完全一致：
+     * 1. 先记下浮窗当前页（一次性便条，下次普通启动回到这一页）；
+     * 2. 收窗；
+     * 3. 只有窗真的在的时候才拉起 MainActivity —— 否则用户本来就在普通界面里，
+     *    再拉一次会像是"页面闪了一下"。
+     */
+    private fun collapseTopWindow() {
+        val wasShowing = isTopWindowShowing()
+
+        if (wasShowing) {
+            SettingsStore.update(this, SettingKey.LAST_PAGE, overlayPageState.value)
+        }
+
+        hideOverlay()
+
+        // 在浮窗里关掉置顶：窗已经收了，此时用户会停在桌面上，
+        // 必须把普通界面拉回来，否则看起来又是"应用退出了"
+        if (wasShowing) {
+            runCatching {
+                startActivity(
+                    Intent(this, MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+    }
+
+    /**
      * 接收设置页的单项变更：写盘 -> 更新内存快照 -> 让需要立刻生效的项生效。
      *
      * 页面只负责传 (key, value)，不碰存储；这里是唯一的写入口。
@@ -2586,29 +2841,21 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             }
 
             // [OVERLAY-v1] 关掉"置于顶层"就立刻收浮窗；开启不在这里弹窗，
-            // 按约定是"重启应用后由 MainActivity 以浮窗启动"
+            // 按约定是"重启应用后由 MainActivity 以浮窗启动"。
+            // 但如果窗口已经在跑（可能是无障碍那只），开 / 关还要顺手核对通路：
+            // 比如从无障碍窗口切回"只走悬浮窗"，用户不该等下次启动才看到层级变化。
             SettingKey.WINDOW_ALWAYS_ON_TOP -> {
-                if (!next.windowAlwaysOnTop) {
-                    val wasShowing = overlayHost.isShowing
+                if (!next.windowAlwaysOnTop) collapseTopWindow() else syncTopWindowKind()
+            }
 
-                    // [OVERLAY-v1] 在浮窗里关掉置顶：先把浮窗当前页记下来，
-                    // 回普通界面时"回到原处"（与点"退出"是同一套一次性记录）
-                    if (wasShowing) {
-                        SettingsStore.update(this, SettingKey.LAST_PAGE, overlayPageState.value)
-                    }
-
-                    hideOverlay()
-
-                    // 在浮窗里把"置于顶层"关掉：窗已经收了，此时用户会停在桌面上，
-                    // 必须把普通界面拉回来，否则看起来又是"应用退出了"
-                    if (wasShowing) {
-                        runCatching {
-                            startActivity(
-                                Intent(this, MainActivity::class.java)
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            )
-                        }
-                    }
+            // 「使用无障碍权限置顶」= 选哪条通路建顶层窗口。窗口正挂着时要当场换，
+            // 不等重启——用户刚授完无障碍权限就该看到窗口变成更高层级那只。
+            SettingKey.A11Y_TOP_WINDOW -> {
+                if (!next.a11yTopWindow && !next.windowAlwaysOnTop) {
+                    // 置顶也跟着掉了：收窗 + 把普通界面拉回来
+                    collapseTopWindow()
+                } else {
+                    syncTopWindowKind()
                 }
             }
 
@@ -2628,69 +2875,123 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     /** 是否已被授予悬浮窗权限。 */
     override fun hasOverlayPermission(): Boolean = Settings.canDrawOverlays(this)
 
+    /**
+     * 是否已被授予无障碍权限（本应用的无障碍服务在系统里被启用）。
+     *
+     * 判定统一走 [A11yTopWindow.isEnabled]：设置页、存储层、本服务用的是同一个答案。
+     */
+    override fun hasAccessibilityPermission(): Boolean = A11yTopWindow.isEnabled(this)
+
+    /**
+     * 无障碍设置页的 Intent。
+     *
+     * 注意与悬浮窗的区别：无障碍权限没有"直达本应用那一项"的公开入口，
+     * 只能把用户送到系统无障碍列表页，由他自己找到本应用并打开开关。
+     */
+    override fun accessibilityPermissionIntent(): Intent = A11yTopWindow.settingsIntent()
+
     /** 直达本应用那一项的悬浮窗设置页。 */
     override fun overlayPermissionIntent(): Intent = Intent(
         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
         Uri.parse("package:$packageName")
     )
 
-    /** 浮窗是否正在显示。 */
+    /** 浮窗（含无障碍置顶窗口）是否正在显示。 */
     override val isOverlayShowing: Boolean
-        get() = overlayHost.isShowing
+        get() = isTopWindowShowing()
 
     /**
-     * 显示浮窗：现有页面 → 一个近乎铺满屏幕的窗口。
+     * 顶层窗口的内容：普通悬浮窗与无障碍窗口共用这一个界面。
      *
-     * 顺序：查权限 -> 挂窗口 -> 建窗成功后把常驻通知换成"浮窗运行中"文案。
-     * （前台身份在服务创建时就拿到了，这里不再依赖"进前台"，所以建窗失败也不必收回前台。）
+     * 两种窗口的区别只在"窗口类型与宿主 Context"，界面、页面切换、设置页内嵌模式完全一样，
+     * 所以这里只有一份实现——以后改界面也不用改两处。
+     */
+    private fun topWindowContent(): @Composable (OverlayHost.Actions) -> Unit = { actions ->
+        OverlayPageFrame(
+            pageName = overlayPageState.value,
+            // 窗口里的"设置"页：读当前快照、写回 UIService（由它统一落盘）
+            settingsProvider = { settingsSnapshot },
+            onSettingChanged = { key, value -> onSettingChanged(key, value) },
+            actions = actions,
+            onPageSelected = { page ->
+                overlayPageState.value = page
+
+                // 窗口切页签与主界面切页是同一件事：前台页变了，刷新目标也跟着变
+                setActivePage(page)
+            }
+        )
+    }
+
+    /**
+     * 显示顶层窗口：现有页面 → 一个近乎铺满屏幕的窗口。
+     *
+     * 走哪条通路由「使用无障碍权限置顶」决定（它就是"用哪种窗口"的开关）：
+     * - 开着且无障碍权限真在 -> TYPE_ACCESSIBILITY_OVERLAY 窗口，由无障碍服务建，
+     *   层级高于普通悬浮窗，且**不需要**悬浮窗权限；
+     * - 否则 -> 普通悬浮窗（TYPE_APPLICATION_OVERLAY），要求悬浮窗权限。
+     *
+     * 顺序：定通路 -> 查权限 -> 挂窗口 -> 成功后把常驻通知换成"运行中"文案。
      */
     override fun showOverlay(page: String): Boolean {
-        if (!hasOverlayPermission()) {
-            Log.w(TAG, "showOverlay: 没有悬浮窗权限，放弃建窗")
+        val useA11yWindow = a11yTopWindowUsable(settingsSnapshot)
 
-            // 走到这里说明"设置说要置顶、但权限已经没了"（启动那一刻刚好被收回）。
-            // 必须把设置改回关闭，否则每次启动都会白白走一遍这个分支，
-            // 设置页还会一直显示"已开启"。
-            settingsSnapshot = SettingsStore.update(this, SettingKey.WINDOW_ALWAYS_ON_TOP, false)
+        val host: OverlayHost = if (useA11yWindow) {
+            val current = a11yWindowHostOrNull()
 
-            return false
+            if (current == null) {
+                // 无障碍服务还没连上（刚开始授权 / 系统还没绑定）：这次不建窗，也**不动设置**。
+                // 服务连上后会回调 onAccessibilityWindowReady() 补建，所以这里只把普通界面拉回来，
+                // 免得 Activity 已经 finish() 的用户对着一片空屏。
+                Log.w(TAG, "showOverlay: 无障碍服务尚未连接，等它连上再建窗")
+
+                startNormalUiFallback()
+
+                return false
+            }
+
+            current
+        } else {
+            if (!hasOverlayPermission()) {
+                Log.w(TAG, "showOverlay: 没有悬浮窗权限，放弃建窗")
+
+                // 走到这里说明"设置说要置顶、但权限已经没了"（启动那一刻刚好被收回）。
+                // 必须把设置改回关闭，否则每次启动都会白白走一遍这个分支，
+                // 设置页还会一直显示"已开启"。
+                settingsSnapshot = SettingsStore.update(this, SettingKey.WINDOW_ALWAYS_ON_TOP, false)
+
+                return false
+            }
+
+            overlayHost
         }
 
         overlayPageState.value = page.ifBlank { settingsSnapshot.defaultStartPage }
 
-        // 浮窗一出来它就是"前台页"：刷新调度按它的页名走
+        // 窗口一出来它就是"前台页"：刷新调度按它的页名走
         setActivePage(overlayPageState.value)
 
-        // 已经有一只窗（例如重启前没来得及收掉的）：先收掉，保证这次是干净重建
+        // 已经有一只窗（另一条通路的残留 / 重启前没来得及收掉的）：先收掉，保证这次是干净重建
         if (overlayHost.isShowing) overlayHost.hide()
+
+        if (a11yWindowHost?.isShowing == true) a11yWindowHost?.hide()
 
         // 建窗过程中先按"还没显示"算，成功后再置位（通知文案跟着它）
         overlayVisible = false
 
-        Log.i(TAG, "showOverlay: 开始建窗 page=${overlayPageState.value}")
+        Log.i(
+            TAG,
+            "showOverlay: 开始建窗 page=${overlayPageState.value} 通路=" +
+                if (useA11yWindow) "无障碍" else "悬浮窗"
+        )
 
         val shown = try {
-            overlayHost.show(
-                bounds = overlayHost.defaultBounds(),
+            host.show(
+                bounds = host.defaultBounds(),
                 onClose = { exitOverlayMode() },
-                content = { actions ->
-                    OverlayPageFrame(
-                        pageName = overlayPageState.value,
-                        // 浮窗里的"设置"页：读当前快照、写回 UIService（由它统一落盘）
-                        settingsProvider = { settingsSnapshot },
-                        onSettingChanged = { key, value -> onSettingChanged(key, value) },
-                        actions = actions,
-                        onPageSelected = { page ->
-                            overlayPageState.value = page
-
-                            // 浮窗切页签与主界面切页是同一件事：前台页变了，刷新目标也跟着变
-                            setActivePage(page)
-                        }
-                    )
-                }
+                content = topWindowContent()
             )
         } catch (e: Throwable) {
-            // 这里是"浮窗建不起来"的唯一证据来源：BadTokenException / SecurityException
+            // 这里是"窗口建不起来"的唯一证据来源：BadTokenException / SecurityException
             // / IllegalArgumentException（type 不被允许）都会落在这里
             Log.e(TAG, "showOverlay: 建窗失败 page=$page", e)
 
@@ -2702,26 +3003,22 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
             refreshServiceNotification()
 
-            // 建窗失败也要把设置改回关闭：否则用户会停留在"置顶开着却没有浮窗"的
-            // 假状态，下次启动还会再试一遍（而且很可能再失败一次）。
-            settingsSnapshot = SettingsStore.update(this, SettingKey.WINDOW_ALWAYS_ON_TOP, false)
-
-            // 浮窗没建起来（addView 被系统拒绝 / 权限刚被收回）：退回普通界面。
-            // 否则 Activity 已经 finish()，用户会面对一片空屏，看起来就是"应用退出了"。
-            runCatching {
-                startActivity(
-                    Intent(this, MainActivity::class.java)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        .putExtra(EXTRA_FORCE_NORMAL, true)
-                )
+            if (!useA11yWindow) {
+                // 悬浮窗建窗失败：把设置改回关闭，否则用户会停留在"置顶开着却没有窗"的
+                // 假状态，下次启动还会再试一遍（而且很可能再失败一次）。
+                settingsSnapshot = SettingsStore.update(this, SettingKey.WINDOW_ALWAYS_ON_TOP, false)
             }
+            // 无障碍通路失败则保留设置：权限还在，失败多半是服务刚断开或 ROM 拒绝，
+            // 服务重连时还能再建一次；把用户的勾选擦掉反而更让人困惑。
+
+            startNormalUiFallback()
         }
 
         if (shown) {
-            // 浮窗真的挂上了：通知换成"浮窗运行中"（服务本身已经是前台，只是换文案）
+            // 窗口真的挂上了：通知换成"运行中"（服务本身已经是前台，只是换文案）
             overlayVisible = true
 
-            // 浮窗可见 = 允许驱动页面内容：门禁条件刚变，立刻重排
+            // 窗口可见 = 允许驱动页面内容：门禁条件刚变，立刻重排
             reschedulePolling()
 
             refreshServiceNotification()
@@ -2731,29 +3028,83 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             // 否则兜底出来的普通界面会落到默认页（进程），看起来就是"闪回进程页"。
             settingsSnapshot = SettingsStore.update(this, SettingKey.LAST_PAGE, "")
 
-            // 窗口活着期间盯着权限：用户在系统设置里关掉悬浮窗权限时，
-            // 系统只撤窗、不通知应用，只能靠自检（见 overlayWatchdog 上的说明）。
-            startOverlayWatchdog()
-
-            Log.i(TAG, "showOverlay: 浮窗已显示，page=${overlayPageState.value}")
+            Log.i(
+                TAG,
+                "showOverlay: 窗口已显示，page=${overlayPageState.value} 通路=" +
+                    if (useA11yWindow) "无障碍" else "悬浮窗"
+            )
         }
 
         return shown
     }
 
-    /** 关闭浮窗（幂等，不改设置）。服务本身继续常驻前台，只把通知文案换回"后台运行中"。 */
+    /**
+     * 关闭顶层窗口（幂等，不改设置）。两条通路都收。
+     *
+     * 服务本身继续常驻前台，只把通知文案换回"后台运行中"。
+     * 不再在这里停巡检：巡检盯的是"设置说开着、权限却没了"，
+     * 收窗就停会让它失去唯一的发现时机。
+     */
     override fun hideOverlay() {
-        // 窗收了就不必再巡检权限（也防止 Handler 继续持有这个实例）
-        stopOverlayWatchdog()
-
         overlayHost.hide()
+
+        hideA11yWindow()
 
         overlayVisible = false
 
         refreshServiceNotification()
 
-        // 浮窗收了：如果主界面也不在前台，就该停止驱动页面内容（重排一次让门禁立刻生效）
+        // 窗口收了：如果主界面也不在前台，就该停止驱动页面内容（重排一次让门禁立刻生效）
         reschedulePolling()
+    }
+
+    /**
+     * 无障碍服务连上了（由 [A11yTopWindowService.onServiceConnected] 调）。
+     *
+     * 为什么需要这个回调：主界面启动得比系统绑定无障碍服务更早是可能的
+     * （刚授权完、或系统重启后），那时建窗会拿不到服务实例而暂时放弃。
+     * 这里补一次：设置要求无障碍置顶、窗口又还没挂上，就按当前页再建一次。
+     */
+    internal fun onAccessibilityWindowReady() {
+        val values = settingsSnapshot
+
+        if (!values.windowAlwaysOnTop || !values.a11yTopWindow) return
+
+        // 已经挂的就是无障碍那只：不用重建
+        if (isShowingA11yWindow()) return
+
+        // 两种情况都走这里：
+        // 1) 还没窗（启动时服务没起来，补建一次）；
+        // 2) 挂着的是悬浮窗（用户刚授权，要换成无障碍那只）。
+        Log.i(TAG, "onAccessibilityWindowReady: 无障碍服务已连上，补建 / 切到无障碍置顶窗口")
+
+        showOverlay(overlayPageState.value.ifBlank { values.defaultStartPage })
+    }
+
+    /**
+     * 无障碍服务断开了（由 [A11yTopWindowService.onUnbind] 调）。
+     *
+     * 系统会把该服务的窗口一起撤掉，但"设置里还开着"这件事不会自动跟着变，所以这里：
+     * 1. **先**按同一套判据回退设置（这时窗口状态还是"在显示"，才判得出"该换一只悬浮窗顶上"
+     *    还是"置顶彻底失效"）；
+     * 2. 再清掉无障碍窗口的宿主状态（系统多半已把窗口撤了，这里幂等清理）；
+     * 3. 万一没有别的窗口顶上来（服务只是被系统重绑、权限还在），把可见状态与通知拉回"没窗口"，
+     *    等 [onAccessibilityWindowReady] 重建。
+     */
+    internal fun onAccessibilityWindowGone() {
+        Log.i(TAG, "onAccessibilityWindowGone: 无障碍服务断开，按当前设置决定是换通路还是退出置顶")
+
+        enforceTopWindowPermissions("无障碍服务断开")
+
+        hideA11yWindow()
+
+        if (!isTopWindowShowing() && overlayVisible) {
+            overlayVisible = false
+
+            refreshServiceNotification()
+
+            reschedulePolling()
+        }
     }
 
     // ---------- IPageDataApi：各页取数 ----------
@@ -2779,9 +3130,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      */
     override fun upstreamOutput(): UpstreamOutput = UpstreamOutput(
         android = AndroidService.instanceOrNull()?.outputSnapshot()
-            ?: "Android 服务尚未就绪（UIService 正在启动上游）",
+            ?: AppStrings.s(R.string.svc_android_not_ready_starting),
         linux = LinuxService.instanceOrNull()?.recentOutput()
-            ?: "Linux 服务尚未就绪（UIService 正在启动上游）"
+            ?: AppStrings.s(R.string.svc_linux_not_ready_starting)
     )
 
     // ---------- IPageDataApi：详细信息页（进程属性表） ----------
@@ -2868,7 +3219,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
                 detailRows.add(row)
             }
 
-            detailNote = "共 ${detailRows.size} 个进程（由上游填入）"
+            detailNote = AppStrings.s(R.string.svc_rows_from_upstream, detailRows.size)
 
             // 有手工数据进来了：之后定时刷新只更缓存，不再自动铺表覆盖它
             detailRowsFromSnapshot = false
@@ -2907,9 +3258,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             }
 
             detailNote = if (detailRows.isEmpty()) {
-                "表内没有进程（等待上游填入）"
+                AppStrings.s(R.string.svc_rows_empty_waiting)
             } else {
-                "共 ${detailRows.size} 个进程"
+                AppStrings.s(R.string.svc_rows_count, detailRows.size)
             }
         }
     }
@@ -3073,7 +3424,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     override fun killDetailProcess(pid: Int, startTicks: Long): ProcessActionResult {
 
         if (pid <= 0) {
-            return ProcessActionResult(false, "没有选中进程。", LinuxPacketStatus.BAD_ARGUMENT)
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_no_process_selected), LinuxPacketStatus.BAD_ARGUMENT)
         }
 
         // 没有启动时刻（-1）就确认不了"还是同一个进程"：宁可拒绝，也不冒"PID 被复用后杀错人"的风险。
@@ -3081,7 +3432,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         if (startTicks < 0L) {
             return ProcessActionResult(
                 false,
-                "这个进程没有可用的启动时间，无法确认它是哪一个进程。",
+                AppStrings.s(R.string.svc_no_start_time),
                 LinuxPacketStatus.BAD_ARGUMENT
             )
         }
@@ -3089,7 +3440,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         val linux = LinuxService.instanceOrNull()
 
         if (linux == null) {
-            return ProcessActionResult(false, "Linux 服务尚未就绪。", LinuxPacketStatus.UNSUPPORTED)
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_not_ready), LinuxPacketStatus.UNSUPPORTED)
         }
 
         val packet = linux.killProcess(pid, startTicks, linuxRequestTimeoutMs)
@@ -3098,7 +3449,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
             scheduleDetailRefreshAfterKill()
 
-            return ProcessActionResult(false, "Linux 服务没有回执。", LinuxPacketStatus.INTERNAL)
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_no_reply), LinuxPacketStatus.INTERNAL)
         }
 
         if (packet.isOk) {
@@ -3112,19 +3463,19 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         val reason = when (packet.status) {
 
-            LinuxPacketStatus.PROCESS_EXITED -> "进程已经退出。"
+            LinuxPacketStatus.PROCESS_EXITED -> AppStrings.s(R.string.svc_process_exited)
 
-            LinuxPacketStatus.UNSUPPORTED -> "服务不支持此操作。"
+            LinuxPacketStatus.UNSUPPORTED -> AppStrings.s(R.string.svc_not_supported)
 
-            LinuxPacketStatus.BAD_ARGUMENT -> "参数不正确。"
+            LinuxPacketStatus.BAD_ARGUMENT -> AppStrings.s(R.string.svc_bad_argument)
 
-            LinuxPacketStatus.ACCEPTED -> "服务只受理了请求，没有执行。"
+            LinuxPacketStatus.ACCEPTED -> AppStrings.s(R.string.svc_accepted_only)
 
             // INTERNAL：信号发不出去。errno 1 = EPERM（权限不够），3 = ESRCH（进程已不在）
             else -> when (packet.info["errno"]?.trim()?.toIntOrNull()) {
-                1 -> "拒绝访问。"
-                3 -> "进程已经退出。"
-                else -> "拒绝访问。"
+                1 -> AppStrings.s(R.string.svc_access_denied)
+                3 -> AppStrings.s(R.string.svc_process_exited)
+                else -> AppStrings.s(R.string.svc_access_denied)
             }
         }
 
@@ -3231,7 +3582,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
                 }
             }
 
-            detailNote = "测试数据：Test0 ~ Test10 共 11 个进程（名称 TestN，其余统计值 = N）"
+            detailNote = AppStrings.s(R.string.svc_test_rows_note)
         }
 
         return added
@@ -3446,3 +3797,4 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         return rows.sortedWith(comparator)
     }
 }
+

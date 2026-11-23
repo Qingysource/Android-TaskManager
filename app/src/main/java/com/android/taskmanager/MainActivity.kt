@@ -22,6 +22,8 @@
  */
 package com.android.taskmanager
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.drawable.ColorDrawable
@@ -72,6 +74,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.launch
 
+import com.android.taskmanager.service.A11yTopWindow
 import com.android.taskmanager.service.SettingsStore
 import com.android.taskmanager.service.UIService
 import com.android.taskmanager.service.ShizukuManager
@@ -120,7 +123,7 @@ private fun PerformanceOverflowMenu(
             Icon(
                 imageVector = Icons.Default.MoreVert,
 
-                contentDescription = "性能页菜单",
+                contentDescription = AppStrings.s(R.string.main_perf_menu),
 
                 modifier = Modifier.rotate(90f)
             )
@@ -133,7 +136,7 @@ private fun PerformanceOverflowMenu(
         ) {
 
             DropdownMenuItem(
-                text = { Text("复制图表") },
+                text = { Text(AppStrings.s(R.string.main_copy_chart)) },
 
                 onClick = {
                     expanded = false
@@ -144,7 +147,7 @@ private fun PerformanceOverflowMenu(
             HorizontalDivider()
 
             DropdownMenuItem(
-                text = { Text("资源监视器") },
+                text = { Text(AppStrings.s(R.string.main_resource_monitor)) },
 
                 onClick = {
                     expanded = false
@@ -179,7 +182,7 @@ private fun PerformanceDetailEntry(
         Icon(
             imageVector = Icons.Default.Info,
 
-            contentDescription = "设备详细信息"
+            contentDescription = AppStrings.s(R.string.devdetail_title)
         )
     }
 }
@@ -228,7 +231,7 @@ class MainActivity : ComponentActivity() {
          * 服务可以在这里**拉**到真实页名，不再依赖那一次上报是否成功。
          */
         @Volatile
-        var currentPage: String = "进程"
+        var currentPage: String = SettingsCatalog.PAGE_PROCESSES
             private set
     }
 
@@ -239,7 +242,7 @@ class MainActivity : ComponentActivity() {
      * 让重启后的浮窗直接停在同一页，而不是跳回默认起始页。
      * 由 MainPage 通过 onPageChanged 持续上报。
      */
-    private var currentPageName: String = "进程"
+    private var currentPageName: String = SettingsCatalog.PAGE_PROCESSES
 
     /**
      * 前台状态上报：定时刷新驱动页面内容要求"主界面在前台 或 浮窗可见"。
@@ -313,12 +316,19 @@ class MainActivity : ComponentActivity() {
         //    走到浮窗分支也好用：浮窗里的 ComposeView 读的是同一个状态，不用再读盘。
         ThemeState.mode.value = normalizeThemeMode(startup.appTheme)
 
-        // ② [OVERLAY-v1] 浮窗模式判定：设置要求置顶 + 系统已授予悬浮窗权限，
-        //    且这次不是"浮窗建失败后的兜底启动"（force_normal）。
-        //    少任何一条都退回普通界面——绝不因为权限缺失或浮窗异常把启动卡住。
+        // ② [OVERLAY-v1] 顶层窗口模式判定：设置要求置顶，且至少有一条通路能建窗，
+        //    且这次不是"建窗失败后的兜底启动"（force_normal）。
+        //    两条通路（与 UIService.showOverlay 的判据完全一致）：
+        //    - 有悬浮窗权限 -> 普通悬浮窗；
+        //    - 「使用无障碍权限置顶」开着且无障碍权限在 -> 无障碍置顶窗口（层级更高，不需要悬浮窗权限）。
+        //    少任何一条都退回普通界面——绝不因为权限缺失或建窗异常把启动卡住。
         val forceNormal = intent?.getBooleanExtra(UIService.EXTRA_FORCE_NORMAL, false) ?: false
 
-        val overlayMode = startup.alwaysOnTop && Settings.canDrawOverlays(this) && !forceNormal
+        val a11yTopReady = startup.a11yTopWindow && A11yTopWindow.isEnabled(this)
+
+        val overlayMode = startup.alwaysOnTop &&
+            (a11yTopReady || Settings.canDrawOverlays(this)) &&
+            !forceNormal
 
         // ③ 首屏：优先用"一次性回原位"记录（last_page），没有才用默认起始页。
         //    last_page 是"开 / 关置于顶层"那一刻记下的页面，启动时消费一次就清空，
@@ -392,6 +402,18 @@ class MainActivity : ComponentActivity() {
             UIService.instanceOrNull()?.settings() ?: SettingsStore.load(this).values
         }
 
+        // ⑧-补 现在能不能真的建出顶层窗口（两条通路任一）。
+        //
+        // 判据必须与 UIService.showOverlay 和上面的启动判定一致，否则会出现
+        // "记了 last_page、结果窗口根本没建"的脏便条。
+        // 读的是存储缓存（load 命中缓存，不重复 IO）。
+        fun topWindowBuildable(): Boolean {
+            val values = SettingsStore.load(this).values
+
+            return Settings.canDrawOverlays(this) ||
+                (values.a11yTopWindow && A11yTopWindow.isEnabled(this))
+        }
+
         // ⑧ 设置变更统一交给 UIService 落盘；
         //    服务还没起来（首次启动的极短窗口）时退化为直接写文件，保证这次修改不丢
         val changeSink: (SettingKey, Any) -> Unit = { key, value ->
@@ -406,12 +428,10 @@ class MainActivity : ComponentActivity() {
             // 软重启后浮窗就用这一页当首屏（一次性记录，见 SettingKey.LAST_PAGE）。
             // 只在 true 时记：取消勾选 / 关闭置顶不写，免得留下无用记录。
             //
-            // 而且必须"真能开得起浮窗"才记：没有悬浮窗权限时这次勾选不会生效
+            // 而且必须"真能建出顶层窗口"才记：两条通路都不满足时这次勾选不会生效
             // （存储层会把置顶改回 false），此时再留一条 last_page 就变成脏便条，
             // 下次普通启动会莫名其妙停在这一页。
-            if (key == SettingKey.WINDOW_ALWAYS_ON_TOP && value == true &&
-                Settings.canDrawOverlays(this)
-            ) {
+            if (key == SettingKey.WINDOW_ALWAYS_ON_TOP && value == true && topWindowBuildable()) {
                 SettingsStore.update(this, SettingKey.LAST_PAGE, currentPageName)
             }
 
@@ -493,62 +513,62 @@ private data class NavigationItem(
     val icon: ImageVector
 )
 
-/** 主功能页面列表（"设置"单独定义，固定放在导航栏底部）。 */
+/** 主功能页面列表（设置页单独定义，固定放在导航栏底部）。 */
 private val primaryNavigationItems = listOf(
     NavigationItem(
         TaskPage.Processes,
-        "进程",
-        "查看正在运行的进程",
+        AppStrings.s(R.string.main_processes),
+        AppStrings.s(R.string.main_view_processes),
         Icons.Default.Apps
     ),
     NavigationItem(
         TaskPage.Performance,
-        "性能",
-        "CPU、内存、磁盘与网络",
+        AppStrings.s(R.string.main_performance),
+        AppStrings.s(R.string.main_perf_desc),
         Icons.Default.BarChart
     ),
     NavigationItem(
         TaskPage.AppHistory,
-        "应用历史记录",
-        "查看应用资源使用历史",
+        AppStrings.s(R.string.main_app_history),
+        AppStrings.s(R.string.main_app_history_desc),
         Icons.Default.History
     ),
     NavigationItem(
         TaskPage.StartupApps,
-        "启动应用",
-        "管理应用启动项",
+        AppStrings.s(R.string.main_startup),
+        AppStrings.s(R.string.main_startup_desc),
         Icons.Default.PlayArrow
     ),
     NavigationItem(
         TaskPage.Users,
-        "用户",
-        "查看系统用户信息",
+        AppStrings.s(R.string.main_users),
+        AppStrings.s(R.string.main_users_desc),
         Icons.Default.SupervisorAccount
     ),
     NavigationItem(
         TaskPage.Details,
-        "详细信息",
-        "查看进程详细属性",
+        AppStrings.s(R.string.details_title),
+        AppStrings.s(R.string.main_details_desc),
         Icons.Default.Info
     ),
     NavigationItem(
         TaskPage.Services,
-        "服务",
-        "查看应用关联服务",
+        AppStrings.s(R.string.main_services),
+        AppStrings.s(R.string.main_services_desc),
         Icons.Default.Storage
     ),
     NavigationItem(
         TaskPage.Debug,
-        "调试",
-        "开发测试与诊断",
+        AppStrings.s(R.string.main_debug),
+        AppStrings.s(R.string.main_debug_desc),
         Icons.Default.BugReport
     )
 )
 
 private val settingsNavigationItem = NavigationItem(
     TaskPage.Settings,
-    "设置",
-    "配置任务管理器",
+    AppStrings.s(R.string.main_settings),
+    AppStrings.s(R.string.main_settings_desc),
     Icons.Default.Settings
 )
 
@@ -557,14 +577,13 @@ private val settingsNavigationItem = NavigationItem(
 // ============================================================
 
 /**
- * 把设置里的"默认起始页"（中文页面名）解析成导航枚举。
+ * 把设置里的"默认起始页"解析成导航枚举。
  *
- * 用 when 而不是按 SettingsCatalog.START_PAGES 的下标取枚举，是因为：
- * 页面名称是持久化数据，改名时这里必须"看得见"地跟着改，而不是悄悄错位。
+ * 比较用的是 [SettingsCatalog] 里的**内部标识**（PAGE_PERFORMANCE 等），不是界面文案：
+ * 起始页是持久化数据，存的一直是标识；界面文案跟着系统语言变，拿它来比会在英文设备上全部落空。
+ *
  * 未知名称（配置文件被手改坏）一律回落进程页——一条设置绝不能把应用卡在空白首屏。
- *
- * 另外：即使有人手改 config 把起始页写成"调试"/"设置"，这里也当作非法参数，
- * 直接回落进程页（存储层 SettingsStore 也会把它修正回"进程"并回写文件，
+ * "调试""设置"作为默认起始页同样非法（存储层 SettingsStore 也会把它修正回进程页并回写文件，
  * 这里是第二道闸，防止有别的调用方绕开存储层传进来一个裸字符串）。
  *
  * @param allowAuxiliaryPages 是否允许"调试""设置"当首屏。
@@ -573,17 +592,19 @@ private val settingsNavigationItem = NavigationItem(
  */
 private fun resolveStartPage(name: String, allowAuxiliaryPages: Boolean = false): TaskPage {
     return when (name) {
-        "性能" -> TaskPage.Performance
-        "应用历史记录" -> TaskPage.AppHistory
-        "启动应用" -> TaskPage.StartupApps
-        "用户" -> TaskPage.Users
-        "详细信息" -> TaskPage.Details
-        "服务" -> TaskPage.Services
+        SettingsCatalog.PAGE_PERFORMANCE -> TaskPage.Performance
+        SettingsCatalog.PAGE_APP_HISTORY -> TaskPage.AppHistory
+        SettingsCatalog.PAGE_STARTUP -> TaskPage.StartupApps
+        SettingsCatalog.PAGE_USERS -> TaskPage.Users
+        SettingsCatalog.PAGE_DETAILS -> TaskPage.Details
+        SettingsCatalog.PAGE_SERVICES -> TaskPage.Services
 
-        // "调试" / "设置"：作为默认起始页一律非法（回落进程页）；
-        // 只有在"回原位"时才是合法落点
-        "调试" -> if (allowAuxiliaryPages) TaskPage.Debug else TaskPage.Processes
-        "设置" -> if (allowAuxiliaryPages) TaskPage.Settings else TaskPage.Processes
+        // 调试 / 设置：作为默认起始页一律非法（回落进程页）；只有在"回原位"时才是合法落点
+        SettingsCatalog.PAGE_DEBUG ->
+            if (allowAuxiliaryPages) TaskPage.Debug else TaskPage.Processes
+
+        SettingsCatalog.PAGE_SETTINGS ->
+            if (allowAuxiliaryPages) TaskPage.Settings else TaskPage.Processes
 
         else -> TaskPage.Processes
     }
@@ -902,7 +923,7 @@ private fun MainPage(
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Menu,
-                                        contentDescription = "打开导航菜单"
+                                        contentDescription = AppStrings.s(R.string.main_open_menu)
                                     )
                                 }
                             },
@@ -986,14 +1007,14 @@ private fun WideTaskNavigation(
                 IconButton(onClick = onToggleExpanded) {
                     Icon(
                         imageVector = Icons.Default.Menu,
-                        contentDescription = if (expanded) "折叠导航菜单" else "展开导航菜单"
+                        contentDescription = if (expanded) AppStrings.s(R.string.main_collapse_menu) else AppStrings.s(R.string.main_expand_menu)
                     )
                 }
 
                 if (expanded) {
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "任务管理器",
+                        text = AppStrings.s(R.string.app_name),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1
@@ -1100,7 +1121,7 @@ private fun CompactTaskNavigation(
             .padding(horizontal = 12.dp)
     ) {
         Text(
-            text = "任务管理器",
+            text = AppStrings.s(R.string.app_name),
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.padding(
@@ -1156,15 +1177,15 @@ private fun CompactTaskNavigation(
 /** 页面 -> 顶部标题栏文案的映射。 */
 private fun navigationTitle(page: TaskPage): String {
     return when (page) {
-        TaskPage.Processes -> "进程"
-        TaskPage.Performance -> "性能"
-        TaskPage.AppHistory -> "应用历史记录"
-        TaskPage.StartupApps -> "启动应用"
-        TaskPage.Users -> "用户"
-        TaskPage.Details -> "详细信息"
-        TaskPage.Services -> "服务"
-        TaskPage.Debug -> "调试"
-        TaskPage.Settings -> "设置"
+        TaskPage.Processes -> AppStrings.s(R.string.main_processes)
+        TaskPage.Performance -> AppStrings.s(R.string.main_performance)
+        TaskPage.AppHistory -> AppStrings.s(R.string.main_app_history)
+        TaskPage.StartupApps -> AppStrings.s(R.string.main_startup)
+        TaskPage.Users -> AppStrings.s(R.string.main_users)
+        TaskPage.Details -> AppStrings.s(R.string.details_title)
+        TaskPage.Services -> AppStrings.s(R.string.main_services)
+        TaskPage.Debug -> AppStrings.s(R.string.main_debug)
+        TaskPage.Settings -> AppStrings.s(R.string.main_settings)
     }
 }
 
@@ -1219,7 +1240,7 @@ private fun PageSearchField(
             ) {
                 if (query.isEmpty()) {
                     Text(
-                        text = "键入要搜索的名称、发布者或者 PID",
+                        text = AppStrings.s(R.string.main_search_hint),
 
                         style = MaterialTheme.typography.bodySmall,
 
@@ -1255,7 +1276,7 @@ private fun PageSearchField(
                 Icon(
                     imageVector = Icons.Default.Clear,
 
-                    contentDescription = "清空搜索",
+                    contentDescription = AppStrings.s(R.string.main_clear_search),
 
                     modifier = Modifier
                         .size(18.dp)
@@ -1280,7 +1301,7 @@ private fun PageSearchField(
  * 不要在这里、也不要在页面里直接碰 AndroidService / LinuxService。
  *
  * 入口先过一道"状态闸"（pageStateOf）：
- * - NOT_IMPLEMENTED → 只画"此页面不受支持"占位，**不进入页面**（页面体不会被组合）；
+ * - NOT_IMPLEMENTED → 只画AppStrings.s(R.string.main_page_unsupported)占位，**不进入页面**（页面体不会被组合）；
  * - UNAVAILABLE     → 画"页面不可用"（这台设备 / 权限环境用不了）；
  * - IMPLEMENTED     → 才会进下面的 when。
  *
@@ -1302,7 +1323,7 @@ private fun PageContent(
         PageState.UNAVAILABLE -> {
             PageUnavailableScreen(
                 title = navigationTitle(page),
-                description = "当前设备或系统环境不支持此页面所需的功能。"
+                description = AppStrings.s(R.string.main_page_unsupported_desc)
             )
 
             return
@@ -1333,7 +1354,7 @@ private fun PageContent(
 // ============================================================
 
 /**
- * "此页面不受支持"占位（页面还没写）。
+ * AppStrings.s(R.string.main_page_unsupported)占位（页面还没写）。
  *
  * 版式按需求定死：**报错图标在上、横向居中，文字在图标下面**，不加标题、不加副标题——
  * 用户切到没写完的页时，只需要看到一件事：这一页现在用不了，不是坏了。
@@ -1369,7 +1390,7 @@ private fun UnsupportedPageScreen() {
         )
 
         Text(
-            text = "此页面不受支持",
+            text = AppStrings.s(R.string.main_page_unsupported),
 
             style = MaterialTheme.typography.titleMedium,
 
@@ -1401,7 +1422,7 @@ private fun PageUnavailableScreen(
         Spacer(Modifier.height(16.dp))
 
         Text(
-            text = "$title 页面不可用",
+            text = AppStrings.s(R.string.main_page_unavailable, title),
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface
         )
@@ -1450,3 +1471,4 @@ private fun MainPageNarrowPreview() {
         }
     }
 }
+

@@ -732,8 +732,12 @@ interface IUserCredentialApi {
  */
 object SettingsCatalog {
 
-    /** 应用主题的可选值。 */
-    val THEMES: List<String> = listOf("使用系统设置", "浅色", "深色")
+    /** 应用主题的可选值（内部标识，显示走 [optionLabel]）。 */
+    const val THEME_SYSTEM: String = "使用系统设置"
+    const val THEME_LIGHT: String = "浅色"
+    const val THEME_DARK: String = "深色"
+
+    val THEMES: List<String> = listOf(THEME_SYSTEM, THEME_LIGHT, THEME_DARK)
 
     /**
      * 默认起始页的可选值（顺序与 MainActivity 的 TaskPage 声明顺序一致）。
@@ -743,8 +747,26 @@ object SettingsCatalog {
      * 这份列表同时是**存储校验白名单**（SettingsStore.allowedValues 引用它），
      * 所以手改 config 把起始页写成这两页也会被判为非法：回落"进程"，并整份回写纠正。
      */
+    /**
+     * 页面名的内部标识。
+     *
+     * 这些中文串**不是界面文案**，是持久化标识（settings.json 里的起始页、last_page 便条、
+     * UIService 的搜索词表都以它们为 key）。所以它们终生不改，界面显示一律走 [optionLabel]，
+     * 否则切一次语言，存储里的旧值就和界面上的新文案对不上，起始页、回原位、搜索状态全部错位。
+     */
+    const val PAGE_PROCESSES: String = "进程"
+    const val PAGE_PERFORMANCE: String = "性能"
+    const val PAGE_APP_HISTORY: String = "应用历史记录"
+    const val PAGE_STARTUP: String = "启动应用"
+    const val PAGE_USERS: String = "用户"
+    const val PAGE_DETAILS: String = "详细信息"
+    const val PAGE_SERVICES: String = "服务"
+    const val PAGE_DEBUG: String = "调试"
+    const val PAGE_SETTINGS: String = "设置"
+
     val START_PAGES: List<String> = listOf(
-        "进程", "性能", "应用历史记录", "启动应用", "用户", "详细信息", "服务"
+        PAGE_PROCESSES, PAGE_PERFORMANCE, PAGE_APP_HISTORY, PAGE_STARTUP,
+        PAGE_USERS, PAGE_DETAILS, PAGE_SERVICES
     )
 
     /**
@@ -753,7 +775,12 @@ object SettingsCatalog {
      * 四档对应 UIService.pollIntervalMs：高 0.5s / 常规 1s / 低 4s / 已暂停（0，不自动刷新）。
      * 页面只认这份文案，不认毫秒——毫秒只在 UIService 里翻译一次。
      */
-    val UPDATE_SPEEDS: List<String> = listOf("高", "常规", "低", "已暂停")
+    const val SPEED_HIGH: String = "高"
+    const val SPEED_NORMAL: String = "常规"
+    const val SPEED_LOW: String = "低"
+    const val SPEED_PAUSED: String = "已暂停"
+
+    val UPDATE_SPEEDS: List<String> = listOf(SPEED_HIGH, SPEED_NORMAL, SPEED_LOW, SPEED_PAUSED)
 
     /**
      * 利用率精确度的可选值（顺序就是设置页下拉里的顺序）。
@@ -762,7 +789,11 @@ object SettingsCatalog {
      * 底层数据本来就有 0.01% 的精度（ELF 侧按两位小数上报），这里只决定显示几位：
      * 默认不保留小数是给"扫一眼看个大概"用的，两位是给"盯着某一行看"用的。
      */
-    val CPU_USAGE_PRECISIONS: List<String> = listOf("默认", "一位", "两位")
+    const val PRECISION_DEFAULT: String = "默认"
+    const val PRECISION_ONE: String = "一位"
+    const val PRECISION_TWO: String = "两位"
+
+    val CPU_USAGE_PRECISIONS: List<String> = listOf(PRECISION_DEFAULT, PRECISION_ONE, PRECISION_TWO)
 
     /**
      * 精度文案 -> 显示的小数位数（0 / 1 / 2）。
@@ -809,8 +840,46 @@ object SettingsCatalog {
      * 这份列表同时是 SettingsStore.allowedValues 的存储校验白名单。
      */
     val PAGES: List<String> = listOf(
-        "进程", "性能", "应用历史记录", "启动应用", "用户", "详细信息", "服务", "调试", "设置"
+        PAGE_PROCESSES, PAGE_PERFORMANCE, PAGE_APP_HISTORY, PAGE_STARTUP,
+        PAGE_USERS, PAGE_DETAILS, PAGE_SERVICES, PAGE_DEBUG, PAGE_SETTINGS
     )
+
+    /**
+     * 内部标识 -> 界面文案。
+     *
+     * 存储、路由、比较一律用标识本身；只有真正画到屏幕上时才过这一层。
+     * 认不出的值原样返回：那说明是脏数据，宁可显示原值让人看见，也不要悄悄换成别的东西。
+     */
+    fun optionLabel(code: String): String = when (code) {
+        THEME_SYSTEM -> AppStrings.s(R.string.theme_system)
+        THEME_LIGHT -> AppStrings.s(R.string.theme_light)
+        THEME_DARK -> AppStrings.s(R.string.theme_dark)
+
+        PAGE_PROCESSES -> AppStrings.s(R.string.main_processes)
+        PAGE_PERFORMANCE -> AppStrings.s(R.string.main_performance)
+        PAGE_APP_HISTORY -> AppStrings.s(R.string.main_app_history)
+        PAGE_STARTUP -> AppStrings.s(R.string.main_startup)
+        PAGE_USERS -> AppStrings.s(R.string.main_users)
+        PAGE_DETAILS -> AppStrings.s(R.string.main_details)
+        PAGE_SERVICES -> AppStrings.s(R.string.main_services)
+        PAGE_DEBUG -> AppStrings.s(R.string.main_debug)
+        PAGE_SETTINGS -> AppStrings.s(R.string.main_settings)
+
+        SPEED_HIGH -> AppStrings.s(R.string.setting_option_speed_high)
+        SPEED_NORMAL -> AppStrings.s(R.string.setting_option_speed_normal)
+        SPEED_LOW -> AppStrings.s(R.string.setting_option_speed_low)
+        SPEED_PAUSED -> AppStrings.s(R.string.setting_option_speed_paused)
+
+        PRECISION_DEFAULT -> AppStrings.s(R.string.setting_option_precision_default)
+        PRECISION_ONE -> AppStrings.s(R.string.setting_option_precision_one)
+        PRECISION_TWO -> AppStrings.s(R.string.setting_option_precision_two)
+
+        CREDENTIAL_NORMAL -> AppStrings.s(R.string.setting_option_identity_normal)
+        CREDENTIAL_SHELL -> AppStrings.s(R.string.setting_option_identity_shell)
+        CREDENTIAL_ROOT -> AppStrings.s(R.string.setting_option_identity_root)
+
+        else -> code
+    }
 }
 
 /**
@@ -910,10 +979,13 @@ interface IPageDataApi {
     // 所以这里不再有"取快照 / 取历史"的方法。
 
     /**
-     * 图表窗口那一行文案，例如 60 秒内的利用率 % / 30 秒内的利用率 % / 4 分钟内的利用率 % / 利用率 % (已暂停)。
+     * 图表窗口的**状态码**（不是给人看的文案）：`PAUSED` / `30` / `60` / `240`，单位秒。
+     *
+     * 为什么发码不发句子：窗口文案要跟着系统语言走，句子必须在 UI 层用资源拼；
+     * 服务层只说明"这一档覆盖多少秒"，界面据此取 R.string 里的整句与短标签。
      *
      * **只在切进性能页时调一次**：用户要改实时更新速度必须回设置页，
-     * 回来时这次调用自然就把新文案取到了，不需要每帧都重新问设置。
+     * 回来时这次调用自然就把新档位取到了，不需要每帧都重新问设置。
      */
     fun performanceChartWindowLabel(): String
 
@@ -1250,6 +1322,17 @@ interface IOverlayApi {
 
     /** 跳系统"悬浮窗管理"页的 Intent（带 package:，直达本应用那个开关）。 */
     fun overlayPermissionIntent(): Intent
+
+    /**
+     * 是否已被授予无障碍权限（本应用的无障碍服务在系统里被启用）。
+     *
+     * 注意：这个权限同样没有运行时申请接口，用户只能去系统无障碍设置页手动打开；
+     * 判定统一走 [com.android.taskmanager.service.A11yTopWindow.isEnabled]。
+     */
+    fun hasAccessibilityPermission(): Boolean
+
+    /** 跳系统无障碍设置页的 Intent（这个权限没有"直达本应用"的公开入口）。 */
+    fun accessibilityPermissionIntent(): Intent
 
     /**
      * 显示浮窗。

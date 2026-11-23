@@ -1025,12 +1025,13 @@ static bool gpu_thermal_zone_temperature(long long *celsius)
 
 /**
  * 物理位置：DRM 节点若有 PCI_SLOT_NAME（domain:bus:device.function），
- * 写成 "PCI 总线 2、设备 0、功能 0"；SoC 核显不是 PCI 设备，这一格就不发。
+ * 只把 bus / device / function 三个整数带回去，由客户端拼成本地语言文案；
+ * SoC 核显不是 PCI 设备，这三个值就一个都不发。
  */
-static void gpu_pci_location(const char *device_path, char *out, int capacity)
+static bool gpu_pci_location(const char *device_path,
+                             unsigned int *out_bus, unsigned int *out_device,
+                             unsigned int *out_function)
 {
-    out[0] = '\0';
-
     char path[256];
 
     snprintf(path, sizeof(path), "%s/device/uevent", device_path);
@@ -1038,13 +1039,13 @@ static void gpu_pci_location(const char *device_path, char *out, int capacity)
     char text[512];
 
     if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
-        return;
+        return false;
     }
 
     const char *cursor = strstr(text, "PCI_SLOT_NAME=");
 
     if (cursor == NULL) {
-        return;
+        return false;
     }
 
     cursor += strlen("PCI_SLOT_NAME=");
@@ -1058,10 +1059,14 @@ static void gpu_pci_location(const char *device_path, char *out, int capacity)
     unsigned int function = 0;
 
     if (sscanf(cursor, "%x:%x:%x.%x", &domain, &bus, &device, &function) != 4) {
-        return;
+        return false;
     }
 
-    snprintf(out, (size_t) capacity, "PCI 总线 %u、设备 %u、功能 %u", bus, device, function);
+    *out_bus = bus;
+    *out_device = device;
+    *out_function = function;
+
+    return true;
 }
 
 /** 显卡温度：先找 device 下的 hwmon，没有再退回 thermal zone。 */
@@ -1906,12 +1911,20 @@ int build_gpu_devices(TmOutDevice *out, int capacity,
         device_put_value(&out[i], "driver_date",
                          query_value_none(TM_QUERY_UNSUPPORTED));
 
-        char location[64];
+        unsigned int pci_bus = 0;
 
-        gpu_pci_location(devices[i].path, location, (int) sizeof(location));
+        unsigned int pci_device = 0;
 
-        if (location[0] != '\0') {
-            device_put(&out[i], "location", location);
+        unsigned int pci_function = 0;
+
+        if (gpu_pci_location(devices[i].path, &pci_bus, &pci_device, &pci_function)) {
+
+            device_put_int(&out[i], "pci_bus", (int) pci_bus, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+            device_put_int(&out[i], "pci_device", (int) pci_device, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+            device_put_int(&out[i], "pci_function", (int) pci_function,
+                           TM_FIELD_STATUS_NOT_AVAILABLE);
         }
 
         // 图形 API：两路各报各的，页面上谁有就摆谁。

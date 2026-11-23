@@ -30,6 +30,8 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import com.android.taskmanager.DetailColumnId
 import com.android.taskmanager.ILinuxServiceApi
 import com.android.taskmanager.UpstreamIdentityMode
@@ -276,13 +278,13 @@ object LinuxFieldStatus {
 
     /** 给界面看的一行说明；未知状态原样返回，便于排查谁加了新状态没登记。 */
     fun describe(status: String): String = when (status) {
-        SUCCESS -> "正常"
-        UNSUPPORTED -> "不支持"
-        ACCESS_DENIED -> "无权限"
-        NOT_AVAILABLE -> "暂无数据"
-        READ_FAILED -> "读取失败"
-        NO_BASELINE -> "缺少基准采样"
-        TRUNCATED -> "已截断"
+        SUCCESS -> AppStrings.s(R.string.health_ok)
+        UNSUPPORTED -> AppStrings.s(R.string.data_unsupported)
+        ACCESS_DENIED -> AppStrings.s(R.string.health_access_denied)
+        NOT_AVAILABLE -> AppStrings.s(R.string.health_no_data)
+        READ_FAILED -> AppStrings.s(R.string.health_read_failed)
+        NO_BASELINE -> AppStrings.s(R.string.health_no_baseline)
+        TRUNCATED -> AppStrings.s(R.string.health_truncated)
         else -> status
     }
 }
@@ -309,11 +311,22 @@ object LinuxFieldStatus {
  * 从 10000 起，因此 uid >= 10000 = 用户进程，其余（root / system / daemon）= 系统进程。
  * 服务端只用 stat("/proc/<pid>") 取属主，不读一整页 status。
  */
-enum class ProcessScope(val wire: String, val label: String) {
+enum class ProcessScope(val wire: String) {
 
-    ALL("0", "全部进程"),
-    USER("1", "用户进程"),
-    SYSTEM("2", "系统进程");
+    ALL("0"),
+    USER("1"),
+    SYSTEM("2");
+
+    /**
+     * 界面上显示的名字。刻意写成现取的属性而不是构造参数：
+     * 构造参数会在枚举类首次加载时就把某一种语言的文案定死，之后切语言不会变。
+     */
+    val label: String
+        get() = when (this) {
+            ALL -> AppStrings.s(R.string.scope_all_processes)
+            USER -> AppStrings.s(R.string.scope_user_processes)
+            SYSTEM -> AppStrings.s(R.string.scope_system_processes)
+        }
 
     companion object {
 
@@ -435,11 +448,14 @@ data class LinuxProcessRecord(
      *
      * 表格里所有"取值"都应走这里，别再用 `fields[key] ?: "0"`——
      * 那正是"把读失败伪装成 0"的来源。
+     *
+     * 有值时也过一次 [BackendDisplayText]：后端发的是英文状态码（state=R / platform=64 /
+     * is_admin=1），本地文案在这里落地，页面永远不直接显示协议码。
      */
     fun displayOf(key: String): String {
         val value = fields[key]
 
-        if (value != null) return value
+        if (value != null) return BackendDisplayText.processColumnText(key, value)
 
         val status = statuses[key] ?: return "—"
 
@@ -526,9 +542,9 @@ data class LinuxPacket(
     /** 失败 / 不完整时的一句话原因，直接可以显示。 */
     val failureReason: String?
         get() = when {
-            !complete -> "包不完整"
+            !complete -> AppStrings.s(R.string.lsvc_packet_incomplete)
             status != LinuxPacketStatus.OK -> LinuxPacketStatus.nameOf(status)
-            !isFromSvc -> "来向不是服务"
+            !isFromSvc -> AppStrings.s(R.string.lsvc_not_from_service)
             else -> null
         }
 
@@ -1109,7 +1125,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
     /** 当前后端身份的说明文案（写进输出首行，页面直接展示）。 */
     @Volatile
-    private var backendIdentityText: String = "未启动"
+    private var backendIdentityText: String = AppStrings.s(R.string.svc_not_started)
 
     /**
      * 后端是否已经打过 `READY`（就绪握手，F-12）。
@@ -1279,8 +1295,8 @@ class LinuxService : Service(), ILinuxServiceApi {
             identityMode = wantedIdentityMode
 
             append(
-                if (privilegedMode) "身份模式：优先提权（$identityMode），失败回退应用身份"
-                else "身份模式：应用自身 UID"
+                if (privilegedMode) AppStrings.s(R.string.lsvc_identity_mode_privileged, identityMode)
+                else AppStrings.s(R.string.lsvc_identity_mode_app)
             )
         }
 
@@ -1298,7 +1314,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
                 if (modeChanged && isBackendRunning) {
 
-                    append("身份模式变化：先回收旧身份的后端，再按新身份重启")
+                    append(AppStrings.s(R.string.lsvc_identity_mode_changed))
 
                     stopBackend()
                 }
@@ -1368,7 +1384,7 @@ class LinuxService : Service(), ILinuxServiceApi {
      */
     override fun backendIdentity(): String {
 
-        return if (isBackendRunning) backendIdentityText else "$backendIdentityText（已退出）"
+        return if (isBackendRunning) backendIdentityText else AppStrings.s(R.string.lsvc_identity_exited, backendIdentityText)
     }
 
     /**
@@ -1397,7 +1413,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         val elf = File(applicationInfo.nativeLibraryDir, ELF_NAME)
 
         if (!elf.exists()) {
-            append("找不到 ELF: ${elf.absolutePath}")
+            append(AppStrings.s(R.string.lsvc_elf_missing, elf.absolutePath))
 
             return false
         }
@@ -1425,7 +1441,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
                     if (startWithShizuku(command, elf, requireRoot = false)) return true
 
-                    append("目标身份 uid=2000，Shizuku 没能起进程，回退应用身份")
+                    append(AppStrings.s(R.string.lsvc_shizuku_uid2000_fallback))
                 }
 
                 UpstreamIdentityMode.ROOT -> {
@@ -1434,7 +1450,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
                     if (startWithRoot(command, elf)) return true
 
-                    append("目标身份 uid=0，Shizuku(root) 与 su 都没能起进程，回退应用身份")
+                    append(AppStrings.s(R.string.lsvc_shizuku_root_failed_fallback))
                 }
 
                 else -> {
@@ -1456,7 +1472,7 @@ class LinuxService : Service(), ILinuxServiceApi {
             backendPrivileged = false
             backendIdentityText = "uid=${android.os.Process.myUid()}"
 
-            append("已启动 ${elf.absolutePath}")
+            append(AppStrings.s(R.string.lsvc_started, elf.absolutePath))
 
             startReader(process)
 
@@ -1464,7 +1480,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
             true
         } catch (e: Exception) {
-            append("启动失败: ${e.message}")
+            append(AppStrings.s(R.string.lsvc_start_failed, e.message ?: ""))
 
             Log.e(TAG, "Linux backend 启动失败", e)
 
@@ -1488,14 +1504,14 @@ class LinuxService : Service(), ILinuxServiceApi {
         }
 
         if (status?.isAuthorized != true) {
-            append("Shizuku 未授权，跳过这条通路")
+            append(AppStrings.s(R.string.lsvc_shizuku_not_granted))
 
             return false
         }
 
         // 目标 uid 0 但 Shizuku 自己是 shell：它给不出 root，这条通路不满足目标，跳过（不算失败原因）
         if (requireRoot && !status.isRoot) {
-            append("目标是 uid=0，但 Shizuku 当前是 uid=2000，跳过这条通路")
+            append(AppStrings.s(R.string.lsvc_shizuku_uid_mismatch))
 
             return false
         }
@@ -1513,7 +1529,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         if (shellProcess == null) {
             // 把异常原文带上：root 身份起 ELF 时被 SELinux / 权限挡掉，就靠这一行定位
             append(
-                "Shizuku 起进程失败" + if (failReason.isEmpty()) "（返回 null）" else "（$failReason）"
+                AppStrings.s(R.string.lsvc_shizuku_spawn_failed) + if (failReason.isEmpty()) AppStrings.s(R.string.lsvc_returned_null) else AppStrings.s(R.string.lsvc_reason_paren, failReason)
             )
 
             return false
@@ -1525,7 +1541,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         // 这里只报最终 uid：调试页需要知道"进程是谁在跑"，不需要知道权限从哪条通道借来的
         backendIdentityText = if (status.isRoot) "uid=0" else "uid=2000"
 
-        append("已以 ${backendIdentityText} 启动 ${elf.absolutePath}")
+        append(AppStrings.s(R.string.lsvc_started_as_identity, backendIdentityText, elf.absolutePath))
 
         startReader(shellProcess)
 
@@ -1548,7 +1564,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         }
 
         if (!rootAvailable) {
-            append("Root 不可用（没有 su 或未授权），跳过这条通路")
+            append(AppStrings.s(R.string.lsvc_root_unavailable))
 
             return false
         }
@@ -1565,7 +1581,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         if (rootProcess == null) {
             append(
-                "Root 起进程失败" + if (failReason.isEmpty()) "（返回 null）" else "（$failReason）"
+                AppStrings.s(R.string.lsvc_root_spawn_failed) + if (failReason.isEmpty()) AppStrings.s(R.string.lsvc_returned_null) else AppStrings.s(R.string.lsvc_reason_paren, failReason)
             )
 
             return false
@@ -1577,7 +1593,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         // 只报 uid：本服务不区分"这是面具 su 还是别的"，调试页也只需要看到进程的 uid
         backendIdentityText = "uid=0"
 
-        append("已以 uid=0 启动 ${elf.absolutePath}")
+        append(AppStrings.s(R.string.lsvc_started_as_root, elf.absolutePath))
 
         startReader(rootProcess)
 
@@ -1629,9 +1645,9 @@ class LinuxService : Service(), ILinuxServiceApi {
         reader = null
 
         // 后端都已收掉，在途请求不可能再有应答了：立刻放行
-        failAllPending("后端已停止")
+        failAllPending(AppStrings.s(R.string.lsvc_backend_stopped))
 
-        append("已请求停止 Linux backend（SHUTDOWN 控制包）")
+        append(AppStrings.s(R.string.lsvc_stop_requested))
     }
 
     /**
@@ -1662,9 +1678,9 @@ class LinuxService : Service(), ILinuxServiceApi {
             true
         } catch (e: Exception) {
             // 写失败（EPIPE / 管道已关闭 / 对端退出）：这一轮请求不可能有应答了
-            append("发送失败: ${e.message}")
+            append(AppStrings.s(R.string.lsvc_send_failed, e.message ?: ""))
 
-            failAllPending("写入管道失败")
+            failAllPending(AppStrings.s(R.string.lsvc_pipe_write_failed))
 
             false
         }
@@ -1690,7 +1706,7 @@ class LinuxService : Service(), ILinuxServiceApi {
     override fun requestPackage(typeCode: Int, mask: Long, timeoutMs: Long): LinuxPacket? {
 
         if (!isBackendReady) {
-            append("请求推迟：后端尚未就绪（未收到 READY）")
+            append(AppStrings.s(R.string.lsvc_defer_request))
 
             return null
         }
@@ -1709,7 +1725,7 @@ class LinuxService : Service(), ILinuxServiceApi {
     override fun controlPackage(code: Int, argument: String, timeoutMs: Long): LinuxPacket? {
 
         if (!isProcessAlive(backend)) {
-            append("控制失败：后端没有在运行（${LinuxControlCode.nameOf(code)}）")
+            append(AppStrings.s(R.string.lsvc_control_failed_not_running, LinuxControlCode.nameOf(code)))
 
             return null
         }
@@ -1780,7 +1796,7 @@ class LinuxService : Service(), ILinuxServiceApi {
     fun deviceSnapshotPacket(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
 
         if (!isBackendReady) {
-            append("设备快照推迟：后端尚未就绪（未收到 READY）")
+            append(AppStrings.s(R.string.lsvc_defer_device_snapshot))
 
             return null
         }
@@ -1807,7 +1823,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         )
 
         if (packet != null && !packet.isOk) {
-            append("设备快照未采用：${packet.failureReason ?: packet.summary()}")
+            append(AppStrings.s(R.string.lsvc_device_snapshot_discarded, packet.failureReason ?: packet.summary()))
         }
 
         return packet
@@ -1836,7 +1852,7 @@ class LinuxService : Service(), ILinuxServiceApi {
     fun extendedDeviceSnapshotPacket(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
 
         if (!isBackendReady) {
-            append("设备扩展快照推迟：后端尚未就绪（未收到 READY）")
+            append(AppStrings.s(R.string.lsvc_defer_device_ext))
 
             return null
         }
@@ -1852,7 +1868,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         )
 
         if (packet != null && !packet.isOk) {
-            append("设备扩展快照未采用：${packet.failureReason ?: packet.summary()}")
+            append(AppStrings.s(R.string.lsvc_device_ext_discarded, packet.failureReason ?: packet.summary()))
         }
 
         return packet
@@ -1876,7 +1892,7 @@ class LinuxService : Service(), ILinuxServiceApi {
     ): LinuxPacket? {
 
         if (!isBackendReady) {
-            append("请求推迟：后端尚未就绪（未收到 READY）")
+            append(AppStrings.s(R.string.lsvc_defer_request))
 
             return null
         }
@@ -1913,13 +1929,13 @@ class LinuxService : Service(), ILinuxServiceApi {
     fun killProcess(pid: Int, startTicks: Long, timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
 
         if (pid <= 0 || startTicks < 0L) {
-            append("KILL 被拒：需要 pid 与 start_ticks（pid=$pid, startTicks=$startTicks）")
+            append(AppStrings.s(R.string.lsvc_kill_rejected, pid, startTicks))
 
             return null
         }
 
         if (!isProcessAlive(backend)) {
-            append("KILL 失败：后端没有在运行（pid=$pid）")
+            append(AppStrings.s(R.string.lsvc_kill_failed_not_running, pid))
 
             return null
         }
@@ -1972,7 +1988,7 @@ class LinuxService : Service(), ILinuxServiceApi {
     ): LinuxPacket? {
 
         if (!isProcessAlive(backend)) {
-            append("请求失败：后端没有在运行（${LinuxRequestType.nameOf(typeCode)}）")
+            append(AppStrings.s(R.string.lsvc_request_failed_not_running, LinuxRequestType.nameOf(typeCode)))
 
             return null
         }
@@ -2004,8 +2020,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         if (!answered) {
             append(
-                "请求超时（seq=$seq ${LinuxRequestType.nameOf(typeCode)} " +
-                    "mask=${LinuxField.describe(mask)}）"
+                AppStrings.s(R.string.lsvc_request_timeout, seq, LinuxRequestType.nameOf(typeCode), LinuxField.describe(mask))
             )
 
             return null
@@ -2013,7 +2028,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         val packet = slot.packet
 
-        append("应答 ${packet?.summary() ?: "#$seq（空包）"}")
+        append(AppStrings.s(R.string.lsvc_reply, packet?.summary() ?: AppStrings.s(R.string.lsvc_empty_packet, seq)))
 
         return packet
     }
@@ -2032,7 +2047,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
             backendReady = true
 
-            append("后端已就绪（READY）")
+            append(AppStrings.s(R.string.lsvc_backend_ready))
 
             return
         }
@@ -2046,7 +2061,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
             if (slot == null) {
                 // 没人等这个 seq：可能是超时后迟到的应答，记一笔就扔，别影响后续流程
-                append("忽略无主应答（seq=${header.seq}）：请求已超时或已被取消")
+                append(AppStrings.s(R.string.lsvc_orphan_reply, header.seq))
 
                 return
             }
@@ -2064,8 +2079,7 @@ class LinuxService : Service(), ILinuxServiceApi {
             if (interrupted != null && !interrupted.finished) {
 
                 append(
-                    "上一个包未收满（seq=${interrupted.header?.seq} " +
-                        "已收 ${interrupted.payloadLines}/${interrupted.header?.count}），按不完整收尾"
+                    AppStrings.s(R.string.lsvc_interrupted_packet, interrupted.header?.seq ?: -1L, interrupted.payloadLines, interrupted.header?.count ?: -1)
                 )
 
                 finishSlot(interrupted)
@@ -2103,7 +2117,7 @@ class LinuxService : Service(), ILinuxServiceApi {
             val record = LinuxProtocol.parseProcessLine(line)
 
             if (record == null) {
-                append("进程行解析失败，已跳过：$line")
+                append(AppStrings.s(R.string.lsvc_process_line_parse_failed, line))
 
                 return
             }
@@ -2154,7 +2168,7 @@ class LinuxService : Service(), ILinuxServiceApi {
             val pair = LinuxProtocol.parseDeviceLine(line)
 
             if (pair == null) {
-                append("设备头解析失败，已跳过：$line")
+                append(AppStrings.s(R.string.lsvc_device_header_parse_failed, line))
 
                 return
             }
@@ -2257,8 +2271,7 @@ class LinuxService : Service(), ILinuxServiceApi {
         if (!complete) {
 
             append(
-                "包不完整（seq=${header.seq}）：收到 $payloadLines 条数据行，" +
-                    "包头声称 ${header.count} 条"
+                AppStrings.s(R.string.lsvc_packet_incomplete_detail, header.seq, payloadLines, header.count)
             )
         }
 
@@ -2297,7 +2310,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         if (slots.isEmpty()) return
 
-        append("$reason：在途请求 ${slots.size} 个，已全部放行（返回空）")
+        append(AppStrings.s(R.string.lsvc_fail_all, reason, slots.size))
 
         slots.forEach { it.latch.countDown() }
     }
@@ -2313,16 +2326,16 @@ class LinuxService : Service(), ILinuxServiceApi {
         }
 
         if (recent.isEmpty()) {
-            return if (isBackendRunning) "Linux Backend 已启动，暂无输出" else "Linux Backend 未启动"
+            return if (isBackendRunning) AppStrings.s(R.string.lsvc_backend_no_output) else AppStrings.s(R.string.lsvc_backend_not_started)
         }
 
         val header = when {
 
-            !isBackendRunning -> "Linux Backend 已退出（上次身份：$backendIdentityText）"
+            !isBackendRunning -> AppStrings.s(R.string.lsvc_backend_exited, backendIdentityText)
 
-            backendPrivileged -> "Linux Backend 运行中（身份：$backendIdentityText）"
+            backendPrivileged -> AppStrings.s(R.string.lsvc_backend_running_identity, backendIdentityText)
 
-            else -> "Linux Backend 运行中（身份：应用自身 UID）"
+            else -> AppStrings.s(R.string.lsvc_backend_running_app)
         }
 
         return (listOf(header) + recent).joinToString("\n")
@@ -2349,8 +2362,7 @@ class LinuxService : Service(), ILinuxServiceApi {
 
                         if (line.length > LinuxProtocol.MAX_LINE_LENGTH) {
                             append(
-                                "丢弃超长行（${line.length} 字节，上限 " +
-                                    "${LinuxProtocol.MAX_LINE_LENGTH}）"
+                                AppStrings.s(R.string.lsvc_line_too_long, line.length, LinuxProtocol.MAX_LINE_LENGTH)
                             )
 
                             continue
@@ -2363,16 +2375,16 @@ class LinuxService : Service(), ILinuxServiceApi {
                     }
                 }
             } catch (e: Exception) {
-                append("读取输出中断: ${e.message}")
+                append(AppStrings.s(R.string.lsvc_read_output_interrupted, e.message ?: ""))
             }
 
             // 管道读完 = 后端没了：把还在等应答的请求立刻放行，别让页面白等超时
             backendReady = false
 
-            failAllPending("后端输出管道已关闭")
+            failAllPending(AppStrings.s(R.string.lsvc_output_pipe_closed))
 
             // 走到这里说明管道读完：要么后端按 SHUTDOWN 退出，要么被 destroy，要么崩了
-            append("Linux Backend 已退出（exitCode=${runCatching { process.exitValue() }.getOrDefault(-1)}）")
+            append(AppStrings.s(R.string.lsvc_backend_exited_code, runCatching { process.exitValue() }.getOrDefault(-1)))
 
             Log.i(TAG, "Linux backend 输出管道已关闭")
         }

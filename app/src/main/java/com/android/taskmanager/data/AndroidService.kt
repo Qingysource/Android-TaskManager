@@ -28,6 +28,8 @@
  */
 package com.android.taskmanager.data
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -180,15 +182,15 @@ class AndroidService : Service() {
             identityMode = wantedIdentityMode
 
             record(
-                if (privilegedMode) "身份切换：提权模式（优先 $identityMode，可用才生效）"
-                else "身份切换：应用自身 UID"
+                if (privilegedMode) AppStrings.s(R.string.asvc_identity_switch_privileged, identityMode)
+                else AppStrings.s(R.string.asvc_identity_switch_app)
             )
         }
 
         if (privilegedMode) {
             probeIdentity()
         } else {
-            record("跳过提权自检（当前不是提权模式）")
+            record(AppStrings.s(R.string.asvc_skip_elevation_selfcheck))
         }
 
         // 预热 uid 索引：详细页把 Linux 行转表行时是同步调用本服务的 queryProcess，
@@ -224,9 +226,9 @@ class AndroidService : Service() {
 
         // 只报告 uid：本服务不对外解释权限是从 Shizuku 还是 su 借来的，
         // 那套"身份来源"模型只属于 UIService 与设置页（调试页看 uid 就够定位问题）。
-        val identity = if (privilegedMode) "取数可提权" else "取数仅应用自身"
+        val identity = if (privilegedMode) AppStrings.s(R.string.asvc_data_elevated) else AppStrings.s(R.string.asvc_data_app)
 
-        return "Android UID: ${Process.myUid()} | $identity"
+        return AppStrings.s(R.string.asvc_identity_line, Process.myUid(), identity)
     }
 
     // ============================================================
@@ -267,7 +269,7 @@ class AndroidService : Service() {
             // 进程调度优先级走 /proc/<pid>/oom_score_adj，归 Linux 侧读（它有权限），
             // Android 侧看不到别的进程的 importance，这里不填，保持"暂无数据"
             androidPriority = null,
-            isolation = if (isolated) "已隔离" else "未隔离"
+            isolation = if (isolated) BackendDisplayText.ISOLATION_YES else BackendDisplayText.ISOLATION_NO
         )
     }
 
@@ -359,7 +361,7 @@ class AndroidService : Service() {
             )
         }
 
-        record("应用索引就绪：${result.size} 个 uid / ${packages.size} 个包")
+        record(AppStrings.s(R.string.asvc_app_index_ready, result.size, packages.size))
 
         return result
     }
@@ -443,7 +445,7 @@ class AndroidService : Service() {
             cachedAvfSupported = result
             avfSupportedProbed = true
 
-            record("AVF 支持：" + (result?.let { if (it) "是" else "否" } ?: "未取到"))
+            record(AppStrings.s(R.string.asvc_avf_supported, result?.let { if (it) AppStrings.s(R.string.data_yes) else AppStrings.s(R.string.data_no) } ?: AppStrings.s(R.string.asvc_not_read)))
 
             return result
         }
@@ -453,12 +455,12 @@ class AndroidService : Service() {
     fun outputSnapshot(): String = synchronized(lineLock) {
 
         if (lines.isEmpty()) {
-            return "（尚无输出）"
+            return AppStrings.s(R.string.asvc_no_output_yet)
         }
 
         buildString {
 
-            append("== AndroidService 输出 ==\n")
+            append(AppStrings.s(R.string.asvc_output_header) + "`n")
 
             lines.forEach { append(it).append('\n') }
         }
@@ -490,11 +492,11 @@ class AndroidService : Service() {
 
                 val second = if (shizukuFitsTarget) probeWithRoot(command) else probeWithShizuku(command)
 
-                first ?: second ?: "提权自检失败：两条通道都没走通"
+                first ?: second ?: AppStrings.s(R.string.asvc_elevation_selfcheck_failed)
 
             } catch (e: Throwable) {
 
-                "提权自检异常：${e.javaClass.simpleName} ${e.message ?: ""}"
+                AppStrings.s(R.string.asvc_elevation_selfcheck_error, e.javaClass.simpleName, e.message ?: "")
             }
 
             Log.i(TAG, text)
@@ -518,7 +520,7 @@ class AndroidService : Service() {
 
         if (!runCatching { ShizukuManager.status.value.isAuthorized }.getOrDefault(false)) {
 
-            record("Shizuku 自检跳过：未授权")
+            record(AppStrings.s(R.string.asvc_shizuku_selfcheck_skipped))
 
             return null
         }
@@ -526,13 +528,13 @@ class AndroidService : Service() {
         val process = try {
             ShizukuManager.newShellProcess(command)
         } catch (e: Throwable) {
-            record("Shizuku 自检异常：${e.javaClass.simpleName}")
+            record(AppStrings.s(R.string.asvc_shizuku_selfcheck_error, e.javaClass.simpleName))
 
             null
         } ?: return null
 
         // 结论只报 id 输出（里面就是 uid=...），不带"这是从哪条通道来的"
-        return "自检：" + readIdentity(process)
+        return AppStrings.s(R.string.asvc_selfcheck, readIdentity(process))
     }
 
     /** 用 su 通道跑一次 `id`，成功返回"自检：<id 输出>"；不可用时返回 null。 */
@@ -540,7 +542,7 @@ class AndroidService : Service() {
 
         if (!runCatching { RootManager.isAvailable }.getOrDefault(false)) {
 
-            record("Root 自检跳过：没有 su 或未授权")
+            record(AppStrings.s(R.string.asvc_root_selfcheck_skipped))
 
             return null
         }
@@ -548,12 +550,12 @@ class AndroidService : Service() {
         val process = try {
             RootManager.newRootProcess(command)
         } catch (e: Throwable) {
-            record("Root 自检异常：${e.javaClass.simpleName}")
+            record(AppStrings.s(R.string.asvc_root_selfcheck_error, e.javaClass.simpleName))
 
             null
         } ?: return null
 
-        return "自检：" + readIdentity(process)
+        return AppStrings.s(R.string.asvc_selfcheck, readIdentity(process))
     }
 
     /** 读一个短命进程的 id 输出并销毁它（自检专用，命令不会久留）。 */
@@ -561,7 +563,7 @@ class AndroidService : Service() {
         val output = try {
             process.inputStream.bufferedReader().use { it.readText() }.trim()
         } catch (e: Throwable) {
-            "读输出失败：${e.javaClass.simpleName}"
+            AppStrings.s(R.string.asvc_read_output_failed, e.javaClass.simpleName)
         } finally {
             try {
                 process.destroy()
@@ -646,3 +648,4 @@ data class AndroidSystemFacts(
      */
     val avfSupported: Boolean? = null
 )
+

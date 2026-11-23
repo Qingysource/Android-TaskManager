@@ -11,7 +11,7 @@
  *
  * 实现状态：`UsersPageState` 目前是 NOT_IMPLEMENTED。
  *  - MainActivity 的 PageContent() 看到这个值就不渲染本页，
- *    改为显示"此页面不受支持"占位（图标在上、文案在下）；
+ *    改为显示AppStrings.s(R.string.main_page_unsupported)占位（图标在上、文案在下）；
  *  - 本页写完那天，把下面那个常量改成 PageState.IMPLEMENTED 即可，MainActivity 不用动。
  *
  * TODO: 接入用户数据并实现列表 UI（在下面的 PageShell 正文里替换占位内容）。
@@ -19,6 +19,9 @@
  * 说明：文件位于 ui 目录，但包名为 com.android.taskmanager，与 MainActivity 同包。
  */
 package com.android.taskmanager
+
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -37,7 +40,7 @@ fun UsersScreen() {
         // 2) 展开：点某个用户看该用户下正在运行的进程数量
         // 3) 格式：跟随设置里的"显示完整账户名"决定截断还是全名
         Text(
-            text = "页面骨架已就绪，用户数据尚未接入。",
+            text = AppStrings.s(R.string.stub_users),
 
             style = MaterialTheme.typography.bodyMedium,
 

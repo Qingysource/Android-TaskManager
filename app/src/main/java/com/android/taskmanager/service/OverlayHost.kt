@@ -16,7 +16,10 @@
  * 三个都塞在下面的 ComposeOverlayOwner 里，生命周期由本类手动推进。
  *
  * 窗口参数（v1 定死，改这里就行）：
- * - 类型 TYPE_APPLICATION_OVERLAY（< 26 退化 TYPE_PHONE）；
+ * - 类型由 [WindowKind] 决定：
+ *   · APPLICATION_OVERLAY -> TYPE_APPLICATION_OVERLAY（< 26 退化 TYPE_PHONE），要悬浮窗权限；
+ *   · ACCESSIBILITY_OVERLAY -> TYPE_ACCESSIBILITY_OVERLAY，只要无障碍服务在跑就能建，
+ *     层级比普通悬浮窗更高（系统窗口之上）；宿主 Context 必须是那个无障碍服务本身；
  * - FLAG_NOT_FOCUSABLE｜FLAG_NOT_TOUCH_MODAL：
  *   触摸能收到、但不会把别的应用的键盘焦点抢走，且浮窗外的点击会穿透到下层应用；
  * - 近乎铺满屏幕但四边留空隙，空隙就是"还能点到系统和其他应用"的逃生口。
@@ -51,11 +54,30 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlin.math.roundToInt
 
 /**
+ * 浮窗的两种窗口类型：决定"这只窗靠什么权限立起来"。
+ *
+ * - [APPLICATION_OVERLAY]：悬浮窗（SYSTEM_ALERT_WINDOW），Context 用 UIService 自己；
+ * - [ACCESSIBILITY_OVERLAY]：无障碍置顶窗口（TYPE_ACCESSIBILITY_OVERLAY），
+ *   Context 必须是已连接的无障碍服务，否则 WindowManager 不认这层权限。
+ */
+enum class WindowKind {
+
+    /** 悬浮窗：需要"显示在其他应用上层"权限。 */
+    APPLICATION_OVERLAY,
+
+    /** 无障碍置顶窗口：需要无障碍服务在跑，不需要悬浮窗权限。 */
+    ACCESSIBILITY_OVERLAY
+}
+
+/**
  * 浮窗管理器：负责窗口的创建、移动、缩放与销毁。
  *
  * 注意：一个实例只持有一个浮窗；重复 [show] 不会叠加窗口。
  */
-class OverlayHost(private val context: Context) {
+class OverlayHost(
+    private val context: Context,
+    private val kind: WindowKind = WindowKind.APPLICATION_OVERLAY
+) {
 
     /** 浮窗的像素位置与尺寸（左上角原点，坐标为屏幕坐标）。 */
     data class Bounds(var x: Int, var y: Int, var width: Int, var height: Int)
@@ -278,9 +300,17 @@ class OverlayHost(private val context: Context) {
     // 工具
     // ============================================================
 
-    /** 浮窗 Window 类型：26 起统一用 TYPE_APPLICATION_OVERLAY，之前只有 TYPE_PHONE。 */
-    private fun overlayWindowType(): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    /**
+     * 窗口类型。
+     *
+     * - 无障碍置顶窗口用 TYPE_ACCESSIBILITY_OVERLAY（API 22 起就有，minSdk 24 不用判版本）；
+     *   它由无障碍服务建窗，层级高于普通悬浮窗，所以能盖住更多系统界面；
+     * - 悬浮窗 26 起统一用 TYPE_APPLICATION_OVERLAY，之前只有 TYPE_PHONE。
+     */
+    private fun overlayWindowType(): Int = when (kind) {
+        WindowKind.ACCESSIBILITY_OVERLAY -> WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+
+        WindowKind.APPLICATION_OVERLAY -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             @Suppress("DEPRECATION")

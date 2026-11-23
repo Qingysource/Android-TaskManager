@@ -1342,14 +1342,16 @@ static TmQueryStatus query_cpu_name_external(int cpu_id, const char *device_path
  *               只读，别改，也别保存指针。
  *
  * 出参格式（由你拼好整串，调用方不做任何加工，直接当字段值发出去）：
- *   第一段是基础状态，只能是这三个词之一：已启用 / 已禁用 / 不支持；
- *   第二段是扩展状态，紧跟在基础状态后面、用半角括号括起，可以为空；
- *   扩展状态为空时连括号都不要写，界面据此不显示括号。
+ *   **一律英文状态码**，不带中文（协议只放标识，本地语言由客户端映射）：
+ *     ENABLED_<实现名>   —— 已启用，实现名全大写、无空格（AMD-V / KVM / GUNYAH …）
+ *     DISABLED           —— 已禁用（硬件支持但内核未启用）
+ *     UNSUPPORTED        —— 平台没有虚拟化能力
+ *   实现名里若含空格或括号，改成下划线或去掉，避免破坏"空格分字段"的协议。
  *   例子：
- *     已启用(AMD-V)
- *     已启用(KVM)
- *     已禁用(硬件支持，内核未启用)
- *     不支持
+ *     ENABLED_AMD-V
+ *     ENABLED_KVM
+ *     DISABLED
+ *     UNSUPPORTED
  *
  * 返回状态含义与 query_cpu_name_external 完全一致，同一个 TmQueryStatus。
  *
@@ -1868,7 +1870,8 @@ static TmQueryValue probe_cpu_name_internal(void)
  * 与其猜一个状态，不如直接说 不支持。已禁用 这个描述留给外部实现
  * （真的有能力判断时由 query_virtualization_external 返回）。
  *
- * 返回值形如 `已启用(KVM)`，整串直接作为字段值发出去，客户端不做加工。
+ * 返回值是**英文状态码**，形如 `ENABLED_KVM` / `ENABLED_GENIEZONE` / `UNSUPPORTED`，
+ * 客户端按码决定显示哪种本地语言文案（协议里不放中文，见 Header.h 的约定）。
  */
 static TmQueryValue probe_virtualization_internal(void)
 {
@@ -1888,11 +1891,12 @@ static TmQueryValue probe_virtualization_internal(void)
         "/dev/halla",
     };
 
-    static const char *const k_names[] = {
-        "Gunyah",
+    // 实现名同时就是状态码的后缀（全大写、无空格，协议里不用转义）
+    static const char *const k_codes[] = {
+        "GUNYAH",
         "KVM",
-        "GenieZone",
-        "Halla",
+        "GENIEZONE",
+        "HALLA",
     };
 
     for (size_t index = 0; index < sizeof(k_paths) / sizeof(k_paths[0]); index++) {
@@ -1903,14 +1907,14 @@ static TmQueryValue probe_virtualization_internal(void)
 
         char text[64];
 
-        snprintf(text, sizeof(text), "已启用(%s)", k_names[index]);
+        snprintf(text, sizeof(text), "ENABLED_%s", k_codes[index]);
 
         cached = query_value_text(TM_QUERY_OK, text);
 
         return cached;
     }
 
-    cached = query_value_text(TM_QUERY_OK, "不支持");
+    cached = query_value_text(TM_QUERY_OK, "UNSUPPORTED");
 
     return cached;
 }

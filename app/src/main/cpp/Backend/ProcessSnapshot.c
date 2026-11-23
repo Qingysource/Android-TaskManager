@@ -541,37 +541,34 @@ void baseline_clear(void)
 // 第二轮（full）：按需读取 / 取值辅助
 // ============================================================
 
-/** 状态字符 -> 中文（含义与 ps 的状态字母一致）。 */
-static const char *state_text_of(char state)
+/**
+ * 状态字符 -> 英文状态码（含义与 ps 的状态字母一致）。
+ *
+ * 直接沿用内核的单个字母，本身已经是最"标识化"的形式：
+ * 客户端按码映射成本地语言（R→运行 / S→休眠 …），协议里不再放中文。
+ * 认不出的状态统一发 UNKNOWN，别把原始字母塞给 UI 去猜。
+ */
+static const char *state_code_of(char state)
 {
     switch (state) {
 
-        case 'R':
-            return "运行";
+        case 'R': return "R";
 
-        case 'S':
-            return "休眠";
+        case 'S': return "S";
 
-        case 'D':
-            return "不可中断";
+        case 'D': return "D";
 
-        case 'Z':
-            return "僵尸";
+        case 'Z': return "Z";
 
-        case 'T':
-            return "已停止";
+        case 'T': return "T";
 
-        case 't':
-            return "跟踪停止";
+        case 't': return "t";
 
-        case 'I':
-            return "空闲";
+        case 'I': return "I";
 
-        case 'X':
-            return "已退出";
+        case 'X': return "X";
 
-        default:
-            return "未知";
+        default: return "UNKNOWN";
     }
 }
 
@@ -837,8 +834,8 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
 
         // 僵尸进程（state = Z）先单独处理：它已经被杀死了，只是父进程还没回收，
         // pid 与 stat 都还在，而 cmdline 一定是空的（进程的用户空间已释放）。
-        // 名字沿用内核线程那套方括号写法（界面上认得出"这是个 kernel 风格的名字"），
-        // 再补一句"(僵尸进程)"，说清它为什么杀不死。
+        // 这里只发内核风格的 "[comm]" 名字本身，不再拼"(僵尸进程)"——
+        // 那是本地语言文案，客户端拿 state == Z 自己补（协议里不放中文）。
         if (cur->state_char == 'Z') {
 
             if (cur->comm[0] == '\0') {
@@ -847,7 +844,7 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
                 return NULL;
             }
 
-            snprintf(buffer, capacity, "[%s] (僵尸进程)", cur->comm);
+            snprintf(buffer, capacity, "[%s]", cur->comm);
 
             return text_result(out_status, buffer);
         }
@@ -906,7 +903,7 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
     }
 
     if (strcmp(key, "state") == 0) {
-        return text_result(out_status, state_text_of(cur->state_char));
+        return text_result(out_status, state_code_of(cur->state_char));
     }
 
     if (strcmp(key, "session") == 0) {
@@ -1285,8 +1282,10 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
             return NULL;
         }
 
+        // platform 只发位宽数字（32 / 64），"位"这个字由客户端按本地语言补；
+        // arch 本来就发 e_machine 的英文标识（ELF 里取出来的），原样发
         if (key[0] == 'p') {
-            snprintf(buffer, capacity, "%d 位", bits);
+            snprintf(buffer, capacity, "%d", bits);
         } else {
             snprintf(buffer, capacity, "%s", arch);
         }
@@ -1304,7 +1303,8 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
             return NULL;
         }
 
-        return text_result(out_status, uid == 0 ? "是" : "否");
+        // 布尔量一律发 "1" / "0"，不出现"是 / 否"这种本地语言
+        return text_result(out_status, uid == 0 ? "1" : "0");
     }
 
     if (strcmp(key, "nx_protect") == 0) {
@@ -1317,8 +1317,8 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
             return NULL;
         }
 
-        // 存在"可写又可执行"的映射 = 数据执行保护对这段没生效
-        return text_result(out_status, writable_exec == 0 ? "是" : "否");
+        // 存在"可写又可执行"的映射 = 数据执行保护对这段没生效；布尔量发 "1" / "0"
+        return text_result(out_status, writable_exec == 0 ? "1" : "0");
     }
 
     if (strcmp(key, "cet_protect") == 0) {
@@ -1340,7 +1340,8 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
 
         bool shadow_stack = strstr(raw, "shstk") != NULL || strstr(raw, "shadow_stack") != NULL;
 
-        return text_result(out_status, shadow_stack ? "是" : "否");
+        // 布尔量发 "1" / "0"
+        return text_result(out_status, shadow_stack ? "1" : "0");
     }
 
     // ---------- 本版拿不到 / 归 Android 服务填 ----------

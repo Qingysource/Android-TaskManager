@@ -11,7 +11,7 @@
  *
  * 实现状态：`ServicesPageState` 目前是 NOT_IMPLEMENTED。
  *  - MainActivity 的 PageContent() 看到这个值就不渲染本页，
- *    改为显示"此页面不受支持"占位（图标在上、文案在下）；
+ *    改为显示AppStrings.s(R.string.main_page_unsupported)占位（图标在上、文案在下）；
  *  - 本页写完那天，把下面那个常量改成 PageState.IMPLEMENTED 即可，MainActivity 不用动。
  *
  * TODO: 接入服务数据并实现列表与操作 UI（在下面的 PageShell 正文里替换占位内容）。
@@ -19,6 +19,9 @@
  * 说明：文件位于 ui 目录，但包名为 com.android.taskmanager，与 MainActivity 同包。
  */
 package com.android.taskmanager
+
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -37,7 +40,7 @@ fun ServicesScreen() {
         // 2) 操作：停止服务按钮（失败时给出原因，不要静默吞掉）
         // 3) 兜底：系统限制（Android 7+ 不再公开全部运行服务）时说明数据不完整
         Text(
-            text = "页面骨架已就绪，服务数据尚未接入。",
+            text = AppStrings.s(R.string.stub_services),
 
             style = MaterialTheme.typography.bodyMedium,
 

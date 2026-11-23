@@ -47,6 +47,7 @@
         界面完全由 Compose 绘制，这里的主题主要作用于启动窗口与系统装饰。
     -->
     <application
+        android:name=".TaskManagerApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -119,6 +120,33 @@
         <service
             android:name="com.android.taskmanager.data.LinuxService"
             android:exported="false" />
+
+        <!--
+            无障碍置顶窗口的授权入口（设置页「使用无障碍权限置顶」）。
+
+            作用：系统里必须先有这一项，用户才能去无障碍设置页把本应用的服务打开；
+            没有这条声明，就不存在"无障碍权限"这个可授予的状态。
+            - permission=BIND_ACCESSIBILITY_SERVICE：只允许系统绑定，别的应用起不来；
+            - exported=true：无障碍设置页由系统进程枚举服务，必须可被系统看见（已被上面的
+              permission 保护，普通应用仍绑不上）；
+            - meta-data 指向 res/xml/a11y_top_window.xml：声明事件类型与"不读窗口内容"。
+            服务连上之后由它自己 addView 建 TYPE_ACCESSIBILITY_OVERLAY 置顶窗口（界面与悬浮窗完全一样）。
+        -->
+        <service
+            android:name="com.android.taskmanager.service.A11yTopWindowService"
+            android:exported="true"
+            android:label="@string/a11y_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_top_window" />
+
+        </service>
 
         <!--
             TODO(预留): 接入真实数据采集后需要补充权限声明，例如：

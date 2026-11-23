@@ -1,3 +1,655 @@
 <resources>
-    <string name="app_name">任务管理器</string>
+    <!--
+        默认语言 = 英文（Google 的约定：默认 res/values 是"兜底语言"）。
+        任何没有对应 values-<语言> 目录的系统语言都会回落到这里；
+        中文在 values-zh/strings.xml 里，两边的 name 必须一一对应。
+    -->
+    <string name="app_name">Task Manager</string>
+
+    <!-- ========== 性能页（PerformanceScreen） ========== -->
+    <string name="perf_memory">Memory</string>
+    <string name="perf_disk">Disk</string>
+    <string name="perf_utilization">Utilization</string>
+    <string name="perf_speed">Speed</string>
+    <string name="perf_processes">Processes</string>
+    <string name="perf_threads">Threads</string>
+    <string name="perf_fd">File descriptors</string>
+    <string name="perf_uptime">Uptime</string>
+    <string name="perf_temperature">Temperature</string>
+    <string name="perf_base_speed">Base speed</string>
+    <string name="perf_sockets">Sockets</string>
+    <string name="perf_cores">Cores</string>
+    <string name="perf_logical">Logical processors</string>
+    <string name="perf_vm">Virtual machine</string>
+    <string name="perf_virtualization">Virtualization</string>
+    <string name="perf_avf">AVF support</string>
+    <string name="perf_l1">L1 cache</string>
+    <string name="perf_l2">L2 cache</string>
+    <string name="perf_l3">L3 cache</string>
+    <string name="perf_chart">Performance chart</string>
+    <string name="perf_chart_copied">The current chart has been copied</string>
+    <string name="perf_summary_hint">Double-click the chart to exit the summary view</string>
+    <string name="perf_memory_m">Memory (M)</string>
+    <string name="perf_disk_d">Disk (D)</string>
+    <string name="perf_network_n">Network (N)</string>
+    <string name="perf_in_use_compressed">In use (compressed)</string>
+    <string name="perf_available">Available</string>
+    <string name="perf_committed">Committed</string>
+    <string name="perf_cached">Cached</string>
+    <string name="perf_kernel_reclaimable">Reclaimable kernel memory</string>
+    <string name="perf_kernel_non_reclaimable">Non-reclaimable kernel memory</string>
+    <string name="perf_slots_used">Used slots</string>
+    <string name="perf_form_factor">Form factor</string>
+    <string name="perf_hardware_reserved">Hardware reserved</string>
+    <string name="perf_compressed_memory">Compressed memory</string>
+    <string name="perf_swap">Swap</string>
+    <string name="perf_manufacturer">Manufacturer</string>
+    <string name="perf_capacity">Capacity</string>
+    <string name="perf_formatted">Formatted</string>
+    <string name="perf_system_disk">System disk</string>
+    <string name="perf_page_file">Page file</string>
+    <string name="perf_type">Type</string>
+    <string name="perf_dedicated_gpu">Dedicated GPU memory</string>
+    <string name="perf_gpu_memory">GPU memory</string>
+    <string name="perf_shared_gpu">Shared GPU memory</string>
+    <string name="perf_driver_version">Driver version</string>
+    <string name="perf_driver_date">Driver date</string>
+    <string name="perf_vulkan_version">Vulkan version</string>
+    <string name="perf_opengl_version">OpenGL ES version</string>
+    <string name="perf_physical_location">Physical location</string>
+    <string name="perf_adapter_name">Adapter name</string>
+    <string name="perf_connection_type">Connection type</string>
+    <string name="perf_ipv4">IPv4 address</string>
+    <string name="perf_ipv6">IPv6 address</string>
+    <string name="perf_signal_strength">Signal strength</string>
+    <string name="perf_memory_usage">Memory usage</string>
+    <string name="perf_active_time">Active time</string>
+    <string name="perf_throughput">Throughput</string>
+    <string name="perf_disk_transfer">Disk transfer rate</string>
+    <string name="perf_paused">Paused</string>
+    <string name="perf_60_seconds">60 seconds</string>
+    <string name="perf_minutes">Minutes</string>
+    <string name="perf_memory_composition">Memory composition</string>
+    <string name="perf_avg_response">Average response time</string>
+    <string name="perf_read_speed">Read speed</string>
+    <string name="perf_write_speed">Write speed</string>
+    <string name="perf_send">Send</string>
+    <string name="perf_receive">Receive</string>
+    <string name="perf_menu_change_graph">Change graph to (H)</string>
+    <string name="perf_menu_overall">Overall utilization (O)</string>
+    <string name="perf_menu_logical">Logical processors (L)</string>
+    <string name="perf_menu_kernel_time">Show kernel times (K)</string>
+    <string name="perf_menu_summary">Summary view (W)</string>
+    <string name="perf_menu_view">View (V)</string>
+    <string name="perf_menu_view_network">View network details (D)</string>
+    <string name="perf_menu_copy">Copy (C)</string>
+    <string name="perf_title">Task Manager</string>
+    <string name="perf_network_details">Network details</string>
+    <string name="perf_back">Back to Performance</string>
+    <!-- 带位置参数的条目：%1$s 由代码传入 -->
+    <string name="perf_seconds_count">%1$s seconds</string>
+    <string name="perf_send_receive">Send: %1$s  Receive: %2$s</string>
+    <string name="perf_seconds_short">%1$s s</string>
+    <string name="perf_minutes_short">%1$s min</string>
+    <string name="perf_window_paused">Utilization % (paused)</string>
+    <string name="perf_window_30">Utilization % over the last 30 seconds</string>
+    <string name="perf_window_60">Utilization % over the last 60 seconds</string>
+    <string name="perf_window_240">Utilization % over the last 4 minutes</string>
+
+    <!-- ========== 通用 ========== -->
+    <string name="common_back">Back</string>
+    <string name="common_ok">OK</string>
+    <string name="common_cancel">Cancel</string>
+    <string name="common_refresh">Refresh</string>
+    <string name="common_none">None</string>
+    <string name="common_test_page">Test page</string>
+
+    <!-- ========== 主导航 / MainActivity ========== -->
+    <string name="main_perf_menu">Performance menu</string>
+    <string name="main_copy_chart">Copy chart</string>
+    <string name="main_resource_monitor">Resource Monitor</string>
+    <string name="main_device_details">Device details</string>
+    <string name="main_view_processes">View running processes</string>
+    <string name="main_performance">Performance</string>
+    <string name="main_perf_desc">CPU, memory, disk and network</string>
+    <string name="main_app_history">App history</string>
+    <string name="main_app_history_desc">View app resource usage history</string>
+    <string name="main_startup">Startup apps</string>
+    <string name="main_startup_desc">Manage startup apps</string>
+    <string name="main_users">Users</string>
+    <string name="main_users_desc">View system user info</string>
+    <string name="main_details">Details</string>
+    <string name="main_details_desc">View detailed process properties</string>
+    <string name="main_services">Services</string>
+    <string name="main_services_desc">View app-related services</string>
+    <string name="main_debug">Debug</string>
+    <string name="main_debug_desc">Development testing and diagnostics</string>
+    <string name="main_settings">Settings</string>
+    <string name="main_settings_desc">Configure Task Manager</string>
+    <string name="main_open_menu">Open navigation menu</string>
+    <string name="main_collapse_menu">Collapse navigation menu</string>
+    <string name="main_expand_menu">Expand navigation menu</string>
+    <string name="main_search_hint">Type a name, publisher, or PID to search</string>
+    <string name="main_clear_search">Clear search</string>
+    <string name="main_page_unsupported_desc">This page requires features that the current device or system does not support.</string>
+    <string name="main_page_unsupported">This page is not supported</string>
+    <string name="main_page_unavailable">%1$s is unavailable</string>
+
+    <!-- ========== 详细信息表 / DetailsScreen ========== -->
+    <string name="details_title">Details</string>
+    <string name="details_empty">No processes in the table yet (waiting for upstream data, or the table was cleared)</string>
+    <string name="details_no_match">No processes match “%1$s” (try name, package, or PID)</string>
+    <string name="details_end_confirm">Do you want to end %1$s?</string>
+    <string name="details_end_warning_app">If an open program is associated with this process, it will be closed and all unsaved data will be lost.</string>
+    <string name="details_end_warning_system">Ending a system process may make the system unstable. Do you want to continue?</string>
+    <string name="details_end_process">End process</string>
+    <string name="details_service_not_ready">Service not ready.</string>
+    <string name="details_operation_failed">The operation could not be completed.</string>
+    <string name="details_long_press_test">Long-press test</string>
+    <string name="details_process_line">Process: %1$s (PID=%2$s)</string>
+    <string name="details_reported">That PID has been reported to UIService via onDetailRowLongPressed(pid).</string>
+    <string name="details_columns_count">%1$s columns / 43 total</string>
+    <string name="details_rows_count">" · %1$s rows"</string>
+    <string name="details_rows_filtered">" · %1$s / %2$s rows (filter: “%3$s”)"</string>
+    <string name="details_sort_prefix">" · Sort: "</string>
+    <string name="details_sort_default">Default order</string>
+    <string name="details_selected_prefix">" · Selected: "</string>
+    <string name="details_sort_hint">Click a header to sort (click again to reverse) · Long-press any header to choose columns</string>
+    <string name="details_ignore_interval">Ignore refresh rate</string>
+    <string name="details_no_visible_columns">No visible columns (service not ready, or all columns are unchecked)</string>
+    <string name="details_choose_columns_hint">Long-press the header area to open “Select columns” and check some</string>
+    <string name="details_select_columns">Select columns</string>
+    <string name="details_select_columns_desc">Choose the columns to show in the table.</string>
+    <string name="details_columns_not_ready">Column definitions are not ready (UIService did not return allColumns)</string>
+
+    <!-- ========== 设备详细信息 / DeviceDetailScreen ========== -->
+    <string name="devdetail_title">Device details</string>
+    <string name="devdetail_reading">Reading…</string>
+    <string name="devdetail_empty">No data yet: the backend is not ready, or it does not support the extended device snapshot (typeCode=6)</string>
+    <string name="devdetail_processor">Processor details</string>
+    <string name="devdetail_no_data">No data yet</string>
+    <string name="devdetail_cores">Cores</string>
+    <string name="devdetail_no_cores">No cores</string>
+    <string name="devdetail_selected_core">Selected core details</string>
+    <string name="devdetail_pick_core">Select a core above</string>
+    <string name="devdetail_connecting">Connecting to the service…</string>
+    <string name="devdetail_paused">Live update: paused (nothing is sampled while the refresh rate is set to Paused)</string>
+    <string name="devdetail_every">"Live update: every "</string>
+    <string name="devdetail_refresh_once">" refresh"</string>
+    <string name="devdetail_seconds_decimal">%1$.1f s</string>
+    <string name="devdetail_current">Current</string>
+    <string name="devdetail_max">Max</string>
+    <string name="devdetail_min">Min</string>
+    <string name="devdetail_set_max">Configured max</string>
+    <string name="devdetail_current_freq">Current frequency</string>
+    <string name="devdetail_max_freq">Max frequency</string>
+    <string name="devdetail_min_freq">Min frequency</string>
+    <string name="devdetail_set_max_freq">Configured max frequency</string>
+
+    <!-- ========== 主题 / Theme ========== -->
+    <string name="theme_system">Use system setting</string>
+    <string name="theme_light">Light</string>
+    <string name="theme_dark">Dark</string>
+
+    <!-- ========== 占位页 ========== -->
+    <string name="stub_history">Page scaffold is ready; history data is not connected yet.</string>
+    <string name="stub_processes">Page scaffold is ready; process data is not connected yet.</string>
+    <string name="stub_services">Page scaffold is ready; service data is not connected yet.</string>
+    <string name="stub_startup">Page scaffold is ready; startup data is not connected yet.</string>
+    <string name="stub_users">Page scaffold is ready; user data is not connected yet.</string>
+    <string name="setting_appearance">Appearance</string>
+    <string name="setting_theme">App theme</string>
+    <string name="setting_theme_desc">Select the color theme used by the app</string>
+    <string name="setting_general">General</string>
+    <string name="setting_start_page">Default start page</string>
+    <string name="setting_start_page_desc">Page opened by default when the app starts</string>
+    <string name="setting_update_speed">Real-time update speed</string>
+    <string name="setting_update_speed_desc">How often system resource usage reports are refreshed</string>
+    <string name="setting_precision">Utilization precision</string>
+    <string name="setting_precision_desc">Decimal places for CPU utilization: none by default, one or two for more precision</string>
+    <string name="setting_window_manage">Window management</string>
+    <string name="setting_window_manage_desc">Configure the default window behavior of Task Manager</string>
+    <string name="setting_always_top">Always on top</string>
+    <string name="setting_always_top_desc">Show as a floating window above other apps (requires top-window or accessibility permission)</string>
+    <string name="setting_minimize_in_use">Minimize while in use</string>
+    <string name="setting_minimize_in_use_desc">Minimize the app automatically when other windows are in use</string>
+    <string name="setting_others">Other options</string>
+    <string name="setting_others_desc">Full account names, history for all processes, confirmation dialogs</string>
+    <string name="setting_full_account_name">Show full account names</string>
+    <string name="setting_full_account_name_desc">Show the full name of user accounts</string>
+    <string name="setting_all_process_history">Show history for all processes</string>
+    <string name="setting_all_process_history_desc">Keep and show history for all processes</string>
+    <string name="setting_ask_efficiency">Ask me before applying efficiency mode</string>
+    <string name="setting_ask_efficiency_desc">Show a confirmation prompt before enabling efficiency mode</string>
+    <string name="setting_background_stats">Background statistics</string>
+    <string name="setting_background_stats_desc">Keep sampling performance data while the app is not in the foreground, so charts have no gaps. Turn off to sample only while the UI is visible, which saves CPU and battery.</string>
+    <string name="setting_advanced">Advanced</string>
+    <string name="setting_kernel_dump">Live kernel memory dump options</string>
+    <string name="setting_kernel_dump_desc">Abort when memory is low, capture hypervisor pages including nonessential pages, capture user pages</string>
+    <string name="setting_dump_abort_lowmem">Abort if memory is insufficient</string>
+    <string name="setting_dump_abort_lowmem_desc">Stop the dump when available memory is not enough</string>
+    <string name="setting_dump_hypervisor">Capture hypervisor pages</string>
+    <string name="setting_dump_hypervisor_desc">Include hypervisor pages in the memory dump</string>
+    <string name="setting_dump_nonessential">Include nonessential pages</string>
+    <string name="setting_dump_nonessential_desc">Also capture nonessential hypervisor pages</string>
+    <string name="setting_dump_user_pages">Capture user pages</string>
+    <string name="setting_dump_user_pages_desc">Include user pages in the memory dump</string>
+    <string name="setting_credentials">User credentials</string>
+    <string name="setting_credentials_desc">The identity Task Manager runs as, and the resources it can manage</string>
+    <string name="setting_identity">User identity</string>
+    <string name="setting_identity_desc">Identity used to read and manage system resources; identities without enough permission are rejected and the previous choice is kept</string>
+    <string name="setting_shizuku_root_only">Authorized, but the Shizuku service runs as root: it offers root capabilities, not Shell (adb)</string>
+    <string name="setting_shizuku_ready">Access restricted interfaces as shell / adb; authorized</string>
+    <string name="setting_shizuku_missing">Shizuku app not found: install Shizuku first so this app can use the shell / adb identity</string>
+    <string name="setting_shizuku_not_running">Shizuku is installed but its service is not running: open Shizuku, tap Start service, then come back and request permission</string>
+    <string name="setting_shizuku_need_grant">Access restricted interfaces as shell / adb; grant this app permission in the Shizuku app</string>
+    <string name="setting_shizuku_open">Open Shizuku</string>
+    <string name="setting_request_perm">Request permission</string>
+    <string name="setting_root_ready">Manage system resources as superuser; the device must be rooted and allow this app to elevate</string>
+    <string name="setting_root_via_shizuku">Root capability already granted through Shizuku (root), so root can be selected directly</string>
+    <string name="setting_reset">Reset settings</string>
+    <string name="setting_reset_desc">Reset all settings to their defaults</string>
+    <string name="setting_feedback">Feedback</string>
+    <string name="setting_send_feedback">Send feedback</string>
+    <string name="setting_reset_title">Reset all settings to defaults?</string>
+    <string name="setting_reset_body">This resets every setting to its default value. Continue?</string>
+    <string name="setting_reset_action">Reset</string>
+    <string name="setting_rejected_title">Option not available</string>
+    <string name="setting_rejected_body">Request the required permission before using this option.</string>
+    <string name="setting_got_it">Got it</string>
+    <string name="setting_overlay_title">Overlay permission required</string>
+    <string name="setting_overlay_go">Open settings</string>
+    <string name="setting_restart_title">Restart required</string>
+    <string name="setting_restart_action">Restart</string>
+    <string name="setting_no_shizuku_title">Shizuku not found</string>
+    <string name="setting_shizuku_stopped_title">Shizuku service not running</string>
+    <string name="setting_perm_failed_title">Permission request failed</string>
+    <string name="setting_retry">Try again</string>
+    <string name="setting_granted">Authorized</string>
+    <string name="setting_identity_no_service">The Task Manager service is not ready yet, so the identity cannot be switched. Try again later.</string>
+    <string name="setting_identity_need_shizuku">“%1$s” needs Shizuku authorization. Request permission in the Shizuku section below, then select this identity.</string>
+    <string name="setting_identity_shell_unavailable">“%1$s” is unavailable: Shizuku is running as root, so it gives this app root capabilities instead of the shell (adb) uid 2000 identity. Select root or normal permissions instead.</string>
+    <string name="setting_identity_need_root">“%1$s” needs root permission. Request permission in the Root section below, then select this identity.</string>
+    <string name="setting_identity_invalid">Unknown identity option “%1$s”; the previous choice was kept.</string>
+    <string name="setting_overlay_body_usage">With Always on top enabled, Task Manager shows as a floating window above other apps, so you can watch processes and resource usage while using other apps.</string>
+    <string name="setting_overlay_body_steps">Android does not let apps request this permission themselves, so you need to enable it manually:\n1. Tap Open settings to open the system overlay management page;\n2. Find Task Manager and turn on that switch;\n3. Come back to this page: the setting completes automatically, and the floating window appears after you restart the app.</string>
+    <string name="setting_overlay_body_note">Note: the floating window is created only at startup and leaves gaps on all four edges, so the system and other apps stay reachable. To go back to the normal UI, turn off Always on top and restart the app; there is no need to revoke this permission.</string>
+    <string name="setting_restart_body">Always on top has been saved. Tap Restart to restart the app now; it reopens as a floating window. Tap Cancel to undo this change: the setting is not saved and the UI stays as it is.</string>
+    <string name="setting_no_shizuku_body">Shizuku is not installed on this device, so the Shell (adb) identity is unavailable.\nInstall Shizuku and start its service, then come back and request permission. Without Shizuku you can use root or normal permissions directly.</string>
+    <string name="setting_shizuku_stopped_body">Shizuku is installed but its service is not running, so authorization cannot be requested.\nTap Open Shizuku, start the service in its app, wait until it says the service is running, then come back and request permission.</string>
+    <string name="setting_fail_overlay_body">The overlay permission was not granted, so Always on top cannot be enabled for now.\nTap Try again to reopen the system overlay permission page; tap Cancel to leave everything unchanged and keep Always on top off.</string>
+    <string name="setting_fail_shizuku_body">Shizuku authorization was not granted, so the app cannot work as Shell (adb) for now.\nMake sure the Shizuku service is running on this device (open the Shizuku app until it says the service is running), then come back and tap Try again; tap Cancel to leave everything unchanged.</string>
+    <string name="setting_fail_root_body">Root permission was not granted (the device is not rooted or the request was denied).\nTap Try again to probe once more; tap Cancel to leave everything unchanged.</string>
+    <string name="setting_option_speed_high">High</string>
+    <string name="setting_option_speed_normal">Normal</string>
+    <string name="setting_option_speed_low">Low</string>
+    <string name="setting_option_speed_paused">Paused</string>
+    <string name="setting_option_precision_default">Default</string>
+    <string name="setting_option_precision_one">One decimal</string>
+    <string name="setting_option_precision_two">Two decimals</string>
+    <string name="setting_option_identity_normal">Normal permissions</string>
+    <string name="setting_option_identity_shell">Shell (adb)</string>
+    <string name="setting_option_identity_root">root</string>
+    <string name="main_processes">Processes</string>
+    <string name="data_unsupported">Unsupported</string>
+    <string name="data_virtualization_disabled">Disabled</string>
+    <string name="data_virtualization_enabled">Enabled (%1$s)</string>
+    <string name="data_state_running">Running</string>
+    <string name="data_state_sleeping">Sleeping</string>
+    <string name="data_state_uninterruptible">Uninterruptible</string>
+    <string name="data_state_zombie">Zombie</string>
+    <string name="data_state_stopped">Stopped</string>
+    <string name="data_state_traced_stop">Traced stop</string>
+    <string name="data_state_idle">Idle</string>
+    <string name="data_state_exited">Exited</string>
+    <string name="data_state_unknown">Unknown</string>
+    <string name="data_bits">%1$s-bit</string>
+    <string name="data_yes">Yes</string>
+    <string name="data_no">No</string>
+    <string name="data_zombie_suffix">%1$s (zombie process)</string>
+    <string name="data_pci_location">PCI bus %1$d, device %2$d, function %3$d</string>
+    <string name="data_vendor_samsung">Samsung</string>
+    <string name="data_vendor_qimonda">Qimonda</string>
+    <string name="data_vendor_elpida">Elpida</string>
+    <string name="data_vendor_etron">Etron</string>
+    <string name="data_vendor_nanya">Nanya</string>
+    <string name="data_vendor_hynix">Hynix</string>
+    <string name="data_vendor_mosel">Mosel</string>
+    <string name="data_vendor_winbond">Winbond</string>
+    <string name="data_vendor_esmt">ESMT</string>
+    <string name="data_vendor_spansion">Spansion</string>
+    <string name="data_vendor_sst">SST</string>
+    <string name="data_vendor_zmos">ZMOS</string>
+    <string name="data_vendor_intel">Intel</string>
+    <string name="data_vendor_numonyx">Numonyx</string>
+    <string name="data_vendor_micron">Micron</string>
+    <string name="perf_zram_detail">raw %1$s, compressed %2$s, in use %3$s</string>
+    <string name="perf_zram_detail_capacity">raw %1$s, compressed %2$s, in use %3$s, capacity %4$s</string>
+    <string name="perf_unit_mt_per_sec">%1$s MT/s</string>
+    <string name="perf_unit_ms">%1$s ms</string>
+    <string name="perf_zero_ms">0 ms</string>
+    <string name="perf_unit_gbps">GB/s</string>
+    <string name="perf_unit_mbps">MB/s</string>
+    <string name="perf_unit_kbps">KB/s</string>
+    <string name="perf_unit_bps">B/s</string>
+    <string name="perf_zero_kbps">0 KB/s</string>
+    <string name="perf_other">Other</string>
+    <string name="perf_none_short">None</string>
+    <string name="perf_link_cellular">Cellular</string>
+    <string name="perf_link_wired">Ethernet</string>
+    <string name="overlay_title">%1$s · Task Manager</string>
+    <string name="overlay_exit">Exit</string>
+    <string name="dcol_name">Name</string>
+    <string name="dcol_package">Package name</string>
+    <string name="dcol_state">Status</string>
+    <string name="dcol_user">User name</string>
+    <string name="dcol_session">Session ID</string>
+    <string name="dcol_pgid">Process group ID</string>
+    <string name="dcol_cgroup">cgroup</string>
+    <string name="dcol_cpu_usage">CPU</string>
+    <string name="dcol_cpu_time">CPU time</string>
+    <string name="dcol_cpu_cycles">CPU cycles</string>
+    <string name="dcol_rss">Working set</string>
+    <string name="dcol_peak_rss">Peak working set</string>
+    <string name="dcol_rss_delta">Working set delta</string>
+    <string name="dcol_active_private">Active private working set</string>
+    <string name="dcol_private">Private working set</string>
+    <string name="dcol_shared">Shared working set</string>
+    <string name="dcol_vss">Virtual size</string>
+    <string name="dcol_page_faults">Page faults</string>
+    <string name="dcol_page_faults_delta">Page faults delta</string>
+    <string name="dcol_nice">Base priority (Linux)</string>
+    <string name="dcol_android_priority">Base priority (Android)</string>
+    <string name="dcol_fd">File descriptors</string>
+    <string name="dcol_threads">Threads</string>
+    <string name="dcol_io_reads">I/O reads</string>
+    <string name="dcol_io_writes">I/O writes</string>
+    <string name="dcol_io_read_bytes">I/O read bytes</string>
+    <string name="dcol_io_write_bytes">I/O write bytes</string>
+    <string name="dcol_path">Path</string>
+    <string name="dcol_cmdline">Command line</string>
+    <string name="dcol_selinux">Security context</string>
+    <string name="dcol_target_sdk">Target API</string>
+    <string name="dcol_platform">Platform</string>
+    <string name="dcol_arch">Architecture</string>
+    <string name="dcol_admin">Elevated</string>
+    <string name="dcol_desc">Description</string>
+    <string name="dcol_nx">NX protection</string>
+    <string name="dcol_gpu_usage">GPU</string>
+    <string name="dcol_gpu_engine">GPU engine</string>
+    <string name="dcol_gpu_dedicated">Dedicated GPU memory</string>
+    <string name="dcol_gpu_shared">Shared GPU memory</string>
+    <string name="dcol_cet">CET</string>
+    <string name="dcol_isolation">Isolation</string>
+    <string name="svc_channel_name">Background service</string>
+    <string name="svc_channel_desc">Persistent notification of the Task Manager data hub (it keeps collecting after the UI is closed)</string>
+    <string name="svc_notif_overlay_title">Task Manager floating window running</string>
+    <string name="svc_notif_bg_title">Task Manager running in background</string>
+    <string name="svc_notif_overlay_text">Showing the monitor panel above other apps</string>
+    <string name="svc_notif_bg_text">Collecting process data; it continues after the UI is closed</string>
+    <string name="svc_rows_from_upstream">%1$d processes (filled in by upstream)</string>
+    <string name="svc_rows_empty_waiting">No processes in the table (waiting for upstream)</string>
+    <string name="svc_rows_count">%1$d processes</string>
+    <string name="svc_test_rows_note">Test data: 11 processes Test0 to Test10 (name TestN, all other stats = N)</string>
+    <string name="svc_no_process_selected">No process selected.</string>
+    <string name="svc_no_start_time">This process has no start time, so it cannot be identified.</string>
+    <string name="svc_linux_not_ready">The Linux service is not ready.</string>
+    <string name="svc_linux_no_reply">The Linux service did not respond.</string>
+    <string name="svc_process_exited">The process has already exited.</string>
+    <string name="svc_not_supported">The service does not support this operation.</string>
+    <string name="svc_bad_argument">Invalid argument.</string>
+    <string name="svc_accepted_only">The service accepted the request but did not execute it.</string>
+    <string name="svc_access_denied">Access denied.</string>
+    <string name="health_ok">OK</string>
+    <string name="health_access_denied">No permission</string>
+    <string name="health_no_data">No data</string>
+    <string name="health_read_failed">Read failed</string>
+    <string name="health_no_baseline">No baseline sample</string>
+    <string name="health_truncated">Truncated</string>
+    <string name="scope_all_processes">All processes</string>
+    <string name="scope_user_processes">User processes</string>
+    <string name="scope_system_processes">System processes</string>
+    <string name="perf_disk_index">Disk %1$d</string>
+    <string name="perf_disk_index_block">Disk %1$d (%2$s)</string>
+    <string name="devdetail_seconds_count">%1$d s</string>
+    <string name="cpuext_topology_group">Topology group</string>
+    <string name="cpuext_cluster_subtitle">%1$s · %2$d cores</string>
+    <string name="dbg_backend_waiting">Waiting for the Linux backend to start...</string>
+    <string name="dbg_unknown">Unknown</string>
+    <string name="dbg_no_v2_request">No v2 request issued yet (protocol: see section ① in data/LinuxService.kt)</string>
+    <string name="dbg_debug_output">Debug output</string>
+    <string name="dbg_no_device_snapshot">No device snapshot taken yet</string>
+    <string name="dbg_ui_not_running">UIService is not running</string>
+    <string name="dbg_not_running">Not running</string>
+    <string name="dbg_page_title">Debug and test</string>
+    <string name="dbg_intro">Starts the Linux ELF backend bundled in the APK and shows the command exchange between it and this app.</string>
+    <string name="dbg_ui_not_ready">UIService is not ready, try again later</string>
+    <string name="dbg_backend_running">Linux backend running</string>
+    <string name="dbg_start_backend_test">Start Linux backend test</string>
+    <string name="dbg_heartbeat_ok">Heartbeat OK: the backend replied PKG + pong=1 (see output above)</string>
+    <string name="dbg_heartbeat_failed">Heartbeat failed: the backend is not running, not ready, or timed out</string>
+    <string name="dbg_send_heartbeat">Send heartbeat</string>
+    <string name="dbg_stop_backend">Stop Linux backend</string>
+    <string name="dbg_v2_selfcheck">v2 request self-check (protocol: see section ① in data/LinuxService.kt)</string>
+    <string name="dbg_request_failed">Request failed: backend not running / send failed / reply timed out</string>
+    <string name="dbg_no_process_rows">(no process rows in the packet)</string>
+    <string name="dbg_query_process_snapshot">Query process snapshot</string>
+    <string name="dbg_full_snapshot">Full snapshot</string>
+    <string name="dbg_capability_failed">Capability query failed: backend not running / timed out</string>
+    <string name="dbg_query_capability">Query capabilities</string>
+    <string name="dbg_reinit_ok">Control reply: REINIT succeeded (the service rebuilt its capture context)</string>
+    <string name="dbg_control_failed">Control failed: backend not running / timed out / rejected by the service</string>
+    <string name="dbg_control_reinit">Control: re-probe context</string>
+    <string name="dbg_dump_ok">Control reply: DUMP_STATE succeeded (internal state dumped, see output above)</string>
+    <string name="dbg_control_dump">Control: dump state</string>
+    <string name="dbg_perf_test_devices">Performance page: test devices</string>
+    <string name="dbg_show_all_networks">Show all network adapters (ignore registration rules)</string>
+    <string name="dbg_test_nic">Test network adapter</string>
+    <string name="dbg_test_disk">Test disk</string>
+    <string name="dbg_test_gpu">Test GPU</string>
+    <string name="dbg_clear_test_devices">Clear test devices</string>
+    <string name="dbg_copy_output">Copy output</string>
+    <string name="dbg_device_snapshot">Device snapshot</string>
+    <string name="dbg_device_snapshot_desc">Takes one device snapshot frame from the Linux service and lists every parsed device instance with its fields and missing values.</string>
+    <string name="dbg_no_d_rows">(no D-row devices in the packet; the backend may not be ready or its version is unsupported)</string>
+    <string name="dbg_output_device_snapshot">Output device snapshot</string>
+    <string name="dbg_restart_android_desc">Restart the Android service: relaunch it under the current identity and print the identity self-check again in the output.</string>
+    <string name="dbg_restart_android">Restart Android service</string>
+    <string name="dbg_details_test_data">Details page test data</string>
+    <string name="dbg_details_test_data_desc">Adds 11 processes Test0 to Test10 (name TestN, every other stat = N) to observe table sorting, selection and horizontal scrolling cost.</string>
+    <string name="dbg_add_test_rows">Add Test0 to Test10</string>
+    <string name="dbg_test_result">Test result</string>
+    <string name="dbg_upstream_output">Upstream service output</string>
+    <string name="dbg_request_line">Request: REQ #%1$d %2$s mask=%3$s</string>
+    <string name="dbg_reply">Reply: %1$s</string>
+    <string name="dbg_first_row">First row pid=%1$d, %2$d fields:</string>
+    <string name="dbg_no_value_fields">Fields without value:</string>
+    <string name="dbg_raw_lines">Raw lines: %1$d</string>
+    <string name="dbg_raw_lines_colon">Raw lines: %1$d</string>
+    <string name="dbg_raw_lines_detail">Raw lines: %1$d (1 header + %2$d processes)</string>
+    <string name="dbg_more_processes">… %1$d more processes not listed</string>
+    <string name="dbg_field_table">Local field table: %1$d entries, ALL=0x%2$s</string>
+    <string name="dbg_injected_now">Currently injected: %1$s</string>
+    <string name="dbg_note_reference">Note: %1$s — the content below is for reference only</string>
+    <string name="dbg_packet_unusable">packet unusable</string>
+    <string name="dbg_extra_info">Extra info: %1$d entries:</string>
+    <string name="dbg_devices_count">%1$d device(s):</string>
+    <string name="dbg_device_line">%1$s  type=%2$s  %3$d fields</string>
+    <string name="dbg_rows_added">Added %1$d rows (Test0 to Test10; repeated taps only refresh)</string>
+    <string name="dbg_upstream_output_desc">Recent run records of AndroidService and LinuxService (backend identity: %1$s)</string>
+    <string name="dbg_perf_test_devices_desc">Injects test devices that carry no data into the performance page: one more per tap, and the matching entry shows up immediately (test disks go to “Disk N”, test adapters to “WLAN”, test GPUs to “GPU N”). It does not affect real capture; the clear button removes them all at once.</string>
+    <string name="dbg_show_all_networks_desc">When checked, every network adapter in the low-level snapshot is registered as a performance page device, including ones normally hidden: p2p0, an unconnected wlan0, an rmnet carrying only fe80::, the VPN tun0, and so on. They still have no data (details show “Not supported”, rate is 0). The switch lasts only for this run and resets when the app restarts. Devices the low level never captured, such as the loopback lo, do not appear just because the box is checked.</string>
+    <string name="dbg_no_value_summary">Fields without value, summarized:</string>
+    <string name="dbg_inject_counts">%1$d empty disks · %2$d empty adapters · %3$d empty GPUs</string>
+    <string name="perf_type_cellular">Cellular</string>
+    <string name="perf_type_ethernet">Ethernet</string>
+    <string name="data_isolated">Isolated</string>
+    <string name="data_not_isolated">Not isolated</string>
+    <string name="svc_detail_waiting_upstream">Waiting for upstream data…</string>
+    <string name="svc_android_not_ready_starting">The Android service is starting…</string>
+    <string name="svc_linux_not_ready_starting">The Linux service is starting…</string>
+    <string name="svc_not_started">Not started</string>
+    <string name="lsvc_packet_incomplete">Incomplete packet</string>
+    <string name="lsvc_not_from_service">Sender is not the service</string>
+    <string name="lsvc_identity_mode_privileged">Identity mode: prefer elevation (%1$s), fall back to the app identity</string>
+    <string name="lsvc_identity_mode_app">Identity mode: the UID of the app itself</string>
+    <string name="lsvc_identity_mode_changed">Identity mode changed: recycle the backend of the old identity, then restart under the new one</string>
+    <string name="lsvc_identity_exited">%1$s (exited)</string>
+    <string name="lsvc_elf_missing">ELF not found: %1$s</string>
+    <string name="lsvc_shizuku_uid2000_fallback">Target identity is uid=2000; Shizuku could not start the process, falling back to the app identity</string>
+    <string name="lsvc_shizuku_root_failed_fallback">Target identity is uid=0; neither Shizuku(root) nor su could start the process, falling back to the app identity</string>
+    <string name="lsvc_started">Started %1$s</string>
+    <string name="lsvc_start_failed">Start failed: %1$s</string>
+    <string name="lsvc_shizuku_not_granted">Shizuku is not granted; skipping this path</string>
+    <string name="lsvc_shizuku_uid_mismatch">The target is uid=0 but Shizuku is currently uid=2000; skipping this path</string>
+    <string name="lsvc_shizuku_spawn_failed">Shizuku failed to start the process</string>
+    <string name="lsvc_root_spawn_failed">Root failed to start the process</string>
+    <string name="lsvc_returned_null">" (returned null)"</string>
+    <string name="lsvc_reason_paren">" (%1$s)"</string>
+    <string name="lsvc_started_as_identity">Started %2$s as %1$s</string>
+    <string name="lsvc_root_unavailable">Root unavailable (no su or not granted); skipping this path</string>
+    <string name="lsvc_started_as_root">Started %1$s as uid=0</string>
+    <string name="lsvc_backend_stopped">backend stopped</string>
+    <string name="lsvc_stop_requested">Asked the Linux backend to stop (SHUTDOWN control packet)</string>
+    <string name="lsvc_send_failed">Send failed: %1$s</string>
+    <string name="lsvc_pipe_write_failed">failed to write to the pipe</string>
+    <string name="lsvc_defer_request">Request deferred: the backend is not ready yet (no READY received)</string>
+    <string name="lsvc_control_failed_not_running">Control failed: the backend is not running (%1$s)</string>
+    <string name="lsvc_defer_device_snapshot">Device snapshot deferred: the backend is not ready yet (no READY received)</string>
+    <string name="lsvc_device_snapshot_discarded">Device snapshot discarded: %1$s</string>
+    <string name="lsvc_defer_device_ext">Extended device snapshot deferred: the backend is not ready yet (no READY received)</string>
+    <string name="lsvc_device_ext_discarded">Extended device snapshot discarded: %1$s</string>
+    <string name="lsvc_kill_rejected">KILL rejected: pid and start_ticks are required (pid=%1$s, startTicks=%2$s)</string>
+    <string name="lsvc_kill_failed_not_running">KILL failed: the backend is not running (pid=%1$s)</string>
+    <string name="lsvc_request_failed_not_running">Request failed: the backend is not running (%1$s)</string>
+    <string name="lsvc_request_timeout">Request timed out (seq=%1$s %2$s mask=%3$s)</string>
+    <string name="lsvc_reply">Reply %1$s</string>
+    <string name="lsvc_empty_packet">#%1$s (empty packet)</string>
+    <string name="lsvc_backend_ready">Backend ready (READY)</string>
+    <string name="lsvc_orphan_reply">Ignoring unmatched reply (seq=%1$s): the request timed out or was cancelled</string>
+    <string name="lsvc_interrupted_packet">Previous packet not fully received (seq=%1$s, got %2$s of %3$s); finishing it as incomplete</string>
+    <string name="lsvc_process_line_parse_failed">Failed to parse a process row, skipped: %1$s</string>
+    <string name="lsvc_device_header_parse_failed">Failed to parse a device header, skipped: %1$s</string>
+    <string name="lsvc_packet_incomplete_detail">Incomplete packet (seq=%1$s): received %2$s data rows but the header claims %3$s</string>
+    <string name="lsvc_fail_all">%1$s: %2$s in-flight requests, all released (returned empty)</string>
+    <string name="lsvc_backend_no_output">Linux backend started, no output yet</string>
+    <string name="lsvc_backend_not_started">Linux backend not started</string>
+    <string name="lsvc_backend_exited">Linux backend exited (previous identity: %1$s)</string>
+    <string name="lsvc_backend_running_identity">Linux backend running (identity: %1$s)</string>
+    <string name="lsvc_backend_running_app">Linux backend running (identity: the UID of the app itself)</string>
+    <string name="lsvc_line_too_long">Dropped an overlong line (%1$s bytes, limit %2$s)</string>
+    <string name="lsvc_read_output_interrupted">Reading output interrupted: %1$s</string>
+    <string name="lsvc_output_pipe_closed">the backend output pipe was closed</string>
+    <string name="lsvc_backend_exited_code">Linux backend exited (exitCode=%1$s)</string>
+    <string name="asvc_identity_switch_privileged">Identity switch: elevation mode (prefer %1$s, applies only when available)</string>
+    <string name="asvc_identity_switch_app">Identity switch: the UID of the app itself</string>
+    <string name="asvc_skip_elevation_selfcheck">Skipped the elevation self-check (not in elevation mode)</string>
+    <string name="asvc_data_elevated">data collection may elevate</string>
+    <string name="asvc_data_app">data collection uses the app identity only</string>
+    <string name="asvc_identity_line">Android UID: %1$s | %2$s</string>
+    <string name="asvc_app_index_ready">App index ready: %1$s uids / %2$s packages</string>
+    <string name="asvc_avf_supported">AVF supported: %1$s</string>
+    <string name="asvc_not_read">not read</string>
+    <string name="asvc_no_output_yet">(no output yet)</string>
+    <string name="asvc_output_header">== AndroidService output ==</string>
+    <string name="asvc_elevation_selfcheck_failed">Elevation self-check failed: neither path worked</string>
+    <string name="asvc_elevation_selfcheck_error">Elevation self-check error: %1$s %2$s</string>
+    <string name="asvc_shizuku_selfcheck_skipped">Shizuku self-check skipped: not granted</string>
+    <string name="asvc_shizuku_selfcheck_error">Shizuku self-check error: %1$s</string>
+    <string name="asvc_root_selfcheck_skipped">Root self-check skipped: no su or not granted</string>
+    <string name="asvc_root_selfcheck_error">Root self-check error: %1$s</string>
+    <string name="asvc_selfcheck">Self-check: %1$s</string>
+    <string name="asvc_read_output_failed">Failed to read output: %1$s</string>
+    <string name="copy_disk_name">\tName:\t</string>
+    <string name="copy_disk_capacity">\tCapacity:\t</string>
+    <string name="copy_disk_formatted">\tFormatted:\t</string>
+    <string name="copy_disk_system">\tSystem disk:\t</string>
+    <string name="copy_disk_pagefile">\tPage file:\t</string>
+    <string name="copy_disk_type">\tType:\t</string>
+    <string name="copy_disk_active">\tActive time\t</string>
+    <string name="copy_disk_response">\tAverage response time\t</string>
+    <string name="copy_disk_read">\tRead speed\t</string>
+    <string name="copy_disk_write">\tWrite speed\t</string>
+    <string name="copy_net_name">\tAdapter name:\t</string>
+    <string name="copy_net_link">\tConnection type:\t</string>
+    <string name="copy_net_ipv4">\tIPv4 address:\t</string>
+    <string name="copy_net_ipv6">\tIPv6 address:\t</string>
+    <string name="copy_net_signal">\tSignal strength:\t</string>
+    <string name="copy_net_throughput">\tThroughput\t</string>
+    <string name="copy_net_send">\tSent\t</string>
+    <string name="copy_net_receive">\tReceived\t</string>
+    <string name="copy_mem_speed">\tSpeed:\t</string>
+    <string name="copy_mem_slots">\tSlots in use:\t</string>
+    <string name="copy_mem_formfactor">\tForm factor:\t</string>
+    <string name="copy_mem_reserved">\tMemory reserved for hardware:\t</string>
+    <string name="copy_mem_available">\tAvailable\t</string>
+    <string name="copy_mem_cached">\tCached\t</string>
+    <string name="copy_mem_committed">\tCommitted\t</string>
+    <string name="copy_mem_reclaimable">\tReclaimable kernel cache\t</string>
+    <string name="copy_mem_nonreclaimable">\tNon-reclaimable kernel cache\t</string>
+    <string name="copy_mem_used_compressed">\tIn use (compressed)\t</string>
+    <string name="copy_cpu_base">\tBase speed:\t</string>
+    <string name="copy_cpu_sockets">\tSockets:\t</string>
+    <string name="copy_cpu_cores">\tCores:\t</string>
+    <string name="copy_cpu_logical">\tLogical processors:\t</string>
+    <string name="copy_cpu_vm">\tVirtual machine:\t</string>
+    <string name="copy_cpu_virt">\tVirtualization:\t</string>
+    <string name="copy_cpu_avf">\tAVF supported:\t</string>
+    <string name="copy_cpu_l1">\tL1 cache:\t</string>
+    <string name="copy_cpu_l2">\tL2 cache:\t</string>
+    <string name="copy_cpu_l3">\tL3 cache:\t</string>
+    <string name="copy_cpu_util">\tUtilization\t</string>
+    <string name="copy_cpu_speed">\tSpeed\t</string>
+    <string name="copy_cpu_uptime">\tUptime\t</string>
+    <string name="copy_cpu_processes">\tProcesses\t</string>
+    <string name="copy_cpu_threads">\tThreads\t</string>
+    <string name="copy_cpu_fds">\tFile descriptors\t</string>
+    <string name="copy_gpu_name">\tName:\t</string>
+    <string name="copy_gpu_util">\tUtilization:\t</string>
+    <string name="copy_gpu_dedicated">\tDedicated GPU memory:\t</string>
+    <string name="copy_gpu_shared">\tShared GPU memory:\t</string>
+    <string name="copy_gpu_total">\tGPU memory:\t</string>
+    <string name="copy_gpu_driver_version">\tDriver version:\t</string>
+    <string name="copy_gpu_driver_date">\tDriver date:\t</string>
+    <string name="copy_gpu_vulkan">\tVulkan version:\t</string>
+    <string name="copy_gpu_opengl">\tOpenGL ES version:\t</string>
+    <string name="copy_gpu_location">\tPhysical location:\t</string>
+    <string name="copy_gpu_reserved">\tMemory reserved for hardware:\t</string>
+    <string name="copy_gpu_temp">\tTemperature:\t</string>
+    <string name="setting_a11y_top_window">Use accessibility permission to stay on top</string>
+    <string name="setting_a11y_top_window_desc">For debugging system windows: draws above them through accessibility. Works only together with Always on top, which then needs no overlay permission.</string>
+    <string name="setting_a11y_title">Accessibility permission required</string>
+    <string name="setting_a11y_body_usage">With this option on, Task Manager draws its window above system windows through the accessibility service, which is what you need when debugging system windows. On its own it creates no window: Always on top must be on as well.</string>
+    <string name="setting_a11y_body_steps">Android does not let apps grant this permission themselves, so you need to enable it manually:\n1. Tap Open settings to open the system accessibility page;\n2. Find Task Manager and turn its service on;\n3. Come back to this page: the setting completes automatically.</string>
+    <string name="setting_a11y_body_note">Note: revoking the accessibility permission only turns this option off. If overlay permission is still granted, Always on top keeps running as a normal floating window; both are turned off only when overlay permission is also missing.</string>
+    <string name="setting_fail_a11y_body">Accessibility permission was not granted, so this option cannot be enabled for now.\nTap Try again to reopen the system accessibility page; tap Cancel to leave everything unchanged and keep the option off.</string>
+    <string name="a11y_service_label">Task Manager - Accessibility window on top</string>
+    <string name="a11y_service_desc">Lets Task Manager place its window above system windows for debugging them. Only used when the accessibility top option in the app is on.</string>
 </resources>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

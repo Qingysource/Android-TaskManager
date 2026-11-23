@@ -16,6 +16,9 @@
  */
 package com.android.taskmanager
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Box
@@ -57,7 +60,7 @@ import androidx.compose.ui.unit.dp
  * 详细信息类页面的统一骨架。
  *
  * @param title 标题栏上的页名
- * @param backDescription 返回按钮的无障碍说明（"返回性能页" / "返回" 之类）
+ * @param backDescription 返回按钮的无障碍说明（"返回性能页" / AppStrings.s(R.string.common_back) 之类）
  * @param onBack 点返回箭头要做什么（关掉这一页、回到原来的页面）
  * @param cardText 工作区中央那张占位卡片上的字；传空串就不摆卡片
  * @param content 追加到工作区里的内容（以后真控件从这里进来），默认没有
@@ -66,8 +69,8 @@ import androidx.compose.ui.unit.dp
 internal fun DetailCanvasPage(
     title: String,
     onBack: () -> Unit,
-    backDescription: String = "返回",
-    cardText: String = "测试页面",
+    backDescription: String = AppStrings.s(R.string.common_back),
+    cardText: String = AppStrings.s(R.string.common_test_page),
     content: @Composable BoxScope.() -> Unit = {}
 ) {
     // 控件相对"正中"的位移（dp）：初始都是 0，也就是居中；拖动只改这两个值

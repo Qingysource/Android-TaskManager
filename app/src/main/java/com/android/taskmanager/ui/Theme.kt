@@ -7,11 +7,11 @@
  * 只做"选颜色"，不做业务：谁想改配色，改这里；页面只管用 MaterialTheme.colorScheme。
  *
  * 三条规则（按优先级从高到低）：
- * 1. 设置 = "使用系统设置" → 跟随系统的深 / 浅色（isSystemInDarkTheme），
+ * 1. 设置 = AppStrings.s(R.string.theme_system) → 跟随系统的深 / 浅色（isSystemInDarkTheme），
  *    并默认使用系统的动态取色（Monet）；系统不支持动态取色时，静默回落到项目默认色板，
  *    **不给任何提示**（用户没要求被告知，弹提示只会干扰）。
- * 2. 设置 = "浅色" / "深色" → 强制该模式，但动态取色策略不变（仍然是"能用就用"）。
- * 3. 设置值非法（配置文件被手改坏）→ 当成"使用系统设置"，不让一个脏值把界面搞成空白。
+ * 2. 设置 = AppStrings.s(R.string.theme_light) / AppStrings.s(R.string.theme_dark) → 强制该模式，但动态取色策略不变（仍然是"能用就用"）。
+ * 3. 设置值非法（配置文件被手改坏）→ 当成AppStrings.s(R.string.theme_system)，不让一个脏值把界面搞成空白。
  *
  * 为什么主题状态放在一个进程级可变状态里，而不是塞进 Activity：
  * - 主界面（MainActivity）和浮窗（UIService 里的 ComposeView）是同一进程里的两处界面，
@@ -23,6 +23,10 @@
  * 即可回到"永远是浅色"的旧行为，本文件可整篇删除。
  */
 package com.android.taskmanager
+
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
+import com.android.taskmanager.SettingsCatalog
 
 import android.app.Activity
 import android.content.Context
@@ -49,14 +53,22 @@ import androidx.core.view.WindowCompat
 // 主题取值（与 SettingsCatalog.THEMES 一一对应）
 // ============================================================
 
-/** "使用系统设置"：跟随系统的深浅色，并优先使用动态取色。 */
-const val THEME_MODE_SYSTEM: String = "使用系统设置"
+/**
+ * 主题取值（内部标识，与 SettingsCatalog.THEMES 一一对应）。
+ *
+ * 注意：这里是**存入设置文件的值**，不是界面上显示的文字。
+ * 显示名（使用系统设置 / 浅色 / 深色）由设置页按这三个值映射到 R.string，
+ * 所以切换系统语言时界面会变、存的值不变——这正是 i18n 想要的行为。
+ */
 
-/** "浅色"：强制浅色。 */
-const val THEME_MODE_LIGHT: String = "浅色"
+/** 跟随系统的深浅色，并优先使用动态取色。 */
+const val THEME_MODE_SYSTEM: String = SettingsCatalog.THEME_SYSTEM
 
-/** "深色"：强制深色。 */
-const val THEME_MODE_DARK: String = "深色"
+/** 强制浅色。 */
+const val THEME_MODE_LIGHT: String = SettingsCatalog.THEME_LIGHT
+
+/** 强制深色。 */
+const val THEME_MODE_DARK: String = SettingsCatalog.THEME_DARK
 
 /**
  * 主题模式的进程内共享状态。
@@ -131,7 +143,7 @@ internal fun TaskManagerTheme(
 
         THEME_MODE_LIGHT -> false
 
-        // "使用系统设置"：跟随系统的深 / 浅色开关
+        // AppStrings.s(R.string.theme_system)：跟随系统的深 / 浅色开关
         else -> isSystemInDarkTheme()
     }
 

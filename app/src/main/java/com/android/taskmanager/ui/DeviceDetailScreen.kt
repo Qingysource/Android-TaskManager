@@ -33,6 +33,9 @@
  */
 package com.android.taskmanager
 
+import com.android.taskmanager.AppStrings
+import com.android.taskmanager.R
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -172,7 +175,7 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
     var intervalMs by remember { mutableStateOf(0L) }
 
     // 没数据时的一句话说明：只写事实（后端没就绪 / 没报告核心），不猜原因
-    var emptyNote by remember { mutableStateOf("正在读取…") }
+    var emptyNote by remember { mutableStateOf(AppStrings.s(R.string.devdetail_reading)) }
 
     // 选中的逻辑核号；null = 还没点过，默认用第一颗
     var selectedCoreId by remember { mutableStateOf<Int?>(null) }
@@ -200,7 +203,7 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
                     emptyNote = ""
                 } else if (frame == null) {
 
-                    emptyNote = "还没有数据：后端未就绪，或这台后端不支持设备扩展快照（typeCode=6）"
+                    emptyNote = AppStrings.s(R.string.devdetail_empty)
                 }
             }
 
@@ -233,7 +236,7 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
     val selected = cores.firstOrNull { it.id == selectedCoreId } ?: cores.firstOrNull()
 
     DetailCanvasPage(
-        title = "设备详细信息",
+        title = AppStrings.s(R.string.devdetail_title),
 
         onBack = onBack,
 
@@ -272,13 +275,13 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
                     Spacer(modifier = Modifier.height(12.dp))
 
                     // 第一项：处理器扩展信息
-                    SectionTitle("处理器扩展信息")
+                    SectionTitle(AppStrings.s(R.string.devdetail_processor))
 
                     Spacer(modifier = Modifier.height(8.dp))
 
                     if (cores.isEmpty()) {
 
-                        EmptyHint(text = emptyNote.ifEmpty { "还没有数据" })
+                        EmptyHint(text = emptyNote.ifEmpty { AppStrings.s(R.string.devdetail_no_data) })
                     } else {
 
                         // 分区顺序按簇序号：Cluster 0 在最上面
@@ -304,7 +307,7 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
                     Spacer(modifier = Modifier.height(4.dp))
 
                     // 第二项：图形下面那排选择用的小 chips
-                    SectionTitle("核心 Chips")
+                    SectionTitle(AppStrings.s(R.string.devdetail_cores))
 
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -318,13 +321,13 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
                         )
                     } else {
 
-                        EmptyHint(text = "暂无核心")
+                        EmptyHint(text = AppStrings.s(R.string.devdetail_no_cores))
                     }
 
                     Spacer(modifier = Modifier.height(16.dp))
 
                     // 第三项：选中核心的详情（每个字段连"为什么没值"一起写）
-                    SectionTitle("选中核心详情")
+                    SectionTitle(AppStrings.s(R.string.devdetail_selected_core))
 
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -336,7 +339,7 @@ internal fun DeviceDetailPage(onBack: () -> Unit) {
                         )
                     } else {
 
-                        EmptyHint(text = "点上面任意一颗核心")
+                        EmptyHint(text = AppStrings.s(R.string.devdetail_pick_core))
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
@@ -352,11 +355,11 @@ private fun RefreshNote(intervalMs: Long, hasService: Boolean) {
 
     val text = when {
 
-        !hasService -> "正在连接服务…"
+        !hasService -> AppStrings.s(R.string.devdetail_connecting)
 
-        intervalMs <= 0L -> "实时更新：已暂停（设置页的更新速度为「已暂停」时不采集）"
+        intervalMs <= 0L -> AppStrings.s(R.string.devdetail_paused)
 
-        else -> "实时更新：每 " + formatInterval(intervalMs) + " 刷新一次"
+        else -> AppStrings.s(R.string.devdetail_every) + formatInterval(intervalMs) + AppStrings.s(R.string.devdetail_refresh_once)
     }
 
     Text(
@@ -370,7 +373,11 @@ private fun RefreshNote(intervalMs: Long, hasService: Boolean) {
 
 /** 间隔转文案：0.5 秒 / 1 秒 / 4 秒 —— 只在这几个档位出现，不做通用换算。 */
 private fun formatInterval(intervalMs: Long): String =
-    if (intervalMs % 1000L == 0L) "${intervalMs / 1000L} 秒" else "%.1f 秒".format(intervalMs / 1000.0)
+    if (intervalMs % 1000L == 0L) {
+        AppStrings.s(R.string.devdetail_seconds_count, intervalMs / 1000L)
+    } else {
+        AppStrings.s(R.string.devdetail_seconds_decimal, intervalMs / 1000.0)
+    }
 
 /** 分区 / 详情区的小标题。 */
 @Composable
@@ -574,13 +581,13 @@ private fun CoreChip(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        ChipFieldRow(label = "当前", value = core.curText())
+        ChipFieldRow(label = AppStrings.s(R.string.devdetail_current), value = core.curText())
 
-        ChipFieldRow(label = "最大", value = core.maxText())
+        ChipFieldRow(label = AppStrings.s(R.string.devdetail_max), value = core.maxText())
 
-        ChipFieldRow(label = "最小", value = core.minText())
+        ChipFieldRow(label = AppStrings.s(R.string.devdetail_min), value = core.minText())
 
-        ChipFieldRow(label = "设置最大", value = core.scalingMaxText())
+        ChipFieldRow(label = AppStrings.s(R.string.devdetail_set_max), value = core.scalingMaxText())
     }
 }
 
@@ -801,7 +808,7 @@ private fun SelectedCoreDetail(core: CpuCoreExt, cluster: CpuClusterExt?) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            DetailRow("利用率", core.displayOf("usage_percent"))
+            DetailRow(AppStrings.s(R.string.perf_utilization), core.displayOf("usage_percent"))
 
             HorizontalDivider(
                 modifier = Modifier.padding(vertical = 2.dp),
@@ -809,13 +816,13 @@ private fun SelectedCoreDetail(core: CpuCoreExt, cluster: CpuClusterExt?) {
                 color = MaterialTheme.colorScheme.outlineVariant
             )
 
-            DetailRow("当前频率", core.displayOf("cur_mhz"))
+            DetailRow(AppStrings.s(R.string.devdetail_current_freq), core.displayOf("cur_mhz"))
 
-            DetailRow("最大频率", core.displayOf("max_mhz"))
+            DetailRow(AppStrings.s(R.string.devdetail_max_freq), core.displayOf("max_mhz"))
 
-            DetailRow("最小频率", core.displayOf("min_mhz"))
+            DetailRow(AppStrings.s(R.string.devdetail_min_freq), core.displayOf("min_mhz"))
 
-            DetailRow("设置的最大频率", core.displayOf("scaling_max_mhz"))
+            DetailRow(AppStrings.s(R.string.devdetail_set_max_freq), core.displayOf("scaling_max_mhz"))
         }
     }
 }

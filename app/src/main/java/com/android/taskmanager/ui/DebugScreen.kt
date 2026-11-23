@@ -104,7 +104,7 @@ fun DebugScreen() {
 
     // 后端输出的镜像：由上方的轮询写入，页面只读
     var output by remember {
-        mutableStateOf("等待 Linux Backend 启动...")
+        mutableStateOf(AppStrings.s(R.string.dbg_backend_waiting))
     }
 
     // 后端是否在跑：决定按钮文案与可用性
@@ -128,7 +128,7 @@ fun DebugScreen() {
 
     // 后端当前身份（shell / 应用 UID），用于在页面上直接说明"是谁在跑"
     var backendIdentity by remember {
-        mutableStateOf("未知")
+        mutableStateOf(AppStrings.s(R.string.dbg_unknown))
     }
 
     // UIService 是否就绪：没起来时按钮点了也没意义，提前说清楚
@@ -143,7 +143,7 @@ fun DebugScreen() {
      * 这里的结果要留到用户看清为止，所以只在点按钮时更新。
      */
     var packetOutput by remember {
-        mutableStateOf("尚未发起 v2 请求（协议见 data/LinuxService.kt ① 段）")
+        mutableStateOf(AppStrings.s(R.string.dbg_no_v2_request))
     }
 
     /**
@@ -158,7 +158,7 @@ fun DebugScreen() {
         val manager = context.getSystemService(android.content.ClipboardManager::class.java)
 
         manager?.setPrimaryClip(
-            android.content.ClipData.newPlainText("调试输出", value)
+            android.content.ClipData.newPlainText(AppStrings.s(R.string.dbg_debug_output), value)
         )
     }
 
@@ -169,7 +169,7 @@ fun DebugScreen() {
      * 放在同一个框里会互相覆盖，看不出哪一行属于哪一次请求。
      */
     var deviceOutput by remember {
-        mutableStateOf("尚未取过设备快照")
+        mutableStateOf(AppStrings.s(R.string.dbg_no_device_snapshot))
     }
 
     // 主线程 Handler：轮询线程不能直接改 Compose 状态，统一 post 回主线程
@@ -187,15 +187,15 @@ fun DebugScreen() {
             mainHandler.post {
                 serviceReady = service != null
 
-                output = service?.linuxBackendOutput() ?: "UIService 尚未启动"
+                output = service?.linuxBackendOutput() ?: AppStrings.s(R.string.dbg_ui_not_running)
                 isRunning = service?.isLinuxBackendRunning == true
 
                 // 第二项：两个上游服务各自的输出，与上面的"测试结果"分开取
                 upstream = service?.upstreamOutput() ?: UpstreamOutput()
 
                 backendIdentity = when {
-                    !isRunning -> "未运行"
-                    else -> service?.linuxBackendIdentity() ?: "未知"
+                    !isRunning -> AppStrings.s(R.string.dbg_not_running)
+                    else -> service?.linuxBackendIdentity() ?: AppStrings.s(R.string.dbg_unknown)
                 }
             }
 
@@ -238,7 +238,7 @@ fun DebugScreen() {
             )
 
             Text(
-                text = "调试与测试",
+                text = AppStrings.s(R.string.dbg_page_title),
 
                 style = MaterialTheme.typography.headlineSmall,
 
@@ -267,7 +267,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "启动 APK 内置的 Linux ELF 后端，并读取它与本应用之间的命令往来。",
+            text = AppStrings.s(R.string.dbg_intro),
 
             style = MaterialTheme.typography.bodyMedium,
 
@@ -304,7 +304,7 @@ fun DebugScreen() {
 
                     if (service == null) {
                         withContext(Dispatchers.Main) {
-                            output = "UIService 尚未就绪，请稍后重试"
+                            output = AppStrings.s(R.string.dbg_ui_not_ready)
                         }
 
                         return@launch
@@ -344,7 +344,7 @@ fun DebugScreen() {
             )
 
             Text(
-                if (isRunning) "Linux Backend 运行中" else "启动 Linux Backend 测试"
+                if (isRunning) AppStrings.s(R.string.dbg_backend_running) else AppStrings.s(R.string.dbg_start_backend_test)
             )
         }
 
@@ -360,11 +360,11 @@ fun DebugScreen() {
                     val service = UIService.instanceOrNull()
 
                     val text = when {
-                        service == null -> "UIService 尚未就绪，请稍后重试"
+                        service == null -> AppStrings.s(R.string.dbg_ui_not_ready)
 
-                        service.pingLinuxSvc() -> "心跳成功：后端回了 PKG + pong=1（见上方输出）"
+                        service.pingLinuxSvc() -> AppStrings.s(R.string.dbg_heartbeat_ok)
 
-                        else -> "心跳失败：后端没在运行，或尚未就绪 / 超时"
+                        else -> AppStrings.s(R.string.dbg_heartbeat_failed)
                     }
 
                     withContext(Dispatchers.Main) {
@@ -385,7 +385,7 @@ fun DebugScreen() {
                 modifier = Modifier.width(8.dp)
             )
 
-            Text("发送心跳")
+            Text(AppStrings.s(R.string.dbg_send_heartbeat))
         }
 
         Spacer(
@@ -402,7 +402,7 @@ fun DebugScreen() {
 
             enabled = serviceReady && isRunning
         ) {
-            Text("停止 Linux Backend")
+            Text(AppStrings.s(R.string.dbg_stop_backend))
         }
 
         Spacer(
@@ -418,7 +418,7 @@ fun DebugScreen() {
         // ====================================================
 
         Text(
-            text = "v2 请求包自检（协议见 data/LinuxService.kt ① 段）",
+            text = AppStrings.s(R.string.dbg_v2_selfcheck),
 
             style = MaterialTheme.typography.titleSmall,
 
@@ -441,29 +441,27 @@ fun DebugScreen() {
                         val service = UIService.instanceOrNull()
 
                         val text = if (service == null) {
-                            "UIService 尚未就绪，请稍后重试"
+                            AppStrings.s(R.string.dbg_ui_not_ready)
                         } else {
 
                             val packet = service.GetDataFromLinuxSvc(LinuxField.ALL)
 
                             if (packet == null) {
-                                "请求失败：后端未运行 / 发送失败 / 等待应答超时"
+                                AppStrings.s(R.string.dbg_request_failed)
                             } else buildString {
 
                                 appendLine(
-                                    "请求：REQ #${packet.seq} " +
-                                        "${LinuxRequestType.nameOf(packet.typeCode)} " +
-                                        "mask=${LinuxField.describe(packet.mask)}"
+                                    AppStrings.s(R.string.dbg_request_line, packet.seq, LinuxRequestType.nameOf(packet.typeCode), LinuxField.describe(packet.mask))
                                 )
 
-                                appendLine("应答：${packet.summary()}")
+                                appendLine(AppStrings.s(R.string.dbg_reply, packet.summary()))
 
                                 val first = packet.processes.firstOrNull()
 
                                 if (first == null) {
-                                    appendLine("（包里没有进程行）")
+                                    appendLine(AppStrings.s(R.string.dbg_no_process_rows))
                                 } else {
-                                    appendLine("首行 pid=${first.pid}，字段 ${first.fields.size} 个：")
+                                    appendLine(AppStrings.s(R.string.dbg_first_row, first.pid, first.fields.size))
 
                                     appendLine(
                                         first.fields.entries.joinToString("  ") {
@@ -474,7 +472,7 @@ fun DebugScreen() {
                                     // 字段级状态：这些是"没有数值"的格子（不是 0）
                                     if (first.statuses.isNotEmpty()) {
                                         appendLine(
-                                            "无值字段：" +
+                                            AppStrings.s(R.string.dbg_no_value_fields) +
                                                 first.statuses.entries.joinToString("  ") {
                                                     "${it.key}=!${it.value}"
                                                 }
@@ -482,7 +480,7 @@ fun DebugScreen() {
                                     }
                                 }
 
-                                append("原始行 ${packet.raw.size} 行")
+                                append(AppStrings.s(R.string.dbg_raw_lines, packet.raw.size))
                             }
                         }
 
@@ -494,7 +492,7 @@ fun DebugScreen() {
 
                 enabled = serviceReady && isRunning
             ) {
-                Text("查询进程快照")
+                Text(AppStrings.s(R.string.dbg_query_process_snapshot))
             }
 
             // 完整快照：一次要全部 43 列，把每个进程的每一格都打出来。
@@ -507,17 +505,17 @@ fun DebugScreen() {
                         val service = UIService.instanceOrNull()
 
                         val text = if (service == null) {
-                            "UIService 尚未就绪，请稍后重试"
+                            AppStrings.s(R.string.dbg_ui_not_ready)
                         } else {
 
                             val packet = service.GetDataFromLinuxSvc(LinuxField.ALL)
 
                             if (packet == null) {
-                                "请求失败：后端未运行 / 发送失败 / 等待应答超时"
+                                AppStrings.s(R.string.dbg_request_failed)
                             } else buildString {
 
-                                appendLine("应答：${packet.summary()}")
-                                appendLine("原始行：${packet.raw.size} 行（包头 1 + 进程 ${packet.processes.size}）")
+                                appendLine(AppStrings.s(R.string.dbg_reply, packet.summary()))
+                                appendLine(AppStrings.s(R.string.dbg_raw_lines_detail, packet.raw.size, packet.processes.size))
                                 appendLine()
 
                                 val shown = packet.processes.take(FULL_SNAPSHOT_LINES)
@@ -540,7 +538,7 @@ fun DebugScreen() {
 
                                 if (packet.processes.size > shown.size) {
                                     appendLine(
-                                        "…… 其余 ${packet.processes.size - shown.size} 个进程未列出"
+                                        AppStrings.s(R.string.dbg_more_processes, packet.processes.size - shown.size)
                                     )
                                 }
 
@@ -555,7 +553,7 @@ fun DebugScreen() {
 
                                 if (statusCount.isNotEmpty()) {
                                     appendLine()
-                                    appendLine("无值字段汇总：")
+                                    appendLine(AppStrings.s(R.string.dbg_no_value_summary))
 
                                     statusCount.entries
                                         .sortedByDescending { it.value }
@@ -572,7 +570,7 @@ fun DebugScreen() {
 
                 enabled = serviceReady && isRunning
             ) {
-                Text("完整快照")
+                Text(AppStrings.s(R.string.dbg_full_snapshot))
             }
 
             // 查询能力：proto / fields / fieldMask —— 两侧字段表是否同步，看这一行就知道
@@ -583,24 +581,23 @@ fun DebugScreen() {
                         val service = UIService.instanceOrNull()
 
                         val text = if (service == null) {
-                            "UIService 尚未就绪，请稍后重试"
+                            AppStrings.s(R.string.dbg_ui_not_ready)
                         } else {
 
                             val packet = service.linuxCapabilities()
 
                             if (packet == null) {
-                                "能力查询失败：后端未运行 / 超时"
+                                AppStrings.s(R.string.dbg_capability_failed)
                             } else buildString {
 
-                                appendLine("应答：${packet.summary()}")
+                                appendLine(AppStrings.s(R.string.dbg_reply, packet.summary()))
 
                                 packet.info.entries.forEach { (key, value) ->
                                     appendLine("$key = $value")
                                 }
 
                                 append(
-                                    "本地字段表：${LinuxField.KEYS.size} 项，ALL=0x" +
-                                        java.lang.Long.toHexString(LinuxField.ALL)
+                                    AppStrings.s(R.string.dbg_field_table, LinuxField.KEYS.size, java.lang.Long.toHexString(LinuxField.ALL))
                                 )
                             }
                         }
@@ -613,7 +610,7 @@ fun DebugScreen() {
 
                 enabled = serviceReady && isRunning
             ) {
-                Text("查询能力")
+                Text(AppStrings.s(R.string.dbg_query_capability))
             }
         }
 
@@ -633,12 +630,12 @@ fun DebugScreen() {
                         val service = UIService.instanceOrNull()
 
                         val text = when {
-                            service == null -> "UIService 尚未就绪，请稍后重试"
+                            service == null -> AppStrings.s(R.string.dbg_ui_not_ready)
 
                             service.ControlLinuxSvc(LinuxControlCode.REINIT, "") ->
-                                "控制回执：REINIT 成功（服务侧已重建采集上下文）"
+                                AppStrings.s(R.string.dbg_reinit_ok)
 
-                            else -> "控制失败：后端未运行 / 超时 / 服务侧拒绝"
+                            else -> AppStrings.s(R.string.dbg_control_failed)
                         }
 
                         withContext(Dispatchers.Main) {
@@ -649,7 +646,7 @@ fun DebugScreen() {
 
                 enabled = serviceReady && isRunning
             ) {
-                Text("控制：重探上下文")
+                Text(AppStrings.s(R.string.dbg_control_reinit))
             }
 
             TextButton(
@@ -659,12 +656,12 @@ fun DebugScreen() {
                         val service = UIService.instanceOrNull()
 
                         val text = when {
-                            service == null -> "UIService 尚未就绪，请稍后重试"
+                            service == null -> AppStrings.s(R.string.dbg_ui_not_ready)
 
                             service.ControlLinuxSvc(LinuxControlCode.DUMP_STATE, "") ->
-                                "控制回执：DUMP_STATE 成功（服务内部状态已吐出，见上方输出）"
+                                AppStrings.s(R.string.dbg_dump_ok)
 
-                            else -> "控制失败：后端未运行 / 超时 / 服务侧拒绝"
+                            else -> AppStrings.s(R.string.dbg_control_failed)
                         }
 
                         withContext(Dispatchers.Main) {
@@ -675,7 +672,7 @@ fun DebugScreen() {
 
                 enabled = serviceReady && isRunning
             ) {
-                Text("控制：导出状态")
+                Text(AppStrings.s(R.string.dbg_control_dump))
             }
         }
 
@@ -697,7 +694,7 @@ fun DebugScreen() {
         // ====================================================
 
         Text(
-            text = "性能页：测试设备",
+            text = AppStrings.s(R.string.dbg_perf_test_devices),
 
             style = MaterialTheme.typography.titleSmall,
 
@@ -709,9 +706,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "往性能页注入没有数据的测试设备：每按一次多一台，性能页立刻出现对应入口" +
-                "（测试磁盘进「磁盘 N」、测试网卡进「WLAN」、测试 GPU 进「GPU N」）。" +
-                "不影响底层真实采集，清除按钮一次全清。",
+            text = AppStrings.s(R.string.dbg_perf_test_devices_desc),
             style = MaterialTheme.typography.bodySmall,
 
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -737,16 +732,13 @@ fun DebugScreen() {
             )
 
             Text(
-                text = "显示所有网卡设备（忽略注册规则）",
+                text = AppStrings.s(R.string.dbg_show_all_networks),
                 style = MaterialTheme.typography.bodyMedium
             )
         }
 
         Text(
-            text = "勾上后，底层快照里的每一块网卡都会注册成性能页设备：p2p0、" +
-                "没连网的 wlan0、只挂着 fe80:: 的 rmnet、VPN 的 tun0 等平时被隐藏的都会出现。" +
-                "它们照样没有数据（明细写「不支持」、速率 0）。开关只在本次运行有效，重启应用即恢复。" +
-                "底层没采集到的设备（如回环 lo）不会因为勾选而出现。",
+            text = AppStrings.s(R.string.dbg_show_all_networks_desc),
             style = MaterialTheme.typography.bodySmall,
 
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -775,7 +767,7 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("测试网卡")
+                Text(AppStrings.s(R.string.dbg_test_nic))
             }
 
             OutlinedButton(
@@ -788,7 +780,7 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("测试磁盘")
+                Text(AppStrings.s(R.string.dbg_test_disk))
             }
 
             OutlinedButton(
@@ -801,7 +793,7 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("测试 GPU")
+                Text(AppStrings.s(R.string.dbg_test_gpu))
             }
 
         }
@@ -821,7 +813,7 @@ fun DebugScreen() {
                     debugDeviceState = manager.debugDeviceText()
                 }
             ) {
-                Text("清除测试设备")
+                Text(AppStrings.s(R.string.dbg_clear_test_devices))
             }
         }
 
@@ -830,7 +822,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "当前注入：$debugDeviceState",
+            text = AppStrings.s(R.string.dbg_injected_now, debugDeviceState),
 
             style = MaterialTheme.typography.bodySmall,
 
@@ -847,7 +839,7 @@ fun DebugScreen() {
 
             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
         ) {
-            Text("复制输出")
+            Text(AppStrings.s(R.string.dbg_copy_output))
         }
 
         Surface(
@@ -894,7 +886,7 @@ fun DebugScreen() {
         // ====================================================
 
         Text(
-            text = "设备快照",
+            text = AppStrings.s(R.string.dbg_device_snapshot),
 
             style = MaterialTheme.typography.titleSmall,
 
@@ -906,7 +898,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "按一次让 Linux 服务采一帧设备快照，把解析后的设备实例、每台设备的字段与无值状态全部列出来。",
+            text = AppStrings.s(R.string.dbg_device_snapshot_desc),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -922,30 +914,33 @@ fun DebugScreen() {
                     val service = UIService.instanceOrNull()
 
                     val text = if (service == null) {
-                        "UIService 尚未就绪，请稍后重试"
+                        AppStrings.s(R.string.dbg_ui_not_ready)
                     } else {
 
                         // 拿原始包：解析后的帧在 PerformanceSnapshot 里，看不到 D/F 行的原样
                         val packet = service.linuxDeviceSnapshot()
 
                         if (packet == null) {
-                            "请求失败：后端未运行 / 发送失败 / 等待应答超时"
+                            AppStrings.s(R.string.dbg_request_failed)
                         } else buildString {
 
-                            appendLine("应答：${packet.summary()}")
+                            appendLine(AppStrings.s(R.string.dbg_reply, packet.summary()))
 
                             if (!packet.isOk) {
                                 appendLine(
-                                    "注意：${packet.failureReason ?: "包不可用"}，下面内容仅供参考"
+                                    AppStrings.s(
+                                    R.string.dbg_note_reference,
+                                    packet.failureReason ?: AppStrings.s(R.string.dbg_packet_unusable)
+                                )
                                 )
                             }
 
-                            appendLine("原始行：${packet.raw.size} 行")
+                            appendLine(AppStrings.s(R.string.dbg_raw_lines_colon, packet.raw.size))
 
                             // 老后端（平铺 I 行）没有设备集合，会落到这里
                             if (packet.info.isNotEmpty()) {
                                 appendLine()
-                                appendLine("附加信息 ${packet.info.size} 条：")
+                                appendLine(AppStrings.s(R.string.dbg_extra_info, packet.info.size))
 
                                 packet.info.entries.forEach { (key, value) ->
                                     appendLine("  $key = $value")
@@ -954,16 +949,15 @@ fun DebugScreen() {
 
                             if (packet.devices.isEmpty()) {
                                 appendLine()
-                                appendLine("（包里没有 D 行设备，可能是后端未就绪或版本不支持）")
+                                appendLine(AppStrings.s(R.string.dbg_no_d_rows))
                             } else {
                                 appendLine()
-                                appendLine("设备 ${packet.devices.size} 台：")
+                                appendLine(AppStrings.s(R.string.dbg_devices_count, packet.devices.size))
 
                                 packet.devices.forEach { device ->
                                     appendLine()
                                     appendLine(
-                                        "${device.id}  type=${device.type}  " +
-                                            "字段 ${device.fields.size} 个"
+                                    AppStrings.s(R.string.dbg_device_line, device.id, device.type, device.fields.size)
                                     )
 
                                     device.fields.entries.forEach { (key, value) ->
@@ -973,7 +967,7 @@ fun DebugScreen() {
                                     // 有状态就说明这一格没有数值，与"值为 0"区分开
                                     if (device.statuses.isNotEmpty()) {
                                         appendLine(
-                                            "  无值字段：" +
+                                            "  " + AppStrings.s(R.string.dbg_no_value_fields) +
                                                 device.statuses.entries.joinToString("  ") {
                                                     "${it.key}=!${it.value}"
                                                 }
@@ -992,7 +986,7 @@ fun DebugScreen() {
 
             enabled = serviceReady && isRunning
         ) {
-            Text("输出设备快照")
+            Text(AppStrings.s(R.string.dbg_output_device_snapshot))
         }
 
         Spacer(
@@ -1005,7 +999,7 @@ fun DebugScreen() {
 
             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
         ) {
-            Text("复制输出")
+            Text(AppStrings.s(R.string.dbg_copy_output))
         }
 
         Surface(
@@ -1070,7 +1064,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "重启 Android 服务：按当前身份重新拉起，并在输出里重新打印一次身份自检。",
+            text = AppStrings.s(R.string.dbg_restart_android_desc),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1098,7 +1092,7 @@ fun DebugScreen() {
                 modifier = Modifier.width(8.dp)
             )
 
-            Text("重启 Android 服务")
+            Text(AppStrings.s(R.string.dbg_restart_android))
         }
 
         Spacer(
@@ -1120,7 +1114,7 @@ fun DebugScreen() {
         // ====================================================
 
         Text(
-            text = "详细信息页测试数据",
+            text = AppStrings.s(R.string.dbg_details_test_data),
 
             style = MaterialTheme.typography.titleMedium,
 
@@ -1132,7 +1126,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "加入 Test0 ~ Test10 共 11 个进程（名称 TestN，其余统计值都填 N），用来观察表格的排序、选中与横向滚动开销。",
+            text = AppStrings.s(R.string.dbg_details_test_data_desc),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1151,7 +1145,7 @@ fun DebugScreen() {
                     withContext(Dispatchers.Main) {
                         Toast.makeText(
                             context,
-                            "已加入 $added 行（Test0 ~ Test10，重复点击只刷新）",
+                            AppStrings.s(R.string.dbg_rows_added, added),
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -1170,7 +1164,7 @@ fun DebugScreen() {
                 modifier = Modifier.width(8.dp)
             )
 
-            Text("添加 Test0 ~ Test10")
+            Text(AppStrings.s(R.string.dbg_add_test_rows))
         }
 
         Spacer(
@@ -1190,7 +1184,7 @@ fun DebugScreen() {
         Text(
             // 结果展示区：显示后端最近若干行输出（命令回显 + 应答），
             // 或启动失败 / 服务未就绪的提示
-            text = "测试结果",
+            text = AppStrings.s(R.string.dbg_test_result),
 
             style = MaterialTheme.typography.titleMedium,
 
@@ -1241,7 +1235,7 @@ fun DebugScreen() {
         // ====================================================
 
         Text(
-            text = "上游服务输出",
+            text = AppStrings.s(R.string.dbg_upstream_output),
 
             style = MaterialTheme.typography.titleMedium,
 
@@ -1253,7 +1247,7 @@ fun DebugScreen() {
         )
 
         Text(
-            text = "AndroidService 与 LinuxService 最近的运行记录（后端身份：$backendIdentity）",
+            text = AppStrings.s(R.string.dbg_upstream_output_desc, backendIdentity),
 
             style = MaterialTheme.typography.bodySmall,
 
@@ -1299,3 +1293,4 @@ fun DebugScreen() {
         }
     }
 }
+
