@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    无障碍服务的配置（由 AndroidManifest 的 meta-data 指向本文件）。
+
+    这一版只做"能被授权 + 建置顶窗口"，所以刻意开到最小：
+    - 只听窗口状态变化（本服务不据此做任何判断，只是保留一个最小事件面）；
+    - canRetrieveWindowContent=false：不读屏幕内容、不抓取别人的界面文字——
+      TYPE_ACCESSIBILITY_OVERLAY 窗口的建立不需要读窗口内容的能力，只认"服务被启用"；
+    - flagDefault：不请求任何额外能力（不拦截按键、不做手势）。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/a11y_service_desc"
+    android:notificationTimeout="100" />
