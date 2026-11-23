@@ -604,6 +604,22 @@ data class PerformanceSnapshot(
 
                 compressedBytes = fields.longOf("compressed_bytes"),
 
+                compressedStatus = fields.statusOf("compressed_bytes"),
+
+                zramOriginalBytes = fields.longOf("zram_original_bytes"),
+
+                zramCompressedBytes = fields.longOf("zram_compressed_bytes"),
+
+                zramUsedBytes = fields.longOf("zram_used_bytes"),
+
+                zramDisksizeBytes = fields.longOf("zram_disksize_bytes"),
+
+                zramSwapUsedBytes = fields.longOf("zram_swap_used_bytes"),
+
+                swapTotalBytes = fields.longOf("swap_total_bytes"),
+
+                swapUsedBytes = fields.longOf("swap_used_bytes"),
+
                 availableBytes = fields.longOf("available_bytes"),
 
                 committedBytes = fields.longOf("committed_bytes"),
@@ -792,6 +808,31 @@ data class MemorySnapshot(
     val manufacturer: String? = null,
     val usedBytes: Long? = null,
     val compressedBytes: Long? = null,
+
+    /** zram 原始数据量（mm_stat 第 1 列 orig_data_size）；null = 没有 zram 或没读到 */
+    val zramOriginalBytes: Long? = null,
+
+    /** compressedBytes 读不到时的原因；ACCESS_DENIED 表示设备在、只是没权限 → 显示 "-" */
+    val compressedStatus: String? = null,
+
+    /** zram 压缩后数据量（第 2 列 compr_data_size） */
+    val zramCompressedBytes: Long? = null,
+
+    /** zram 实际占住的物理内存（第 3 列 mem_used_total，与 compressedBytes 同源同值） */
+    val zramUsedBytes: Long? = null,
+
+    /** zram 设备容量上限（disksize 累加），和用量分开 */
+    val zramDisksizeBytes: Long? = null,
+
+    /** /proc/swaps 里 zram 已用的交换量（压缩前口径，不能当内存占用） */
+    val zramSwapUsedBytes: Long? = null,
+
+    /** 交换空间总量：/proc/swaps 所有设备 Size 列累加（设备配置容量）；null = 没读到 */
+    val swapTotalBytes: Long? = null,
+
+    /** 交换空间已用：/proc/swaps 所有设备 Used 列累加（压缩前口径） */
+    val swapUsedBytes: Long? = null,
+
     val availableBytes: Long? = null,
     val committedBytes: Long? = null,
     val commitLimitBytes: Long? = null,
@@ -842,12 +883,59 @@ data class MemorySnapshot(
 
         if (usedBytes == null) return "—"
 
-        val compressed = compressedBytes?.let { memorySizeText(it) } ?: "—"
+        val compressed = compressedBytes?.let { memorySizeText(it) }
+            ?: if (compressedStatus == FIELD_STATUS_ACCESS_DENIED) MEMORY_ACCESS_DENIED_TEXT else "—"
 
         return "${memorySizeText(usedBytes)} ($compressed)"
     }
 
     fun availableText(): String = memorySizeText(availableBytes)
+
+    /**
+     * 压缩内存（zram）的三个实测数：原始 / 压缩后 / 实际占用，容量有就一起写。
+     *
+     * 只在真读到 mm_stat 时才出这一行：没有 zram 或读不到就整行不画
+     * （和"速度 / 厂商"同一规矩），不摆一串 0 MB 占位。
+     * 实占含分配器碎片与元数据，会比"压缩后数据量"略大 —— 这不是算错。
+     */
+    fun zramDetailText(): String? {
+
+        val original = zramOriginalBytes ?: return null
+        val compressed = zramCompressedBytes ?: return null
+        val used = zramUsedBytes ?: return null
+
+        val text = StringBuilder()
+
+        text.append("原始 ").append(memorySizeText(original))
+        text.append(" → 压缩 ").append(memorySizeText(compressed))
+        text.append("，实占 ").append(memorySizeText(used))
+
+        zramDisksizeBytes?.takeIf { it > 0 }?.let {
+            text.append("，容量 ").append(memorySizeText(it))
+        }
+
+        return text.toString()
+    }
+
+    /**
+     * 交换空间一行显示：`已用/总量 单位`，例 `0.8/4.0 GB`。
+     *
+     * 与「已提交」同一套写法：同一把尺子（取大的那个定单位），单位只写一次。
+     * 缺一个就只报另一个；两个都没读到返回 null，整行不画。
+     */
+    fun swapText(): String? {
+
+        val used = swapUsedBytes
+        val total = swapTotalBytes
+
+        if (used == null && total == null) return null
+
+        if (used == null) return memorySizeText(total!!)
+
+        if (total == null) return memorySizeText(used)
+
+        return rangeText(used, total)
+    }
 
     /**
      * 已提交：`已用/上限`。

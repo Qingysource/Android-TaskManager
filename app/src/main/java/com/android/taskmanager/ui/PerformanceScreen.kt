@@ -1348,6 +1348,13 @@ private fun memoryDetailLines(memory: MemorySnapshot?): List<Pair<String, String
 
         add("为硬件保留的内存" to data.reservedText())
 
+        // zram 三个实测数：真读到 mm_stat 才画这一行
+        // （没有压缩内存的机器不该出现一串 0 MB 占位，和"速度"同一规矩）
+        data.zramDetailText()?.let { add("压缩内存" to it) }
+
+        // 交换空间：已用/总量 一行收（例 0.8/4.0 GB），排在压缩内存下面
+        data.swapText()?.let { add("交换空间" to it) }
+
         // 厂商这一行只在底层真报出来时才有：它来自 dt 的 ddr_manufacturer_id，
         // 读不到或编码不在表里就整行不画（和"速度"同一规矩，不摆破折号占位）
         data.manufacturer?.takeIf { it.isNotBlank() }?.let { add("厂商" to it.trim()) }

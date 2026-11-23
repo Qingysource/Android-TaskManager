@@ -2736,35 +2736,128 @@ static bool read_cpu_max_freq_khz(double *out)
     return read_first_number_of(paths, (int) (sizeof(paths) / sizeof(paths[0])), out);
 }
 
-/** /sys/devices/system/cpu 下 cpuN 目录的个数 = 逻辑处理器数；-1 = 列不出来。 */
-static int count_logical_cpus(void)
+/**
+ * 收集要看的 cpuN 编号。
+ *
+ * 先列 /sys/devices/system/cpu；列不了目录（SELinux 只给 search 不给 readdir）时，
+ * 读内核固定文件 possible（"0-7" 就是 8 个逻辑核），再不行就按 cpu0..cpu15 的
+ * 固定编号逐个 stat —— CPU 编号本来就是连续的，不该因为列不了目录就数不出核来。
+ *
+ * @return 收集到的个数；0 = 一条都没拿到
+ */
+static int collect_cpu_indices(int *out, int capacity)
 {
-    DIR *dir = opendir("/sys/devices/system/cpu");
-
-    if (dir == NULL) {
-        return -1;
+    if (out == NULL || capacity <= 0) {
+        return 0;
     }
 
     int count = 0;
-    struct dirent *entry;
 
-    while ((entry = readdir(dir)) != NULL) {
+    DIR *dir = opendir("/sys/devices/system/cpu");
 
-        // 只认 cpuN；cpufreq / cpuidle / policyN 这些不是处理器
-        if (strncmp(entry->d_name, "cpu", 3) != 0) {
-            continue;
+    if (dir != NULL) {
+
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+
+            // 只认 cpuN；cpufreq / cpuidle / policyN 这些不是处理器
+            if (strncmp(entry->d_name, "cpu", 3) != 0) {
+                continue;
+            }
+
+            if (!is_pure_digits(entry->d_name + 3)) {
+                continue;
+            }
+
+            if (count >= capacity) {
+                break;
+            }
+
+            out[count++] = atoi(entry->d_name + 3);
         }
 
-        if (!is_pure_digits(entry->d_name + 3)) {
-            continue;
-        }
-
-        count++;
+        closedir(dir);
     }
 
-    closedir(dir);
+    if (count > 0) {
+        return count;
+    }
+
+    // 第二档：possible 是内核固定导出的"这颗 SoC 一共有哪些 CPU"，格式 "0-7" / "0-3,4-7"
+    char possible[128];
+
+    if (read_text_file("/sys/devices/system/cpu/possible", possible, (int) sizeof(possible)) > 0) {
+
+        const char *cursor = possible;
+
+        while (*cursor != '\0' && count < capacity) {
+
+            if (*cursor < '0' || *cursor > '9') {
+                cursor++;
+                continue;
+            }
+
+            int from = 0;
+
+            while (*cursor >= '0' && *cursor <= '9') {
+                from = from * 10 + (*cursor - '0');
+                cursor++;
+            }
+
+            int to = from;
+
+            if (*cursor == '-') {
+
+                cursor++;
+
+                if (*cursor < '0' || *cursor > '9') {
+                    break;
+                }
+
+                to = 0;
+
+                while (*cursor >= '0' && *cursor <= '9') {
+                    to = to * 10 + (*cursor - '0');
+                    cursor++;
+                }
+            }
+
+            for (int value = from; value <= to && count < capacity; value++) {
+                out[count++] = value;
+            }
+        }
+    }
+
+    if (count > 0) {
+        return count;
+    }
+
+    // 第三档：固定编号。cpu 目录存在就是一颗（拓扑读不读得到另算）
+    for (int cpu = 0; cpu < 16 && count < capacity; cpu++) {
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d", cpu);
+
+        struct stat info;
+
+        if (stat(path, &info) == 0) {
+            out[count++] = cpu;
+        }
+    }
 
     return count;
+}
+
+/** /sys/devices/system/cpu 下 cpuN 的个数 = 逻辑处理器数；-1 = 一条都拿不到。 */
+static int count_logical_cpus(void)
+{
+    int cpu_ids[256];
+
+    int count = collect_cpu_indices(cpu_ids, (int) (sizeof(cpu_ids) / sizeof(cpu_ids[0])));
+
+    return count > 0 ? count : -1;
 }
 
 /**
@@ -2797,9 +2890,11 @@ static void count_sockets_and_cores(int *sockets_out, int *cores_out)
 
     *cores_out = -1;
 
-    DIR *dir = opendir("/sys/devices/system/cpu");
+    int cpu_ids[256];
 
-    if (dir == NULL) {
+    int cpu_count = collect_cpu_indices(cpu_ids, (int) (sizeof(cpu_ids) / sizeof(cpu_ids[0])));
+
+    if (cpu_count <= 0) {
         return;
     }
 
@@ -2817,20 +2912,9 @@ static void count_sockets_and_cores(int *sockets_out, int *cores_out)
     // 只要有一台 cpuN 拿不到可靠拓扑，整台机器的核心数就不下结论
     bool topology_failed = false;
 
-    struct dirent *entry;
+    for (int cpu_slot = 0; cpu_slot < cpu_count; cpu_slot++) {
 
-    while ((entry = readdir(dir)) != NULL) {
-
-        // 只认 cpuN；cpufreq / cpuidle / policyN 这些不是处理器
-        if (strncmp(entry->d_name, "cpu", 3) != 0) {
-            continue;
-        }
-
-        if (!is_pure_digits(entry->d_name + 3)) {
-            continue;
-        }
-
-        int cpu = atoi(entry->d_name + 3);
+        int cpu = cpu_ids[cpu_slot];
 
         cpu_seen++;
 
@@ -3075,8 +3159,6 @@ static void count_sockets_and_cores(int *sockets_out, int *cores_out)
         core_key_count++;
     }
 
-    closedir(dir);
-
     if (cpu_seen == 0) {
         return;
     }
@@ -3208,14 +3290,16 @@ static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3],
 
     bool found[3] = { false, false, false };
 
-    // 先探 cache 目录本身：目录都打不开，就不是"没有这一级"，而是读不了
+    // 先探 cache 目录本身。这里只用 stat：它只需要父目录的 search 权限，不列目录内容。
+    // 某些 SELinux 域允许打开 cache/indexN/level，却不让 readdir —— 用 opendir 判存在
+    // 会把"读得到"误判成"读不了"，所以目录在就继续按固定 index 编号往下读。
     char cache_dir[TM_PATH_MAX];
 
     snprintf(cache_dir, sizeof(cache_dir), "%s/cache", cpu_dir);
 
-    DIR *cache_handle = opendir(cache_dir);
+    struct stat cache_info;
 
-    if (cache_handle == NULL) {
+    if (stat(cache_dir, &cache_info) != 0) {
 
         bool denied = (errno == EACCES || errno == EPERM);
 
@@ -3225,8 +3309,6 @@ static void probe_cpu_cache_from_sysfs(const char *cpu_dir, int out_kb[3],
 
         return;
     }
-
-    closedir(cache_handle);
 
     // 这一级在不在：index 里有 level=N 就算"有"，尺寸读不出来另算
     bool seen[3] = { false, false, false };
@@ -3949,6 +4031,55 @@ static int enumerate_memory_devices(TmDeviceRef *out, int capacity)
     return 1;
 }
 
+/** 判一块块设备能不能进磁盘列表，能就填进 out[count]；返回新的 count。 */
+static int disk_add_block(TmDeviceRef *out, int capacity, int count, const char *block_name)
+{
+    if (block_name == NULL || block_name[0] == '\0' || block_name[0] == '.') {
+        return count;
+    }
+
+    if (is_pseudo_block_name(block_name)) {
+        return count;
+    }
+
+    // 枚举与固定路径两趟会撞名（sda 既被列目录列到、又被固定路径试到），按块名去重
+    for (int i = 0; i < count; i++) {
+
+        if (strcmp(out[i].name, block_name) == 0) {
+            return count;
+        }
+    }
+
+    if (count >= capacity) {
+        return count;
+    }
+
+    char probe[TM_PATH_MAX];
+    struct stat info;
+
+    // 物理盘判据：控制器链接存在
+    snprintf(probe, sizeof(probe), "/sys/block/%s/device", block_name);
+
+    if (stat(probe, &info) != 0) {
+        return count;
+    }
+
+    // 容量为 0 的空槽不算磁盘（读卡器 / 光驱位没有介质）
+    double sectors = 0.0;
+
+    snprintf(probe, sizeof(probe), "/sys/block/%s/size", block_name);
+
+    if (!read_first_number(probe, &sectors) || sectors <= 0.0) {
+        return count;
+    }
+
+    snprintf(out[count].path, sizeof(out[count].path), "/sys/block/%s", block_name);
+
+    snprintf(out[count].name, sizeof(out[count].name), "%s", block_name);
+
+    return count + 1;
+}
+
 /**
  * 枚举磁盘：扫 /sys/block，只留物理盘。
  *
@@ -3959,6 +4090,10 @@ static int enumerate_memory_devices(TmDeviceRef *out, int capacity)
  *    厂商自己起的虚拟盘名字不在前缀表里，只能靠这一条挡下来。
  * 另外容量为 0 的空槽（读卡器没插卡）不算一台磁盘，免得页面上多一个 0 MB 的空壳。
  *
+ * 两趟走：枚举 + 常见块名的固定路径（sda/sdb、mmcblk0/1、nvme0n1、vda）。
+ * 块名由内核按探测顺序分配，列不了目录时固定名字仍能 stat 到 device 与 size，
+ * 这样"目录读不了"就不会变成"这台机器没有磁盘"。
+ *
  * 编号在**排序之后**给：readdir 顺序不保证跨帧一致，先把名字排序，
  * 再依次编 disk0 / disk1，客户端的"磁盘 0 / 磁盘 1"才不会两帧之间换位置。
  */
@@ -3968,57 +4103,36 @@ static int enumerate_disk_devices(TmDeviceRef *out, int capacity)
         return 0;
     }
 
+    int count = 0;
+
     DIR *dir = opendir("/sys/block");
 
-    if (dir == NULL) {
-        return 0;
+    if (dir != NULL) {
+
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+            count = disk_add_block(out, capacity, count, entry->d_name);
+        }
+
+        closedir(dir);
     }
 
-    int count = 0;
-    struct dirent *entry;
+    static const char *const fixed_blocks[] = {
+        "sda",
+        "sdb",
+        "sdc",
+        "mmcblk0",
+        "mmcblk1",
+        "nvme0n1",
+        "nvme1n1",
+        "vda",
+        "vdb",
+    };
 
-    while ((entry = readdir(dir)) != NULL) {
-
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        if (is_pseudo_block_name(entry->d_name)) {
-            continue;
-        }
-
-        if (count >= capacity) {
-            break;
-        }
-
-        char probe[TM_PATH_MAX];
-        struct stat info;
-
-        // 物理盘判据：控制器链接存在
-        snprintf(probe, sizeof(probe), "/sys/block/%s/device", entry->d_name);
-
-        if (stat(probe, &info) != 0) {
-            continue;
-        }
-
-        // 容量为 0 的空槽不算磁盘（读卡器 / 光驱位没有介质）
-        double sectors = 0.0;
-
-        snprintf(probe, sizeof(probe), "/sys/block/%s/size", entry->d_name);
-
-        if (!read_first_number(probe, &sectors) || sectors <= 0.0) {
-            continue;
-        }
-
-        snprintf(out[count].path, sizeof(out[count].path),
-                 "/sys/block/%s", entry->d_name);
-
-        snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
-
-        count++;
+    for (size_t i = 0; i < sizeof(fixed_blocks) / sizeof(fixed_blocks[0]); i++) {
+        count = disk_add_block(out, capacity, count, fixed_blocks[i]);
     }
-
-    closedir(dir);
 
     // 按块名排序：枚举顺序跨帧稳定，界面上的"磁盘 0 / 磁盘 1"才不会来回换位
     if (count > 1) {
@@ -4484,290 +4598,399 @@ static int gpu_add(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen,
     return count + 1;
 }
 
-/** 1) 高通：/sys/class/kgsl 下的 kgsl-3dN（3D 图形核；kgsl-2d 是 2D 合成，不算显卡）。 */
+/**
+ * 登记一个 KGSL 3D 节点：枚举与固定路径两趟共用同一套"读型号 + 加入"。
+ *
+ * stat 只要求路径上的 search 权限，不读目录内容 —— 这正是"目录枚举被 SELinux
+ * 挡住、单个节点仍可访问"时还能确认节点存在的原因。节点在、字段读不出来，
+ * 由下游各字段各自报状态，不在这里提前放弃。
+ */
+static int gpu_register_kgsl_node(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen,
+                                  const char *path)
+{
+    struct stat info;
+
+    if (stat(path, &info) != 0) {
+        return count;
+    }
+
+    // gpu_model 是高通导出的芯片名（Adreno735 / Adreno (TM) 740 这种）。
+    // 原文写法不统一，这里过一遍规范名函数，统一成
+    // "Qualcomm(R) Adreno(TM) 735"；不是 Adreno 的型号只加厂商前缀。
+    // 读不出来就用空型号 —— 名字退成 "Qualcomm(R) Adreno(TM)"，设备照样登记。
+    char model[64];
+
+    model[0] = '\0';
+
+    char model_path[TM_PATH_MAX];
+
+    snprintf(model_path, sizeof(model_path), "%s/gpu_model", path);
+
+    read_text_file(model_path, model, (int) sizeof(model));
+
+    trim_disk_text(model);
+
+    char display[TM_OUT_VALUE_MAX];
+
+    gpu_qualcomm_model_name(model, display, (int) sizeof(display));
+
+    return gpu_add(out, capacity, count, seen, path, display, TM_GPU_VENDOR_QUALCOMM);
+}
+
+/**
+ * 1) 高通：kgsl-3dN（3D 图形核；kgsl-2d 是 2D 合成，不算显卡）。
+ *
+ * 两条路都走，谁也替代不了谁：
+ *   ① 枚举 /sys/class/kgsl —— 内核里到底挂了几个 3D 核，只有列目录才知道；
+ *   ② 固定路径 kgsl-3d0 .. kgsl-3d3 —— 枚举依赖"读目录"（readdir）权限，
+ *      某些 SELinux 域（典型是 adb shell）允许打开目录里的具体文件、却不允许
+ *      读目录列表：opendir 直接失败，可 gpubusy 明明读得动。少了这一步，
+ *      就会把一颗能读到利用率的 Adreno 误判成"这台机器没有 GPU"。
+ *
+ * 两条路的结果按真实路径去重。只有 stat 失败才算"节点不存在"；
+ * 真读不出数据时，逐字段报状态，那才是结论。
+ */
 static int gpu_discover_kgsl(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
 {
     DIR *dir = opendir("/sys/class/kgsl");
 
-    if (dir == NULL) {
-        return count;
-    }
+    if (dir != NULL) {
 
-    struct dirent *entry;
+        struct dirent *entry;
 
-    while ((entry = readdir(dir)) != NULL) {
+        while ((entry = readdir(dir)) != NULL) {
 
-        if (strncmp(entry->d_name, "kgsl-3d", 7) != 0) {
-            continue;
+            if (strncmp(entry->d_name, "kgsl-3d", 7) != 0) {
+                continue;
+            }
+
+            char path[TM_PATH_MAX];
+
+            snprintf(path, sizeof(path), "/sys/class/kgsl/%s", entry->d_name);
+
+            count = gpu_register_kgsl_node(out, capacity, count, seen, path);
         }
 
-        char path[TM_PATH_MAX];
-
-        snprintf(path, sizeof(path), "/sys/class/kgsl/%s", entry->d_name);
-
-        struct stat info;
-
-        if (stat(path, &info) != 0) {
-            continue;
-        }
-
-        // gpu_model 是高通导出的芯片名（Adreno735 / Adreno (TM) 740 这种）。
-        // 原文写法不统一，这里过一遍规范名函数，统一成
-        // "Qualcomm(R) Adreno(TM) 735"；不是 Adreno 的型号只加厂商前缀。
-        char model[64];
-
-        model[0] = '\0';
-
-        char model_path[TM_PATH_MAX];
-
-        snprintf(model_path, sizeof(model_path), "%s/gpu_model", path);
-
-        read_text_file(model_path, model, (int) sizeof(model));
-
-        trim_disk_text(model);
-
-        char display[TM_OUT_VALUE_MAX];
-
-        gpu_qualcomm_model_name(model, display, (int) sizeof(display));
-
-        count = gpu_add(out, capacity, count, seen, path, display, TM_GPU_VENDOR_QUALCOMM);
+        closedir(dir);
     }
 
-    closedir(dir);
+    static const char *const fixed_nodes[] = {
+        "/sys/class/kgsl/kgsl-3d0",
+        "/sys/class/kgsl/kgsl-3d1",
+        "/sys/class/kgsl/kgsl-3d2",
+        "/sys/class/kgsl/kgsl-3d3",
+    };
+
+    for (size_t i = 0; i < sizeof(fixed_nodes) / sizeof(fixed_nodes[0]); i++) {
+        count = gpu_register_kgsl_node(out, capacity, count, seen, fixed_nodes[i]);
+    }
 
     return count;
 }
 
 /**
- * 2) / 3) / 4) Mali 系：/sys/class/misc 下的 maliN，以及平台设备里名字带 mali 的。
- *
- * 同一个驱动（ARM kbase）被联发科、三星、Google 三家都用着，节点位置一模一样，
- * 所以厂商只能靠 SoC 判；判不出来就记 ARM（驱动确实是 ARM 的）。
+ * 登记一个 kbase 节点（/sys/class/misc/maliN）：枚举与固定路径共用。
+ * gpuinfo 是 kbase 的版本行：Mali-G57 5 cores r0p1 0x9091。
  */
-static int gpu_discover_mali_misc(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+static int gpu_register_mali_misc_node(TmDeviceRef *out, int capacity, int count,
+                                       TmGpuSeen *seen, const char *path, int vendor)
 {
-    DIR *dir = opendir("/sys/class/misc");
+    struct stat info;
 
-    if (dir == NULL) {
+    if (stat(path, &info) != 0) {
         return count;
     }
 
-    int vendor = gpu_soc_vendor();
+    char info_text[64];
 
-    if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
-        vendor = TM_GPU_VENDOR_ARM;
-    }
+    info_text[0] = '\0';
 
-    struct dirent *entry;
+    char info_path[TM_PATH_MAX];
 
-    while ((entry = readdir(dir)) != NULL) {
+    snprintf(info_path, sizeof(info_path), "%s/device/gpuinfo", path);
 
-        if (strncmp(entry->d_name, "mali", 4) != 0) {
-            continue;
-        }
+    read_text_file(info_path, info_text, (int) sizeof(info_text));
 
-        char path[TM_PATH_MAX];
+    trim_disk_text(info_text);
 
-        snprintf(path, sizeof(path), "/sys/class/misc/%s", entry->d_name);
+    if (info_text[0] == '\0') {
 
-        struct stat info;
-
-        if (stat(path, &info) != 0) {
-            continue;
-        }
-
-        // kbase 的 gpuinfo：Mali-G57 5 cores r0p1 0x9091
-        char info_text[64];
-
-        info_text[0] = '\0';
-
-        char info_path[TM_PATH_MAX];
-
-        snprintf(info_path, sizeof(info_path), "%s/device/gpuinfo", path);
+        // 有的内核把 gpuinfo 直接摆在 misc 节点下，不挂在 device 里
+        snprintf(info_path, sizeof(info_path), "%s/gpuinfo", path);
 
         read_text_file(info_path, info_text, (int) sizeof(info_text));
 
         trim_disk_text(info_text);
-
-        if (info_text[0] == '\0') {
-            snprintf(info_path, sizeof(info_path), "%s/gpuinfo", path);
-            read_text_file(info_path, info_text, (int) sizeof(info_text));
-            trim_disk_text(info_text);
-        }
-
-        count = gpu_add(out, capacity, count, seen, path,
-                        info_text[0] != '\0' ? info_text : "ARM Mali GPU", vendor);
     }
 
-    closedir(dir);
-
-    return count;
+    return gpu_add(out, capacity, count, seen, path,
+                   info_text[0] != '\0' ? info_text : "ARM Mali GPU", vendor);
 }
 
-/** 5) 裸 Mali 平台设备：/sys/bus/platform/devices 里名字带 mali 的那几个。 */
-static int gpu_discover_mali_platform(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+/**
+ * 2) Mali 系：/sys/class/misc 下的 maliN。
+ *
+ * 与 KGSL 同理两趟走：枚举 + mali0 / mali1 固定路径。
+ * 目录枚举被挡住时，固定名字照样能取到 gpuinfo —— 能读到就说明这块 GPU 在。
+ */
+static int gpu_discover_mali_misc(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
 {
-    DIR *dir = opendir("/sys/bus/platform/devices");
-
-    if (dir == NULL) {
-        return count;
-    }
-
     int vendor = gpu_soc_vendor();
 
     if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
         vendor = TM_GPU_VENDOR_ARM;
     }
 
-    struct dirent *entry;
+    DIR *dir = opendir("/sys/class/misc");
 
-    while ((entry = readdir(dir)) != NULL) {
+    if (dir != NULL) {
 
-        if (strstr(entry->d_name, "mali") == NULL) {
-            continue;
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+
+            if (strncmp(entry->d_name, "mali", 4) != 0) {
+                continue;
+            }
+
+            char path[TM_PATH_MAX];
+
+            snprintf(path, sizeof(path), "/sys/class/misc/%s", entry->d_name);
+
+            count = gpu_register_mali_misc_node(out, capacity, count, seen, path, vendor);
         }
 
-        char path[TM_PATH_MAX];
-
-        snprintf(path, sizeof(path), "/sys/bus/platform/devices/%s", entry->d_name);
-
-        struct stat info;
-
-        if (stat(path, &info) != 0) {
-            continue;
-        }
-
-        count = gpu_add(out, capacity, count, seen, path, "ARM Mali GPU", vendor);
+        closedir(dir);
     }
 
-    closedir(dir);
+    static const char *const fixed_nodes[] = {
+        "/sys/class/misc/mali0",
+        "/sys/class/misc/mali1",
+    };
+
+    for (size_t i = 0; i < sizeof(fixed_nodes) / sizeof(fixed_nodes[0]); i++) {
+        count = gpu_register_mali_misc_node(out, capacity, count, seen, fixed_nodes[i], vendor);
+    }
 
     return count;
 }
 
 /**
- * 6) Linux 官方 DRM：/sys/class/drm 下的 cardN（renderD* 与 cardN 是同一个设备，
- *    只按 cardN 登记；cardN-XXX 是接口连接器，不是显卡）。
+ * 3) Mali 的平台设备：/sys/bus/platform/devices 下名字带 mali 的那个
+ *    （13000000.mali / soc:mali 这种，由 DTS 决定）。
  *
- * 厂商按驱动名判；PCI 卡再看 uevent 的 PCI_ID。
- * 高通那套已经由 KGSL 登记过，这里的 msm/msm_drm card 直接跳过，避免一张卡两行。
+ * 枚举 + 固定兜底：平台设备名没法预先知道，但 kbase 一定会在 /sys/class/misc
+ * 下挂 maliN，maliN/device 就是那个平台设备 —— 用它可以绕过 platforms 目录枚举。
+ */
+static int gpu_discover_mali_platform(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
+{
+    int vendor = gpu_soc_vendor();
+
+    if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
+        vendor = TM_GPU_VENDOR_ARM;
+    }
+
+    DIR *dir = opendir("/sys/bus/platform/devices");
+
+    if (dir != NULL) {
+
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+
+            if (strstr(entry->d_name, "mali") == NULL) {
+                continue;
+            }
+
+            char path[TM_PATH_MAX];
+
+            snprintf(path, sizeof(path), "/sys/bus/platform/devices/%s", entry->d_name);
+
+            struct stat info;
+
+            if (stat(path, &info) != 0) {
+                continue;
+            }
+
+            count = gpu_add(out, capacity, count, seen, path, "ARM Mali GPU", vendor);
+        }
+
+        closedir(dir);
+    }
+
+    static const char *const fixed_nodes[] = {
+        "/sys/class/misc/mali0/device",
+        "/sys/class/misc/mali1/device",
+        "/sys/bus/platform/devices/mali",
+        "/sys/bus/platform/devices/mali0",
+    };
+
+    for (size_t i = 0; i < sizeof(fixed_nodes) / sizeof(fixed_nodes[0]); i++) {
+
+        struct stat info;
+
+        if (stat(fixed_nodes[i], &info) != 0) {
+            continue;
+        }
+
+        count = gpu_add(out, capacity, count, seen, fixed_nodes[i], "ARM Mali GPU", vendor);
+    }
+
+    return count;
+}
+
+/** 现有登记表里有没有某厂商的卡（避免同一颗 GPU 被 KGSL 与 msm 各记一次）。 */
+static bool gpu_has_vendor(const TmDeviceRef *out, int count, int vendor)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    for (int k = 0; k < count; k++) {
+
+        if (out[k].vendor == vendor) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/** DRM 驱动名 -> 厂商；认不出来返回 UNKNOWN（卡片仍然登记，名字退成 "GPU"）。 */
+static int gpu_vendor_of_driver(const char *driver)
+{
+    if (strcasecmp(driver, "amdgpu") == 0 || strcasecmp(driver, "radeon") == 0) {
+        return TM_GPU_VENDOR_AMD;
+    }
+
+    if (strcasecmp(driver, "nvidia") == 0 || strcasecmp(driver, "nouveau") == 0
+        || strcmp(driver, "nvidia-drm") == 0) {
+        return TM_GPU_VENDOR_NVIDIA;
+    }
+
+    if (strcasecmp(driver, "i915") == 0 || strcasecmp(driver, "xe") == 0) {
+        return TM_GPU_VENDOR_INTEL;
+    }
+
+    if (strcasecmp(driver, "msm") == 0 || strcasecmp(driver, "msm_drm") == 0
+        || strcasecmp(driver, "kgsl") == 0) {
+        return TM_GPU_VENDOR_QUALCOMM;
+    }
+
+    if (strcasecmp(driver, "virtio_gpu") == 0) {
+        return TM_GPU_VENDOR_VIRTIO;
+    }
+
+    if (strcasecmp(driver, "panfrost") == 0 || strcasecmp(driver, "panthor") == 0
+        || strcasecmp(driver, "kbase") == 0) {
+        int vendor = gpu_soc_vendor();
+        return (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM)
+               ? TM_GPU_VENDOR_ARM : vendor;
+    }
+
+    if (strcasecmp(driver, "pvrsrvkm") == 0 || strcasecmp(driver, "powervr") == 0) {
+        return TM_GPU_VENDOR_IMAGINATION;
+    }
+
+    if (strcasecmp(driver, "exynos") == 0 || strstr(driver, "exynos") != NULL) {
+        return TM_GPU_VENDOR_SAMSUNG;
+    }
+
+    return TM_GPU_VENDOR_UNKNOWN;
+}
+
+/**
+ * 登记一个 DRM cardN：枚举与固定路径两趟共用。
+ *
+ * 驱动名读不出来（权限 / 老内核）也照样登记：name 退成 "GPU" 总比整页空白强，
+ * 具体字段读不到由下游各自报状态。
+ */
+static int gpu_register_drm_card(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen,
+                                 const char *path)
+{
+    struct stat info;
+
+    if (stat(path, &info) != 0) {
+        return count;
+    }
+
+    char driver[64];
+
+    driver[0] = '\0';
+
+    char driver_link[TM_PATH_MAX];
+
+    snprintf(driver_link, sizeof(driver_link), "%s/device/driver", path);
+
+    gpu_link_name(driver_link, driver, (int) sizeof(driver));
+
+    int vendor = gpu_vendor_of_driver(driver);
+
+    // 高通：KGSL 那一趟通常已经登记过同一颗 GPU，这里不再追加；
+    // 但老内核 / kgsl 整个不可读时，msm 的 cardN 是唯一线索，必须收下。
+    if (vendor == TM_GPU_VENDOR_QUALCOMM
+        && gpu_has_vendor(out, count, TM_GPU_VENDOR_QUALCOMM)) {
+        return count;
+    }
+
+    char name[64];
+
+    gpu_drm_vendor_name(path, name, (int) sizeof(name));
+
+    if (strcmp(name, "GPU") == 0 && driver[0] != '\0') {
+        snprintf(name, sizeof(name), "%s (%s)", gpu_vendor_text(vendor), driver);
+    }
+
+    return gpu_add(out, capacity, count, seen, path, name, vendor);
+}
+
+/**
+ * 5) Linux 官方 DRM：/sys/class/drm 下的 cardN。
+ *    renderD* 与 cardN 是同一个设备，只按 cardN 登记；
+ *    cardN-XXX 是接口连接器，不是显卡。
+ *
+ * 枚举 + card0..card3 固定路径：DRM 类目录同样是 readdir 的目标，
+ * 枚举被挡时固定编号仍然 stat 得到，读到驱动名就认得出厂商。
  */
 static int gpu_discover_drm(TmDeviceRef *out, int capacity, int count, TmGpuSeen *seen)
 {
     DIR *dir = opendir("/sys/class/drm");
 
-    if (dir == NULL) {
-        return count;
-    }
+    if (dir != NULL) {
 
-    struct dirent *entry;
+        struct dirent *entry;
 
-    while ((entry = readdir(dir)) != NULL) {
+        while ((entry = readdir(dir)) != NULL) {
 
-        if (strncmp(entry->d_name, "card", 4) != 0) {
-            continue;
-        }
-
-        bool digits_only = true;
-
-        for (const char *cursor = entry->d_name + 4; *cursor != '\0'; cursor++) {
-
-            if (!isdigit((unsigned char) *cursor)) {
-                digits_only = false;
-                break;
-            }
-        }
-
-        if (!digits_only) {
-            continue;
-        }
-
-        char path[TM_PATH_MAX];
-
-        snprintf(path, sizeof(path), "/sys/class/drm/%s", entry->d_name);
-
-        char driver[64];
-
-        driver[0] = '\0';
-
-        char driver_link[TM_PATH_MAX];
-
-        snprintf(driver_link, sizeof(driver_link), "%s/device/driver", path);
-
-        gpu_link_name(driver_link, driver, (int) sizeof(driver));
-
-        int vendor = TM_GPU_VENDOR_UNKNOWN;
-
-        if (strcasecmp(driver, "amdgpu") == 0 || strcasecmp(driver, "radeon") == 0) {
-
-            vendor = TM_GPU_VENDOR_AMD;
-
-        } else if (strcasecmp(driver, "nvidia") == 0 || strcasecmp(driver, "nouveau") == 0
-                   || strcmp(driver, "nvidia-drm") == 0) {
-
-            vendor = TM_GPU_VENDOR_NVIDIA;
-
-        } else if (strcasecmp(driver, "i915") == 0 || strcasecmp(driver, "xe") == 0) {
-
-            vendor = TM_GPU_VENDOR_INTEL;
-
-        } else if (strcasecmp(driver, "msm") == 0 || strcasecmp(driver, "msm_drm") == 0
-                   || strcasecmp(driver, "kgsl") == 0) {
-
-            // 高通：KGSL 那一趟通常已经登记过同一颗 GPU，这时不再追加；
-            // 但老内核 / 权限不足时可能根本没有 kgsl 节点，那 msm 的 card
-            // 就是唯一的线索，必须收下，否则整页会一张卡都没有。
-            bool already = false;
-
-            for (int k = 0; k < count; k++) {
-
-                if (out[k].vendor == TM_GPU_VENDOR_QUALCOMM) {
-                    already = true;
-                    break;
-                }
-            }
-
-            if (already) {
+            if (strncmp(entry->d_name, "card", 4) != 0) {
                 continue;
             }
 
-            vendor = TM_GPU_VENDOR_QUALCOMM;
-
-        } else if (strcasecmp(driver, "virtio_gpu") == 0) {
-
-            vendor = TM_GPU_VENDOR_VIRTIO;
-
-        } else if (strcasecmp(driver, "panfrost") == 0 || strcasecmp(driver, "panthor") == 0
-                   || strcasecmp(driver, "kbase") == 0) {
-
-            vendor = gpu_soc_vendor();
-
-            if (vendor == TM_GPU_VENDOR_UNKNOWN || vendor == TM_GPU_VENDOR_QUALCOMM) {
-                vendor = TM_GPU_VENDOR_ARM;
+            // cardN 后面可能跟 "-HDMI-A-1" 这类连接器，只认纯数字的卡本身
+            if (!is_pure_digits(entry->d_name + 4)) {
+                continue;
             }
 
-        } else if (strcasecmp(driver, "pvrsrvkm") == 0 || strcasecmp(driver, "powervr") == 0) {
+            char path[TM_PATH_MAX];
 
-            vendor = TM_GPU_VENDOR_IMAGINATION;
+            snprintf(path, sizeof(path), "/sys/class/drm/%s", entry->d_name);
 
-        } else if (strcasecmp(driver, "exynos") == 0 || strstr(driver, "exynos") != NULL) {
-
-            vendor = TM_GPU_VENDOR_SAMSUNG;
+            count = gpu_register_drm_card(out, capacity, count, seen, path);
         }
 
-        char name[64];
-
-        gpu_drm_vendor_name(path, name, (int) sizeof(name));
-
-        // 驱动名认出来了但名字还是默认的 "GPU"，就补成"厂商 + 驱动"，便于分辨
-        if (strcmp(name, "GPU") == 0 && driver[0] != '\0') {
-            snprintf(name, sizeof(name), "%s (%s)", gpu_vendor_text(vendor), driver);
-        }
-
-        count = gpu_add(out, capacity, count, seen, path, name, vendor);
+        closedir(dir);
     }
 
-    closedir(dir);
+    static const char *const fixed_cards[] = {
+        "/sys/class/drm/card0",
+        "/sys/class/drm/card1",
+        "/sys/class/drm/card2",
+        "/sys/class/drm/card3",
+    };
+
+    for (size_t i = 0; i < sizeof(fixed_cards) / sizeof(fixed_cards[0]); i++) {
+        count = gpu_register_drm_card(out, capacity, count, seen, fixed_cards[i]);
+    }
 
     return count;
 }
@@ -6416,48 +6639,93 @@ static int compare_network_ref(const void *left, const void *right)
     return strcmp(a->name, b->name);
 }
 
+/** 登记一块网卡：枚举与固定路径两趟共用（按接口名去重，stat 确认存在）。 */
+static int net_add_iface(TmDeviceRef *out, int capacity, int count, const char *iface)
+{
+    if (iface == NULL || iface[0] == '\0' || iface[0] == '.') {
+        return count;
+    }
+
+    // 回环不是网卡：它没有硬件，也没有"发送 / 接收"这回事
+    if (strcmp(iface, "lo") == 0) {
+        return count;
+    }
+
+    for (int i = 0; i < count; i++) {
+
+        if (strcmp(out[i].name, iface) == 0) {
+            return count;
+        }
+    }
+
+    if (count >= capacity) {
+        return count;
+    }
+
+    char probe[TM_PATH_MAX];
+    struct stat info;
+
+    snprintf(probe, sizeof(probe), "/sys/class/net/%s", iface);
+
+    if (stat(probe, &info) != 0) {
+        return count;
+    }
+
+    snprintf(out[count].path, sizeof(out[count].path), "/sys/class/net/%s", iface);
+
+    snprintf(out[count].name, sizeof(out[count].name), "%s", iface);
+
+    return count + 1;
+}
+
 /**
  * 枚举网卡：扫 /sys/class/net，只跳过回环。
  *
  * 虚拟接口也枚举（上层要靠角色字段判断），但排序把无线 / 有线 / 移动网络
  * 放在虚拟接口前面，限流时先保住真网卡。
+ *
+ * 两趟走：枚举 + 常见接口名的固定路径。接口名是内核/厂商起的（wlan0、rmnet_data0
+ * 这些），列不了目录时按固定候选逐个 stat，读到就登记 —— 上层再用 isRegisteredNetwork
+ * 决定收不收、叫什么名字，底层只负责"这个接口存在"。
  */
 static int enumerate_network_devices(TmDeviceRef *out, int capacity)
 {
-    DIR *dir = opendir("/sys/class/net");
-
-    if (dir == NULL) {
+    if (out == NULL || capacity <= 0) {
         return 0;
     }
 
     int count = 0;
 
-    struct dirent *entry;
+    DIR *dir = opendir("/sys/class/net");
 
-    while ((entry = readdir(dir)) != NULL) {
+    if (dir != NULL) {
 
-        if (entry->d_name[0] == '.') {
-            continue;
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+            count = net_add_iface(out, capacity, count, entry->d_name);
         }
 
-        // 回环不是网卡：它没有硬件，也没有"发送 / 接收"这回事
-        if (strcmp(entry->d_name, "lo") == 0) {
-            continue;
-        }
-
-        if (count >= capacity) {
-            break;
-        }
-
-        snprintf(out[count].path, sizeof(out[count].path),
-                 "/sys/class/net/%s", entry->d_name);
-
-        snprintf(out[count].name, sizeof(out[count].name), "%s", entry->d_name);
-
-        count++;
+        closedir(dir);
     }
 
-    closedir(dir);
+    static const char *const fixed_ifaces[] = {
+        "wlan0",
+        "wlan1",
+        "eth0",
+        "eth1",
+        "rmnet0",
+        "rmnet_data0",
+        "rmnet_data1",
+        "ccmni0",
+        "pdp0",
+        "wwan0",
+        "tun0",
+    };
+
+    for (size_t i = 0; i < sizeof(fixed_ifaces) / sizeof(fixed_ifaces[0]); i++) {
+        count = net_add_iface(out, capacity, count, fixed_ifaces[i]);
+    }
 
     if (count > 1) {
         qsort(out, (size_t) count, sizeof(TmDeviceRef), compare_network_ref);
@@ -8139,42 +8407,14 @@ static int disk_index_of_block(const char *block_name,
 
     for (int i = 0; i < disk_count; i++) {
 
-        char dir[TM_PATH_MAX];
+        // 分区判据是"<盘>/<块名>/dev 存在"，这一条用 stat 就够，
+        // 不需要列出盘目录 —— 所以列不了目录也不会把分区认丢。
+        char probe[TM_PATH_MAX];
+        struct stat info;
 
-        snprintf(dir, sizeof(dir), "/sys/block/%s", disks[i].name);
+        snprintf(probe, sizeof(probe), "/sys/block/%s/%s/dev", disks[i].name, block_name);
 
-        DIR *parent = opendir(dir);
-
-        if (parent == NULL) {
-            continue;
-        }
-
-        int found = 0;
-
-        struct dirent *entry;
-
-        while ((entry = readdir(parent)) != NULL) {
-
-            if (entry->d_name[0] == '.' || strcmp(entry->d_name, block_name) != 0) {
-                continue;
-            }
-
-            // 只认分区目录：同名文件（size / stat）不算分区
-            char probe[TM_PATH_MAX];
-            struct stat info;
-
-            snprintf(probe, sizeof(probe), "%s/%s/dev", dir, entry->d_name);
-
-            if (stat(probe, &info) == 0) {
-                found = 1;
-            }
-
-            break;
-        }
-
-        closedir(parent);
-
-        if (found) {
+        if (stat(probe, &info) == 0) {
             return i;
         }
     }
@@ -8706,87 +8946,157 @@ static long long meminfo_bytes(const char *text, const char *key)
 }
 
 /**
- * 扫一个目录下的 zram 设备，累加 mm_stat 的 mem_used_total（字节）。
+ * zram 一族的扫描结果（针对一个 sysfs 目录）。
  *
- * 为什么遍历：一台机器可以有 zram0 / zram1 好几块，写死 zram0 会漏掉后面的。
- * 为什么用 mem_used_total（第 3 列）：它是 zram 实际吃掉的物理内存；
- * 第 2 列 compr_data_size 只是压缩后数据本身的大小，不含页表与元数据。
- *
- * @param base_dir sysfs 里块设备的目录，/sys/block 或 /sys/class/block
- * @return 字节数；0 = 这个目录下没有 zram；-1 = 目录打不开，或有 zram 但一块都读不到
+ * 三个 bool 就是"三态"本身：目录列没列成、有没有看到设备、有没有读到数值。
+ * 必须分开记 —— 合成一个返回值就会出现"设备在但读不到"被当成"没有 zram"。
  */
-static long long sum_zram_mem_used(const char *base_dir)
+typedef struct {
+    bool dir_listed;      // 目录枚举成功，能确认里面有没有 zram
+    bool device_seen;     // 见到 / 探测到 zram 设备存在
+    bool value_read;      // 至少一块读到了 mm_stat
+    long long original;   // orig_data_size 累加
+    long long compressed; // compr_data_size 累加
+    long long used;       // mem_used_total 累加
+    long long disksize;   // disksize 累加
+    bool disksize_read;
+} TmZramDirScan;
+
+/**
+ * 读一块 zram 的 mm_stat 与 disksize。
+ *
+ * mm_stat 九列的顺序（内核文档固定）：
+ *   orig_data_size compr_data_size mem_used_total mem_limit mem_used_max
+ *   same_pages pages_compacted huge_pages huge_pages_since
+ * 只用前三列，各有各的含义，不能互相顶替：
+ *   1) 压缩前的数据量
+ *   2) 压缩后的数据量
+ *   3) 实际占住的物理内存（含分配器碎片与元数据）
+ *
+ * @return true = mm_stat 读到了；false = 这块读不到（权限 / 格式不对）
+ */
+static bool zram_read_one(const char *base_dir, const char *name, TmZramDirScan *scan)
 {
-    DIR *dir = opendir(base_dir);
+    char path[TM_PATH_MAX];
 
-    if (dir == NULL) {
-        return -1;
+    snprintf(path, sizeof(path), "%s/%s/mm_stat", base_dir, name);
+
+    char text[256];
+
+    long long orig = 0;
+    long long compr = 0;
+    long long used = 0;
+
+    if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
+        return false;
     }
 
-    long long total = 0;
-    int saw_zram = 0;
-    int found = 0;
-
-    struct dirent *entry;
-
-    while ((entry = readdir(dir)) != NULL) {
-
-        if (strncmp(entry->d_name, "zram", 4) != 0) {
-            continue;
-        }
-
-        saw_zram = 1;
-
-        char path[TM_PATH_MAX];
-
-        snprintf(path, sizeof(path), "%s/%s/mm_stat", base_dir, entry->d_name);
-
-        char text[256];
-
-        if (read_text_file(path, text, (int) sizeof(text)) <= 0) {
-            continue;
-        }
-
-        // 列顺序：orig_data_size compr_data_size mem_used_total ...
-        long long orig = 0;
-        long long compr = 0;
-        long long used = 0;
-
-        if (sscanf(text, "%lld %lld %lld", &orig, &compr, &used) != 3) {
-            continue;
-        }
-
-        if (used <= 0) {
-            continue;
-        }
-
-        total += used;
-        found = 1;
+    if (sscanf(text, "%lld %lld %lld", &orig, &compr, &used) != 3) {
+        return false;
     }
 
-    closedir(dir);
+    scan->original += orig;
+    scan->compressed += compr;
 
-    if (!saw_zram) {
-        return 0;
+    if (used > 0) {
+        // 多块 zram 相加；0 说明这块还没吃内存，加不加都不影响总和
+        scan->used += used;
     }
 
-    return found ? total : -1;
+    snprintf(path, sizeof(path), "%s/%s/disksize", base_dir, name);
+
+    double size = 0.0;
+
+    if (read_first_number(path, &size) && size > 0.0) {
+        scan->disksize += (long long) size;
+        scan->disksize_read = true;
+    }
+
+    return true;
 }
 
 /**
- * mm_stat 读不到时的折算分母。
+ * 扫一个目录（/sys/block 或 /sys/class/block）里的 zram 设备。
  *
- * zram 的常见压缩比在 2:1 到 3:1 之间，这里取中间值 3：只影响"没有 sysfs 权限"那一档，
- * 有权限时用的都是 mm_stat 的精确值。宁可量级对、不精确，也比报 0 强 ——
- * 报 0 会让人以为这台机器没开压缩内存。
+ * 两步：先枚举；列不了目录（SELinux 只给 search 不给 readdir）就按 zram0..zram3
+ * 固定编号 stat + 读 mm_stat —— 块设备编号连续，单块读得动就够，不该因为
+ * 列不了目录就判"这台机器没开压缩内存"。
  */
-#define TM_ZRAM_FALLBACK_DIVISOR 3LL
+static void zram_scan_dir(const char *base_dir, TmZramDirScan *scan)
+{
+    memset(scan, 0, sizeof(*scan));
+
+    DIR *dir = opendir(base_dir);
+
+    if (dir != NULL) {
+
+        scan->dir_listed = true;
+
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+
+            if (strncmp(entry->d_name, "zram", 4) != 0) {
+                continue;
+            }
+
+            scan->device_seen = true;
+
+            if (zram_read_one(base_dir, entry->d_name, scan)) {
+                scan->value_read = true;
+            }
+        }
+
+        closedir(dir);
+
+        return;
+    }
+
+    for (int index = 0; index < 4; index++) {
+
+        char name[16];
+
+        snprintf(name, sizeof(name), "zram%d", index);
+
+        char path[TM_PATH_MAX];
+
+        snprintf(path, sizeof(path), "%s/%s", base_dir, name);
+
+        struct stat info;
+
+        if (stat(path, &info) != 0) {
+            continue;
+        }
+
+        scan->device_seen = true;
+
+        if (zram_read_one(base_dir, name, scan)) {
+            scan->value_read = true;
+        }
+    }
+}
+
+/** zram 汇总状态：确认没有 / 精确读到 / 设备在但读不到 / 连有没有都不知道。 */
+#define TM_ZRAM_NONE 0
+#define TM_ZRAM_OK 1
+#define TM_ZRAM_UNREADABLE 2
+#define TM_ZRAM_UNKNOWN 3
+
+typedef struct {
+    int state;
+    long long original_bytes;
+    long long compressed_bytes;
+    long long used_bytes;
+    long long disksize_bytes;
+    bool disksize_known;
+} TmZramInfo;
 
 /**
  * 从 /proc/swaps 里取 zram 设备已用掉的交换量（字节）。
  *
- * 这一行是**压缩前**的数据量（和 mm_stat 的 orig_data_size 是同一个数），
- * 只有在 mm_stat 读不到时才拿它折算压缩后占用，不能直接当成压缩量显示。
+ * 这一行是**压缩前**的数据量，只用来回答"zram 是不是正在当交换用"，
+ * 不能当成压缩后占用，也不能除以某个压缩比反推内存 —— 它和 mem_used_total
+ * 本来就不是同一个口径（same_pages 之类会让两者对不上）。
  *
  * @return 字节数；-1 = 没有 zram 交换，或这个文件读不到
  */
@@ -8839,45 +9149,120 @@ static long long read_zram_swap_used_bytes(void)
 }
 
 /**
- * 压缩内存：所有 zram 设备实际占住的物理内存。
+ * 交换空间：/proc/swaps 的 Size / Used 两列，所有 swap 设备一起加（不只 zram）。
  *
- * 三档来源，逐档降级：
- *   1) sys block 下每块 zram 的 mm_stat      精确值，首选；
- *   2) sys class 下的同一批属性              同一个 inode 的另一条路径，个别机型只留着这条；
- *   3) 两处都读不到（普通应用域常常被 SELinux 挡在 sysfs 外）时，
- *      用 /proc/swaps 里 zram 的已用量按常见压缩比折算，量级正确但不是精确值。
+ * Size 是设备配置容量（zram 的 disksize、磁盘 swap 分区的分区大小），Used 是
+ * 已用交换量（压缩前口径，别拿它当内存占用）。表头那一行 sscanf 不认数字，
+ * 自然被挡掉。
  *
- * 三档都说不过去（没有 zram、也没有 /proc/swaps）时返回 -1，
- * 上层按这一项没有值处理，不拿 0 顶替。
- *
- * @return 字节数；0 = 这台机器确实没开压缩内存
+ * @return 0 = 读到了（没有设备行时 total / used 都是 0，属于"没配交换"）；
+ *         -1 = 文件读不到
  */
-static long long read_zram_used_bytes(void)
+static int read_swap_table_bytes(long long *total_out, long long *used_out)
 {
-    long long from_block = sum_zram_mem_used("/sys/block");
+    static char text[2048];
 
-    if (from_block > 0) {
-        return from_block;
+    if (read_text_file("/proc/swaps", text, (int) sizeof(text)) <= 0) {
+        return -1;
     }
 
-    long long from_class = sum_zram_mem_used("/sys/class/block");
+    long long total = 0;
+    long long used = 0;
 
-    if (from_class > 0) {
-        return from_class;
+    char *cursor = text;
+
+    while (cursor != NULL && cursor[0] != '\0') {
+
+        char *newline = strchr(cursor, '\n');
+
+        if (newline != NULL) {
+            newline[0] = '\0';
+        }
+
+        char name[64];
+        char type[32];
+        long long size_kb = 0;
+        long long used_kb = 0;
+
+        if (sscanf(cursor, "%63s %31s %lld %lld", name, type, &size_kb, &used_kb) == 4) {
+
+            total += size_kb * 1024LL;
+            used += used_kb * 1024LL;
+        }
+
+        if (newline == NULL) {
+            break;
+        }
+
+        cursor = newline + 1;
     }
 
-    // 两处都明说"这里没有 zram"，那压缩内存就是 0
-    if (from_block == 0 || from_class == 0) {
-        return 0;
+    *total_out = total;
+    *used_out = used;
+
+    return 0;
+}
+
+/**
+ * 压缩内存：所有 zram 设备实际占住的物理内存（mm_stat 第 3 列 mem_used_total）。
+ *
+ * 来源只有两条，都是同一个 inode 的两条路径：
+ *   1) /sys/block/zramN/mm_stat
+ *   2) /sys/class/block/zramN/mm_stat
+ * 两处是同一批设备，**只取其一**累加，绝不两条路径相加（会翻倍）。
+ *
+ * 刻意不做的两件事：
+ *   - 不拿 disksize 当已压缩内存（那是容量上限，不是用量）；
+ *   - 不拿 /proc/swaps 的 Used 除以假定压缩比。压缩比随内容在 1:1..4:1 之间浮动，
+ *     mem_used_total 还含分配器碎片与元数据，"原始量 / 3"只是猜的，
+ *     看着像精确值最误导。读不到就如实报读不到。
+ *
+ * 状态：
+ *   NONE        两处都确认没有 zram（压缩内存 0 是有效结论）
+ *   UNREADABLE  看到设备但数值读不到（多半是 SELinux）
+ *   UNKNOWN     目录本身都列不了，连有没有都不知道
+ */
+static void read_zram_info(TmZramInfo *info)
+{
+    memset(info, 0, sizeof(*info));
+
+    TmZramDirScan block_scan;
+    TmZramDirScan class_scan;
+
+    zram_scan_dir("/sys/block", &block_scan);
+    zram_scan_dir("/sys/class/block", &class_scan);
+
+    const TmZramDirScan *source = NULL;
+
+    if (block_scan.value_read) {
+        source = &block_scan;
+    } else if (class_scan.value_read) {
+        source = &class_scan;
     }
 
-    long long swapped = read_zram_swap_used_bytes();
+    if (source != NULL) {
 
-    if (swapped > 0) {
-        return swapped / TM_ZRAM_FALLBACK_DIVISOR;
+        info->state = TM_ZRAM_OK;
+        info->original_bytes = source->original;
+        info->compressed_bytes = source->compressed;
+        info->used_bytes = source->used;
+        info->disksize_bytes = source->disksize;
+        info->disksize_known = source->disksize_read;
+
+        return;
     }
 
-    return -1;
+    if (block_scan.device_seen || class_scan.device_seen) {
+        info->state = TM_ZRAM_UNREADABLE;
+        return;
+    }
+
+    if (block_scan.dir_listed || class_scan.dir_listed) {
+        info->state = TM_ZRAM_NONE;
+        return;
+    }
+
+    info->state = TM_ZRAM_UNKNOWN;
 }
 
 /** 高通内核头文件里 ddr_type 的枚举顺序，值即下标的含义与厂商一致。 */
@@ -9669,8 +10054,69 @@ static int build_memory_devices(TmOutDevice *out, int capacity,
     device_put_int(&out[0], "nonreclaimable_kernel_bytes", sunreclaim,
                    TM_FIELD_STATUS_NOT_AVAILABLE);
 
-    // 压缩内存在 zram 里，meminfo 的 SwapTotal 只是它的上限，不能用
-    device_put_int(&out[0], "compressed_bytes", read_zram_used_bytes(),
+    // 压缩内存在 zram 里，meminfo 的 SwapTotal 只是它的上限，不能用。
+    // 下面每个数都来自 mm_stat 的实测列，没有任何一项是折算出来的。
+    TmZramInfo zram;
+
+    read_zram_info(&zram);
+
+    const char *zram_status = TM_FIELD_STATUS_NOT_AVAILABLE;
+
+    if (zram.state == TM_ZRAM_UNREADABLE || zram.state == TM_ZRAM_UNKNOWN) {
+        // 设备在但读不到 / 连目录都列不了：都是"也许能拿到"，不是"没有"
+        zram_status = TM_FIELD_STATUS_ACCESS_DENIED;
+    }
+
+    long long zram_used = -1;
+    long long zram_original = -1;
+    long long zram_compressed = -1;
+
+    if (zram.state == TM_ZRAM_OK) {
+
+        zram_used = zram.used_bytes;
+        zram_original = zram.original_bytes;
+        zram_compressed = zram.compressed_bytes;
+
+    } else if (zram.state == TM_ZRAM_NONE) {
+
+        // 确认没有 zram：0 是有效结论，不是"读不到"
+        zram_used = 0;
+        zram_original = 0;
+        zram_compressed = 0;
+    }
+
+    device_put_int(&out[0], "compressed_bytes", zram_used, zram_status);
+
+    device_put_int(&out[0], "zram_original_bytes", zram_original, zram_status);
+
+    device_put_int(&out[0], "zram_compressed_bytes", zram_compressed, zram_status);
+
+    device_put_int(&out[0], "zram_used_bytes", zram_used, zram_status);
+
+    // 设备容量：disksize 是上限，和用量分开报，谁也不顶替谁
+    device_put_int(&out[0], "zram_disksize_bytes",
+                   zram.disksize_known ? zram.disksize_bytes : -1,
+                   zram.disksize_known ? TM_FIELD_STATUS_NOT_AVAILABLE
+                                       : (zram.state == TM_ZRAM_NONE
+                                          ? TM_FIELD_STATUS_UNSUPPORTED : zram_status));
+
+    // 交换空间：/proc/swaps 的 Size（设备配置容量）与 Used（已用量），
+    // 所有 swap 设备一起加，不只认 zram。Used 是压缩前口径，不能当内存占用；
+    // 无设备行时两个都是 0（没配交换，有效结论），读不到才报不可用。
+    long long swap_total = -1;
+    long long swap_used = -1;
+
+    if (read_swap_table_bytes(&swap_total, &swap_used) != 0) {
+        swap_total = -1;
+        swap_used = -1;
+    }
+
+    device_put_int(&out[0], "swap_total_bytes", swap_total, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    device_put_int(&out[0], "swap_used_bytes", swap_used, TM_FIELD_STATUS_NOT_AVAILABLE);
+
+    // zram 的交换用量单独一格（压缩前口径），与上面的全表交换量分开报
+    device_put_int(&out[0], "zram_swap_used_bytes", read_zram_swap_used_bytes(),
                    TM_FIELD_STATUS_NOT_AVAILABLE);
 
     // 分条图另外三段
@@ -9914,55 +10360,80 @@ static bool gpu_text_has_gpu(const char *text)
     return strstr(lower, "gpu") != NULL;
 }
 
-/** 兜底温度：/sys/class/thermal 里 type 带 gpu 的第一个热区。 */
+/** 检查一个热区：type 带 gpu、且 temp 读得出来，才算 GPU 温度。 */
+static bool gpu_thermal_zone_check(const char *zone, long long *celsius)
+{
+    char path[256];
+
+    snprintf(path, sizeof(path), "/sys/class/thermal/%s/type", zone);
+
+    char type_text[64];
+
+    if (read_text_file(path, type_text, (int) sizeof(type_text)) <= 0) {
+        return false;
+    }
+
+    if (!gpu_text_has_gpu(type_text)) {
+        return false;
+    }
+
+    snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", zone);
+
+    long long milli = 0;
+
+    if (!gpu_read_first_int(path, &milli)) {
+        return false;
+    }
+
+    *celsius = milli / 1000;
+
+    return true;
+}
+
+/**
+ * 兜底温度：/sys/class/thermal 里 type 带 gpu 的第一个热区。
+ *
+ * 两趟走，理由与 GPU 发现一样：热区编号由内核按注册顺序定，不枚举不知道有几条；
+ * 但枚举要"读目录"权限，被 SELinux 挡住时，thermal_zone0..15 的固定编号仍能
+ * 一个个直接读 type —— 读得到就认得出来，不因为列不了目录就把温度判成没有。
+ */
 static bool gpu_thermal_zone_temperature(long long *celsius)
 {
     DIR *dir = opendir("/sys/class/thermal");
 
-    if (dir == NULL) {
-        return false;
+    if (dir != NULL) {
+
+        struct dirent *entry;
+
+        while ((entry = readdir(dir)) != NULL) {
+
+            if (strncmp(entry->d_name, "thermal_zone", 12) != 0) {
+                continue;
+            }
+
+            if (gpu_thermal_zone_check(entry->d_name, celsius)) {
+
+                closedir(dir);
+
+                return true;
+            }
+        }
+
+        closedir(dir);
     }
 
-    bool found = false;
+    for (int index = 0; index < 16; index++) {
 
-    struct dirent *entry;
+        char zone[32];
 
-    while (!found && (entry = readdir(dir)) != NULL) {
+        snprintf(zone, sizeof(zone), "thermal_zone%d", index);
 
-        if (strncmp(entry->d_name, "thermal_zone", 12) != 0) {
-            continue;
+        if (gpu_thermal_zone_check(zone, celsius)) {
+            return true;
         }
-
-        char path[256];
-
-        snprintf(path, sizeof(path), "/sys/class/thermal/%s/type", entry->d_name);
-
-        char type_text[64];
-
-        if (read_text_file(path, type_text, (int) sizeof(type_text)) <= 0) {
-            continue;
-        }
-
-        if (!gpu_text_has_gpu(type_text)) {
-            continue;
-        }
-
-        snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", entry->d_name);
-
-        long long milli = 0;
-
-        if (!gpu_read_first_int(path, &milli)) {
-            continue;
-        }
-
-        *celsius = milli / 1000;
-
-        found = true;
     }
 
-    closedir(dir);
-
-    return found;
+    return false;
 }
 
 /**
@@ -10173,6 +10644,34 @@ static GpuField gpu_field_missing(const char *status)
     return field;
 }
 
+/**
+ * 节点"在不在"：stat 成功说明路径存在（只要求父目录的 search 权限，不读文件内容）。
+ *
+ * 用途是区分两种"什么都没读到"：
+ *   - 路径存在、值读不出来  -> 权限问题，报 ACCESS_DENIED（界面显示 "-"）
+ *   - 路径根本不存在        -> 这个平台没导出这一格，报 NOT_AVAILABLE（"不支持"）
+ * 绝不能在"目录枚举失败"这一步就把整块判死。
+ */
+static bool gpu_node_exists(const char *path)
+{
+    struct stat info;
+
+    return stat(path, &info) == 0;
+}
+
+/** 候选路径里只要有一个存在却读不出来，就按权限问题报。 */
+static GpuField gpu_missing_from_paths(const char *const *paths, size_t path_count)
+{
+    for (size_t i = 0; i < path_count; i++) {
+
+        if (paths[i] != NULL && gpu_node_exists(paths[i])) {
+            return gpu_field_missing(TM_FIELD_STATUS_ACCESS_DENIED);
+        }
+    }
+
+    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+}
+
 /** 一次性读两个整数（gpubusy 那种"忙碌 总计"的格式）。 */
 static bool gpu_read_two_ints(const char *path, long long *first, long long *second)
 {
@@ -10196,56 +10695,84 @@ static bool gpu_read_two_ints(const char *path, long long *first, long long *sec
     return true;
 }
 
+/** 取某个 devfreq 设备的 load（"22@300000000Hz" 里的 22，夹到 0..100）。 */
+static bool gpu_devfreq_read_load(const char *device, long long *percent)
+{
+    char path[TM_PATH_MAX];
+
+    snprintf(path, sizeof(path), "/sys/class/devfreq/%s/load", device);
+
+    long long value = 0;
+
+    if (!gpu_read_first_int(path, &value)) {
+        return false;
+    }
+
+    if (value < 0) value = 0;
+
+    if (value > 100) value = 100;
+
+    *percent = value;
+
+    return true;
+}
+
 /**
  * devfreq 的 load 一格：Mali / panfrost / panthor 都走这个。
  *
  * 格式是 "22@300000000Hz"（占用百分比 @ 当前频率），也见过只写百分比的。
  * 只取 @ 前面那个数，夹到 0..100。
+ *
+ * 枚举之后还有固定兜底：devfreq 设备名是厂商起的（gpu / mali / mtk_gpu …），
+ * 穷举不了，但常见的那几个先直接试一遍 —— 目录枚举被挡时，名字对了就能读到。
  */
 static bool gpu_devfreq_load(long long *percent)
 {
     DIR *dir = opendir("/sys/class/devfreq");
 
-    if (dir == NULL) {
-        return false;
-    }
+    if (dir != NULL) {
 
-    bool found = false;
+        struct dirent *entry;
 
-    struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
 
-    while (!found && (entry = readdir(dir)) != NULL) {
+            bool looks_gpu = strstr(entry->d_name, "gpu") != NULL
+                             || strstr(entry->d_name, "mali") != NULL
+                             || strstr(entry->d_name, "pan") != NULL;
 
-        bool looks_gpu = strstr(entry->d_name, "gpu") != NULL
-                         || strstr(entry->d_name, "mali") != NULL
-                         || strstr(entry->d_name, "pan") != NULL;
+            if (!looks_gpu) {
+                continue;
+            }
 
-        if (!looks_gpu) {
-            continue;
+            if (gpu_devfreq_read_load(entry->d_name, percent)) {
+
+                closedir(dir);
+
+                return true;
+            }
         }
 
-        char path[TM_PATH_MAX];
-
-        snprintf(path, sizeof(path), "/sys/class/devfreq/%s/load", entry->d_name);
-
-        long long value = 0;
-
-        if (!gpu_read_first_int(path, &value)) {
-            continue;
-        }
-
-        if (value < 0) value = 0;
-
-        if (value > 100) value = 100;
-
-        *percent = value;
-
-        found = true;
+        closedir(dir);
     }
 
-    closedir(dir);
+    static const char *const fixed_devices[] = {
+        "gpu",
+        "mali",
+        "kgsl-3d0",
+        "mtk_gpu",
+        "soc:gpu",
+        "13000000.mali",
+        "5000000.mali"
+    };
 
-    return found;
+    for (size_t i = 0; i < sizeof(fixed_devices) / sizeof(fixed_devices[0]); i++) {
+
+        if (gpu_devfreq_read_load(fixed_devices[i], percent)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /**
@@ -10292,7 +10819,20 @@ static GpuField gpu_qualcomm_usage(const char *base)
         return gpu_field_value(percent);
     }
 
-    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+    // 三个候选全没读出来时再分一次状态：节点在 = 权限不够（"-"），
+    // 节点根本不存在 = 这平台没导出利用率（"不支持"）。
+    char busy_path[TM_PATH_MAX];
+    char ratio_path[TM_PATH_MAX];
+    char drm_path[TM_PATH_MAX];
+
+    snprintf(busy_path, sizeof(busy_path), "%s/gpu_busy_percentage", base);
+    snprintf(ratio_path, sizeof(ratio_path), "%s/gpubusy", base);
+    snprintf(drm_path, sizeof(drm_path), "%s/device/gpu_busy_percent", base);
+
+    const char *const usage_candidates[] = { busy_path, ratio_path, drm_path };
+
+    return gpu_missing_from_paths(usage_candidates,
+                                  sizeof(usage_candidates) / sizeof(usage_candidates[0]));
 }
 
 /** 联发科：GED 框架与它的 hal 节点。两处都试，先读到的算。 */
@@ -10313,7 +10853,7 @@ static GpuField gpu_mediatek_usage(void)
         }
     }
 
-    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+    return gpu_missing_from_paths(paths, sizeof(paths) / sizeof(paths[0]));
 }
 
 /** 通用 DRM（amdgpu / i915 / panfrost 等）：驱动自己导出的占用文件。 */
@@ -10410,7 +10950,11 @@ static GpuField gpu_qualcomm_temperature(const char *base)
         return gpu_field_value(celsius);
     }
 
-    return gpu_field_missing(TM_FIELD_STATUS_NOT_AVAILABLE);
+    // temp 节点在、值读不出来：权限问题（"-"）；节点不在：这版内核没导出温度
+    const char *const temperature_candidates[] = { path };
+
+    return gpu_missing_from_paths(temperature_candidates,
+                                  sizeof(temperature_candidates) / sizeof(temperature_candidates[0]));
 }
 
 /** 填写函数：GPU 温度（厂商专用 -> hwmon -> 热区 -> 状态）。 */
@@ -10601,7 +11145,32 @@ static GpuField gpu_field_shared(const TmDeviceRef *device, bool used)
     }
 
     if (!has_mapped) {
-        return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
+
+        // 全都没读出来时再看节点在不在：kgsl 的 mapped、GTT 的 used/total、
+        // dma-buf 的 buffers 目录，任何一处存在都说明"这平台有这一格、只是没读到"，
+        // 按权限报（界面显示 "-"）；全都找不到才是真不支持。
+        char gtt_used_path[TM_PATH_MAX];
+        char gtt_total_path[TM_PATH_MAX];
+
+        snprintf(gtt_used_path, sizeof(gtt_used_path), "%s/device/mem_info_gtt_used", device->path);
+        snprintf(gtt_total_path, sizeof(gtt_total_path), "%s/device/mem_info_gtt_total", device->path);
+
+        const char *const shared_candidates[] = {
+            gtt_used_path,
+            gtt_total_path,
+            "/sys/class/kgsl/kgsl/mapped",
+            "/sys/kernel/dmabuf/buffers",
+            "/sys/kernel/dma_buf/buffers",
+        };
+
+        GpuField missing = gpu_missing_from_paths(shared_candidates,
+                                                  sizeof(shared_candidates) / sizeof(shared_candidates[0]));
+
+        if (missing.status != NULL && strcmp(missing.status, TM_FIELD_STATUS_NOT_AVAILABLE) == 0) {
+            return gpu_field_missing(TM_FIELD_STATUS_UNSUPPORTED);
+        }
+
+        return missing;
     }
 
     if (used) {
