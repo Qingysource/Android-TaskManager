@@ -156,6 +156,42 @@ private fun PerformanceOverflowMenu(
 }
 
 // ============================================================
+// Device Detail Entry (性能页专用)
+// ============================================================
+
+/**
+ * 性能页动作区里的「设备详细信息」入口（单个图标按钮，不是下拉菜单）。
+ *
+ * 位置：右上角溢出菜单的**左边**，两者同属性能页的动作区 —— 宽屏在页名行右端，
+ * 竖屏在 TopAppBar 的 actions 里。点一下直接打开设备详细信息页。
+ *
+ * 为什么入口只放这一处：这一页是性能数据的补充视图，别处没有语义上的入口；
+ * 页面自己不做第二个回跳入口，返回就靠页面标题栏那颗箭头。
+ */
+@Composable
+private fun PerformanceDetailEntry(
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+
+    IconButton(onClick = onOpen, modifier = modifier) {
+
+        Icon(
+            imageVector = Icons.Default.Info,
+
+            contentDescription = "设备详细信息"
+        )
+    }
+}
+
+/**
+ * 设备详细信息页的入口：整页本体在 ui/DeviceDetailScreen.kt（[DeviceDetailPage]）。
+ *
+ * 这里只留入口按钮与调度，界面代码不再往 MainActivity 里堆 ——
+ * 本文件已经有 1200 多行，再塞一整页内容会很难按页定位。
+ */
+
+// ============================================================
 // Activity Entry
 // ============================================================
 
@@ -670,6 +706,10 @@ private fun MainPage(
     }
     var railExpanded by rememberSaveable { mutableStateOf(false) }
 
+    // 设备详细信息页的开关：只有性能页动作区那一个按钮会把它置 true，
+    // 页面自己那颗返回箭头置回 false。它是一整页，不是弹窗。
+    var deviceDetailVisible by rememberSaveable { mutableStateOf(false) }
+
     // 性能页管理器：页名行右端的溢出菜单往这里发请求（复制由页面实现、资源监视器只有空接口）
     val performanceManager = PageManagers.performance(LocalContext.current)
 
@@ -687,7 +727,25 @@ private fun MainPage(
         val chartSummary = PageManagers.performance(LocalContext.current).summaryActive &&
             selectedPage == TaskPage.Performance
 
-        if (chartSummary) {
+        if (deviceDetailVisible) {
+
+            // 设备详细信息页：整页独显，导航栏 / 页名行 / 顶栏一起让位。
+            //
+            // 这一支不在 Scaffold 里，拿不到 TopAppBar 那份 inset 边距：targetSdk 已经是
+            // edge-to-edge，不自己让位的话标题行会顶到状态栏（用户看到的就是"第一排跑进通知栏"）。
+            // 所以整页按 safeDrawing 让开状态栏 / 导航栏 / 刘海。
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+            ) {
+
+                DeviceDetailPage(
+                    onBack = { deviceDetailVisible = false }
+                )
+            }
+
+        } else if (chartSummary) {
 
             PageContent(selectedPage, settingsProvider, onSettingChanged)
 
@@ -757,6 +815,11 @@ private fun MainPage(
                         // 这里只决定按钮画在哪，点下去转交性能页管理器，复制逻辑仍在页面里。
                         if (selectedPage == TaskPage.Performance) {
                             Spacer(Modifier.weight(1f))
+
+                            // 详细信息入口在溢出菜单左边，顺序写在这里就是屏幕顺序
+                            PerformanceDetailEntry(
+                                onOpen = { deviceDetailVisible = true }
+                            )
 
                             PerformanceOverflowMenu(
                                 onCopyChart = { performanceManager.requestCopyChart() },
@@ -844,8 +907,14 @@ private fun MainPage(
                                 }
                             },
                             actions = {
-                                // 性能页的溢出菜单：顶栏右侧，与宽屏页名行是同一个位置
+                                // 性能页的溢出菜单：顶栏右侧，与宽屏页名行是同一个位置。
+                                // 详细信息入口排在它左边（actions 里靠前的先画、更靠左）
                                 if (selectedPage == TaskPage.Performance) {
+
+                                    PerformanceDetailEntry(
+                                        onOpen = { deviceDetailVisible = true }
+                                    )
+
                                     PerformanceOverflowMenu(
                                         onCopyChart = { performanceManager.requestCopyChart() },
 

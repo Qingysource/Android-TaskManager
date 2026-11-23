@@ -348,8 +348,17 @@ object LinuxRequestType {
      */
     const val DEVICE_SNAPSHOT = 5
 
+    /**
+     * 设备扩展快照：逐集群 / 逐核心的细粒度数据（当前只有 CPU 这一组）。
+     *
+     * 与 [DEVICE_SNAPSHOT] 并列，不是它的扩展字段：5 的字段集合与设备实例
+     * 已经被性能页锁定，扩展信息要按集群、按核各发一台设备，塞进 5 会改动
+     * 既有解析。请求 `REQ <seq> 6 0x0`，应答全是 D/F 行，包头 count 记 D+F 总条数。
+     */
+    const val DEVICE_EXTENDED_SNAPSHOT = 6
+
     /** 合法范围（解析时用来拒绝未知 typeCode 的脏包）。 */
-    val VALID: IntRange = QUERY_PROCESS..DEVICE_SNAPSHOT
+    val VALID: IntRange = QUERY_PROCESS..DEVICE_EXTENDED_SNAPSHOT
 
     fun nameOf(typeCode: Int): String = when (typeCode) {
         QUERY_PROCESS -> "QUERY_PROCESS"
@@ -357,6 +366,7 @@ object LinuxRequestType {
         CONTROL -> "CONTROL"
         PING -> "PING"
         DEVICE_SNAPSHOT -> "DEVICE_SNAPSHOT"
+        DEVICE_EXTENDED_SNAPSHOT -> "DEVICE_EXTENDED_SNAPSHOT"
         else -> "UNKNOWN($typeCode)"
     }
 }
@@ -586,6 +596,16 @@ object LinuxProtocol {
     const val DEVICE_TYPE_GPU = "GPU"
     const val DEVICE_TYPE_SYSTEM = "SYSTEM"
 
+    /**
+     * 设备扩展快照（typeCode=6）的两种设备类型。
+     *
+     * CPU_CLUSTER 是分区标签（一个调频域 / 拓扑簇一台），CPU_CORE 是一颗逻辑核一台。
+     * 与 5 里的 "CPU" 区分开：那是"整颗处理器合并成一台"，这里是逐核粒度，
+     * 页面靠 type 分辨"这是分区还是核心"。
+     */
+    const val DEVICE_TYPE_CPU_CLUSTER = "CPU_CLUSTER"
+    const val DEVICE_TYPE_CPU_CORE = "CPU_CORE"
+
     /** 后端就绪通知（进程起来、可以收请求）。它不属于任何包，单独一行。 */
     const val READY_LINE = "READY"
 
@@ -652,6 +672,15 @@ object LinuxProtocol {
     }
 
     /**
+     * 组一个设备扩展快照请求：`REQ <seq> 6 0x0`。
+     *
+     * 不带附加参数：CPU 名称库那套上下文是设备快照（5）的东西，
+     * 扩展页不使用它，也不需要服务端为它刷新缓存。
+     */
+    fun buildDeviceExtendedSnapshot(seq: Long): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.DEVICE_EXTENDED_SNAPSHOT} 0x0"
+
+    /**
      * 组一个控制请求：`REQ <seq> 3 0x0 <code> [arg]`
      *
      * 掩码位固定 0x0：控制类不看字段集合，避免"掩码里有垃圾位"被判成参数错。
@@ -685,7 +714,7 @@ object LinuxProtocol {
      *
      * 具体校验：
      * - 字段数必须正好 ≥ 7（多出来的当扩展字段，忽略）；
-     * - seq > 0；isFromSvc 必须为 1；typeCode ∈ 1..5；status ∈ 0..5；count ≥ 0；
+     * - seq > 0；isFromSvc 必须为 1；typeCode ∈ 1..6；status ∈ 0..5；count ≥ 0；
      * - mask 只能占 43 位以内。
      */
     fun parseHeader(line: String): PacketHeader? {
@@ -1793,6 +1822,43 @@ class LinuxService : Service(), ILinuxServiceApi {
         PerformanceSnapshot.from(deviceSnapshotPacket(timeoutMs))
 
     /**
+     * 取一包设备扩展快照（typeCode=6，设备详细信息页用）。
+     *
+     * 请求措辞：`REQ <seq> 6 0x0`，没有附加参数。应答全是 D/F 行：
+     * `D id=cluster0 type=CPU_CLUSTER` 与 `D id=cpu0 type=CPU_CORE`，
+     * 包头 count = D 行 + F 行总条数。
+     *
+     * 为什么不让调用方自己拼请求：seq 配对、超时清理、收包归属都在这一个类里，
+     * 页面只该拿到"解析好的一帧"。
+     *
+     * @return 完整包；后端没就绪 / 超时 / 老后端回 UNSUPPORTED → null
+     */
+    fun extendedDeviceSnapshotPacket(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
+
+        if (!isBackendReady) {
+            append("设备扩展快照推迟：后端尚未就绪（未收到 READY）")
+
+            return null
+        }
+
+        val seq = nextSeqOf()
+
+        val packet = exchange(
+            seq,
+            LinuxProtocol.buildDeviceExtendedSnapshot(seq),
+            LinuxRequestType.DEVICE_EXTENDED_SNAPSHOT,
+            0L,
+            timeoutMs
+        )
+
+        if (packet != null && !packet.isOk) {
+            append("设备扩展快照未采用：${packet.failureReason ?: packet.summary()}")
+        }
+
+        return packet
+    }
+
+    /**
      * 取一次进程快照。
      *
      * 请求措辞：`REQ <seq> 1 <maskHex> <scope>` —— 第 5 个字段是范围，
@@ -2011,11 +2077,13 @@ class LinuxService : Service(), ILinuxServiceApi {
                 activePending = slot
             }
 
-            // count=0 的包（QUERY_INFO、PING、控制回执）到此就已经完整了。
-            // 设备快照例外：它的 count 记的是"后面 I 行的条数"，见到包头只是开头；
-            // 但失败包（UNSUPPORTED 等）本来就没有 I 行，见到包头就得收尾，
-            // 否则要白等满一个超时。
-            if (header.typeCode == LinuxRequestType.DEVICE_SNAPSHOT) {
+            // 设备快照例外：它的 count 记的是"后面数据行的条数"，见到包头只是开头；
+            // 失败包（UNSUPPORTED 等）本来就没有数据行，见到包头就得收尾，
+            // 否则要白等满一个超时。设备扩展快照（6）与 5 是同一套收包约定，
+            // 必须一起放进来 —— 漏了它，count>0 的成功包会被当成"以包头收尾"的半包。
+            if (header.typeCode == LinuxRequestType.DEVICE_SNAPSHOT ||
+                header.typeCode == LinuxRequestType.DEVICE_EXTENDED_SNAPSHOT
+            ) {
 
                 if (header.status != LinuxPacketStatus.OK || header.count <= 0) {
                     finishSlot(slot)

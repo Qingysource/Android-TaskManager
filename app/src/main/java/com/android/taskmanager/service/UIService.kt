@@ -94,6 +94,7 @@ import com.android.taskmanager.data.LinuxPacketStatus
 import com.android.taskmanager.data.LinuxProcessRecord
 import com.android.taskmanager.data.LinuxProtocol
 import com.android.taskmanager.data.CpuUsagePoint
+import com.android.taskmanager.data.CpuExtendedSnapshot
 import com.android.taskmanager.data.LinuxRequestType
 import com.android.taskmanager.data.PerformanceSnapshot
 import com.android.taskmanager.data.ProcessScope
@@ -2478,6 +2479,33 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         return linux.deviceSnapshotPacket(linuxRequestTimeoutMs)
     }
+
+    /**
+     * 设备扩展快照（typeCode=6）的原始包：设备详细信息页与排错用。
+     *
+     * 与 [linuxDeviceSnapshot] 分开两路：那个是"整颗处理器一台设备"的性能页口径，
+     * 这个是"一簇一台、一核一台"。两路各自有采样基线（后端侧各存一份），
+     * 所以这里也不需要跟性能页的采集线程错峰。
+     *
+     * "已暂停"时不发请求：暂停的语义是"连后台也别动"，页面那边同样按 0 间隔处理。
+     */
+    fun linuxExtendedDeviceSnapshot(): LinuxPacket? {
+
+        if (pollIntervalMs(settingsSnapshot.updateSpeed) <= 0L) return null
+
+        val linux = LinuxService.instanceOrNull() ?: return null
+
+        return linux.extendedDeviceSnapshotPacket(linuxRequestTimeoutMs)
+    }
+
+    /**
+     * CPU 扩展信息的一帧（清洗好、可直接渲染的模型），供设备详细信息页渲染。
+     *
+     * 清洗放在服务侧的理由与性能页一致：页面只该看到"填好的那一帧"，
+     * 不自己去拼请求、不自己解析 D/F 行。
+     */
+    fun cpuExtendedSnapshot(): CpuExtendedSnapshot? =
+        CpuExtendedSnapshot.from(linuxExtendedDeviceSnapshot())
 
     /**
      * 刷新一次快照（幂等入口：轮询与页面"刷新"按钮都走这里，避免各自发请求）。

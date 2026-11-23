@@ -11,10 +11,33 @@ set(BACKEND_OUTPUT_DIR
 
 file(MAKE_DIRECTORY "${BACKEND_OUTPUT_DIR}")
 
-# 创建独立 ELF 可执行文件（纯 C 源文件，见 Backend/main.c）
+# 后端源文件清单。组织方式见 Backend/Header.h：
+#   main.c          服务实例入口 / 消息循环 / 命令分发
+#   Protocol.c      协议层（状态映射、字段输出、应答包）
+#   Common.c        公共文本与数字工具
+#   ProcessSnapshot.c  进程快照采集与增量结算
+#   DeviceSnapshot.c   设备快照装配（注册表 + 各类设备组装）
+#   DeviceExtendedSnapshot.c  设备扩展快照装配（typeCode=6，按集群 / 逐核）
+#   CPUDevice.c 等  各具体设备模块
+#   CPUExtended.c   CPU 扩展采集（集群分组与逐核频率 / 利用率）
+#
+# 文件名一律英文，中文只出现在注释里：这些路径要经过 CMake、AGP 与 Gradle
+# 三层脚本转发，中文名在不同平台的编码上容易出岔子。
 add_executable(
     task_backend
     Backend/main.c
+    Backend/Protocol.c
+    Backend/Common.c
+    Backend/ProcessSnapshot.c
+    Backend/DeviceSnapshot.c
+    Backend/DeviceExtendedSnapshot.c
+    Backend/CPUDevice.c
+    Backend/CPUExtended.c
+    Backend/MemoryDevice.c
+    Backend/Disk.c
+    Backend/GPUDevice.c
+    Backend/NetworkDevice.c
+    Backend/SystemDevice.c
 )
 
 # 输出为 libtask_backend.so
@@ -31,12 +54,12 @@ target_compile_features(task_backend PRIVATE c_std_11)
 
 # 体积优先：这个后端只做"读一行、分发、写一句"，不需要调试符号。
 # 想用 gdb / addr2line 看调用栈时，把 -g0 去掉即可（体积会回到 MB 级）。
+# 模块拆分后不再加 -flto：实测（同一套 flag、arm64）单文件 97,496 字节、
+# 拆分后 106,600 字节，LTO 只省 40 字节，不值得让链接期多一层复杂度。
 target_compile_options(task_backend PRIVATE -Os -g0 -Wall -Wextra)
 
 # 链接期丢掉没用到的段，进一步压缩 ELF
 target_link_options(task_backend PRIVATE -Wl,--gc-sections)
-
-# 预留：新增后端源文件时，在此扩展 add_executable 的源文件列表与链接库。
 
 # 显卡那一节用 dlopen 查 Vulkan 版本，Android 上 dlopen 在 libdl 里。
 target_link_libraries(task_backend dl)

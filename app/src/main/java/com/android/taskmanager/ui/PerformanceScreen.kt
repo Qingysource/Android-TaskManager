@@ -74,6 +74,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -307,7 +308,7 @@ private data class CpuStat(
  * 行内是横排的若干指标，行与行之间竖排：
  * 1) 利用率 / 速度（这两个是主数据，字号最大）
  * 2) 进程 / 线程 / 文件描述符
- * 3) 正常运行时间
+ * 3) 正常运行时间，右边紧挨着温度（温度是"有才加"的一项：底层没报就不出现）
  *
  * 某一格没数据时，对应文案是破折号 —— 不要用 0 冒充，0% 与 读不到 是两件事。
  */
@@ -335,9 +336,18 @@ private fun cpuSummaryRows(
         )
     ),
 
-    listOf(
-        CpuStat("正常运行时间", snapshot.uptimeText(), wideWidth = 92.dp, narrowWidth = 92.dp)
-    )
+    // 第三行：正常运行时间，右边可能还有温度
+    buildList {
+
+        add(CpuStat("正常运行时间", snapshot.uptimeText(), wideWidth = 92.dp, narrowWidth = 92.dp))
+
+        // 温度：底层真的报了才加这一项（没有就连标签都不画，不留空格子）。
+        // 字号 / 行高跟"正常运行时间"完全一致 —— 它俩在同一行，用同一个 CpuStat 渲染。
+        snapshot.cpuTemperatureText()?.let { text ->
+
+            add(CpuStat("温度", text, wideWidth = 72.dp, narrowWidth = 62.dp))
+        }
+    }
 )
 
 /**
@@ -839,6 +849,9 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
     // 长按图表弹出的菜单
     var chartDialogVisible by remember { mutableStateOf(false) }
 
+    // 网络适配器的「网络详细信息」页（占位画布）：只从长按菜单里的那一项进
+    var networkDetailVisible by remember { mutableStateOf(false) }
+
     // 菜单里的两项画图偏好（图表口径、是否显示内核时间）**不放在本页内部**：
     // 页面里的 remember 在竖屏 / 横屏 / 悬浮窗三个宿主各有一份，图形摘要视图又是另一个
     // 宿主渲染的，结果就是"换一个地方就得重新点一遍"。统一由性能页管理器持有，
@@ -997,6 +1010,17 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                     .weight(1f)
             )
         }
+
+        return
+    }
+
+    // 网络适配器的「网络详细信息」页：目前是一块可以自由摆放控件的画布（占位）。
+    // 它和主界面右上角那个「设备详细信息」入口不是同一个页面，各走各的。
+    if (networkDetailVisible) {
+
+        NetworkDetailCanvasPage(
+            onClose = { networkDetailVisible = false }
+        )
 
         return
     }
@@ -1242,6 +1266,11 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 ChartViewTarget("GPU(G)", enabled = gpus.isNotEmpty()) { manager.selectGpu(0) },
                 ChartViewTarget("NPU", enabled = false) { }
             ),
+
+            // 网络适配器专属的「查看网络详细信息」：只对网卡页出现，进去是一块占位画布
+            onViewNetworkDetail = {
+                networkDetailVisible = true
+            },
 
             // 复制内容按当前选中的硬件现算：CPU / 内存各有一整块
             copyText = clipboardTextFor(
@@ -2665,7 +2694,7 @@ private fun MemoryBreakdownBar(
 /**
  * 统计区最左块：三行"小字标题 + 标题下的大字数据"。
  *
- * 行内横排、行间竖排；每行的指标数量不同（2 / 3 / 1），所以用数据驱动而不是写死三个 Row。
+ * 行内横排、行间竖排；每行的指标数量不同（2 / 3 / 1 或 2），所以用数据驱动而不是写死三个 Row。
  */
 @Composable
 private fun CpuSummaryBlock(
@@ -4123,6 +4152,7 @@ private fun PerformanceChartDialog(
     onShowKernelTimeChange: (Boolean) -> Unit,
     onEnterSummary: () -> Unit,
     viewTargets: List<ChartViewTarget>,
+    onViewNetworkDetail: () -> Unit,
     copyText: String,
     onDismiss: () -> Unit
 ) {
@@ -4212,6 +4242,19 @@ private fun PerformanceChartDialog(
                             )
                         }
                     }
+                }
+            }
+
+            // 网络适配器专属：查看网络详细信息。与「查看(V)」同属一组（中间不画分隔线），
+            // 位置在「查看」下、分隔线之上，所以「复制(C)」仍在它下面那一组里。
+            if (kind == HardwareKind.NETWORK) {
+
+                ChartMenuRow(
+                    label = "查看网络详细信息(D)"
+                ) {
+                    onViewNetworkDetail()
+
+                    onDismiss()
                 }
             }
 
@@ -4429,4 +4472,25 @@ private fun copyChartMenuText(context: Context, text: String) {
     }
 
     clipboard.setPrimaryClip(ClipData.newPlainText("任务管理器", text))
+}
+
+/**
+ * 网络适配器的「网络详细信息」页（占位版）。
+ *
+ * 版式不在这里画：标题栏 + 分隔线 + 可自由摆放控件的工作区，统一走 [DetailCanvasPage]
+ * （性能页那个「设备详细信息」入口用的是同一套皮，改一处两边都跟着变）。
+ * 工作区中央那张写着「测试页面」的卡片就是现在的全部内容，按住可以拖到任意位置。
+ *
+ * 与主界面右上角那个「设备详细信息」入口不是同一个页面：这条入口只有网卡页的长按菜单。
+ */
+@Composable
+private fun NetworkDetailCanvasPage(onClose: () -> Unit) {
+
+    DetailCanvasPage(
+        title = "网络详细信息",
+
+        onBack = onClose,
+
+        backDescription = "返回性能页"
+    )
 }
