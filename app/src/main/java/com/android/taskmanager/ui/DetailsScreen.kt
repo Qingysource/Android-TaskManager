@@ -141,6 +141,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
+import com.android.taskmanager.data.AndroidService
 import com.android.taskmanager.data.ProcessIconCache
 import com.android.taskmanager.data.ProcessScope
 import com.android.taskmanager.service.UIService
@@ -859,9 +860,15 @@ fun DetailsScreen(
     // ---------- 打开位置：壳进程二选一 ----------
     locationTarget?.let { target ->
 
-        // APK 只在打开对话框时查一次；查不到就把第二项置灰，不拿壳路径顶替
-        val apkPath = remember(target.pid, target.packageName) {
-            resolveProcessApk(context, target)
+        // APK 路径在 IO 上查：副用户里的包要走 shell 的 pm path，不能堵住组合线程
+        var apkPath by remember(target.pid, target.startTicks) {
+            mutableStateOf<String?>(null)
+        }
+
+        LaunchedEffect(target.pid, target.startTicks) {
+            apkPath = withContext(Dispatchers.IO) {
+                resolveProcessApk(context, target)
+            }
         }
 
         DetailLocationDialog(
@@ -1265,7 +1272,7 @@ private fun resolveProcessApk(context: Context, row: ProcessRow): String? {
 
     if (pkg == null) return null
 
-    return try {
+    val localPath = try {
 
         val info = context.packageManager.getApplicationInfo(pkg, 0)
 
@@ -1273,9 +1280,19 @@ private fun resolveProcessApk(context: Context, row: ProcessRow): String? {
             ?.takeIf { it.isNotEmpty() && File(it).exists() }
 
     } catch (_: Exception) {
-        // 包被卸载 / 不可见：找不到对应 APK
+
+        // 包被卸载 / 不可见：下面按进程所属用户再查一次
         null
     }
+
+    if (localPath != null) return localPath
+
+    // 副用户里的包在当前用户的 PackageManager 里看不到，必须按那个用户取 APK
+    val userId = (row.uid ?: 0) / 100000
+
+    return AndroidService.instanceOrNull()
+        ?.applicationApkPath(pkg, userId)
+        ?.takeIf { it.isNotEmpty() && File(it).exists() }
 }
 
 /**
@@ -3111,19 +3128,22 @@ private fun DetailDataRow(
 
     val isSelected = row.identity() == selectedIdentity
 
-    // 图标按**包名**取一次、之后走缓存：同一个包的多个进程共用一张图，刷新也不会重新解码。
-    // 只有 Android 框架进程带包名，Linux 原生进程没有图标来源，空槽照旧。
+    // 图标按「包名 + 进程 uid 对应的 Android 用户」取一次、之后走缓存：
+    // 用户 10 的包不在当前用户的 PackageManager 里，只按包名查会查空。
     val packageName = row.packageName
+    val iconUserId = (row.uid ?: 0) / 100000
 
-    var icon by remember(packageName) {
-        mutableStateOf(packageName?.let { ProcessIconCache.cached(it) })
+    var icon by remember(packageName, iconUserId) {
+        mutableStateOf(packageName?.let { ProcessIconCache.cached(it, iconUserId) })
     }
 
-    LaunchedEffect(packageName) {
+    LaunchedEffect(packageName, iconUserId) {
 
-        if (packageName != null && !ProcessIconCache.isKnown(packageName)) {
+        if (packageName != null && !ProcessIconCache.isKnown(packageName, iconUserId)) {
 
-            icon = withContext(Dispatchers.IO) { ProcessIconCache.load(packageName) }
+            icon = withContext(Dispatchers.IO) {
+                ProcessIconCache.load(packageName, iconUserId)
+            }
         }
     }
 

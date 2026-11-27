@@ -1317,7 +1317,9 @@ data class ProcessRow(
      * 与 [values] 里 `package_name` 那一格的区别：那一格是"给人看的显示值"（可能被置为
      * 暂无数据文案），这里是**原始包名**，专供图标查询 / 搜索匹配这类需要真值的地方用。
      */
-    val packageName: String? = null
+    val packageName: String? = null,
+    /** 进程属主 uid；用来推导 Android 用户 id，图标要按用户查。null = 后端没采到。 */
+    val uid: Int? = null
 ) {
     /**
      * 行身份字符串：`pid/startTicks`（startTicks 未知时退化为 `pid`）。

@@ -4,10 +4,8 @@ import android.app.ActivityManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.UserManager
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -362,6 +360,7 @@ fun UsersScreen(
 
                             UsersProcessRow(
                                 process = process,
+                                userId = user.userId,
                                 selected = selectedRowKey == processKey,
                                 columns = columns,
                                 widths = widths,
@@ -955,20 +954,20 @@ private fun UsersUserRow(
         modifier = Modifier
             .width(totalWidth)
             .height(52.dp)
-            .background(background)
-            .pointerInput(user.userId) {
-                detectTapGestures(onLongPress = { currentLongPress() })
-            },
+            .background(background),
         verticalAlignment = Alignment.CenterVertically
     ) {
 
-        // 左侧箭头：只负责展开 / 收起，点它不触发选中
+        // 左侧箭头：只负责展开 / 收起，点它不触发选中；长按仍弹账户菜单
         Box(
             Modifier
                 .width(28.dp)
                 .fillMaxHeight()
                 .pointerInput(user.userId) {
-                    detectTapGestures(onTap = { currentToggle() })
+                    detectTapGestures(
+                        onTap = { currentToggle() },
+                        onLongPress = { currentLongPress() }
+                    )
                 },
             contentAlignment = Alignment.Center
         ) {
@@ -984,13 +983,16 @@ private fun UsersUserRow(
             )
         }
 
-        // 箭头以外的区域：点击只做选择
+        // 箭头以外的区域：点击选择，长按弹账户菜单
         Row(
             Modifier
                 .weight(1f)
                 .fillMaxHeight()
                 .pointerInput(user.userId) {
-                    detectTapGestures(onTap = { currentSelect() })
+                    detectTapGestures(
+                        onTap = { currentSelect() },
+                        onLongPress = { currentLongPress() }
+                    )
                 },
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -1010,7 +1012,7 @@ private fun UsersUserRow(
                         .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
                     contentAlignment = Alignment.Center
                 ) {
-                    UsersUserAvatar(user.userId)
+                    UsersUserAvatar(userId = user.userId)
                 }
 
                 Spacer(Modifier.width(8.dp))
@@ -1054,18 +1056,16 @@ private fun UsersUserRow(
 }
 
 /**
- * 用户行头像：优先读 Android 用户自身的头像（UserManager.getUserIcon），
- * 读不到就退回原来的账户图标，不拿别的用户头像顶替。
+ * 用户行头像：只从 root 通道读系统保存的用户头像；
+ * 没有 root 或读不到时退回通用账户图标。
  */
 @Composable
 private fun UsersUserAvatar(userId: Int) {
 
-    val context = LocalContext.current
-
     var avatar by remember(userId) { mutableStateOf<ImageBitmap?>(null) }
 
     LaunchedEffect(userId) {
-        avatar = loadAndroidUserAvatar(context, userId)
+        avatar = loadAndroidUserAvatar(userId)
     }
 
     val bitmap = avatar
@@ -1093,32 +1093,20 @@ private fun UsersUserAvatar(userId: Int) {
 }
 
 /**
- * 读某个 Android 用户的头像。
- *
- * 先让 UIService 走提权通道读系统保存的头像文件（`/data/system/users/<id>/photo.*`），
- * 再把字节解码成 Bitmap；提权通道不可用 / 没设置头像时，退到 `UserManager.getUserIcon()`
- * 的反射调用。两条路都拿不到就返回 null，界面显示通用账户图标。
+ * 读某个 Android 用户的头像：只走 root 读系统保存的
+ * `/data/system/users/<id>/photo.*`，读不到返回 null，由界面显示通用图标。
  */
-private suspend fun loadAndroidUserAvatar(context: Context, userId: Int): ImageBitmap? =
+private suspend fun loadAndroidUserAvatar(userId: Int): ImageBitmap? =
     withContext(Dispatchers.IO) {
 
         val raw = runCatching {
             UIService.instanceOrNull()?.androidUserAvatar(userId)
         }.getOrNull()
 
-        if (raw != null && raw.isNotEmpty()) {
-            runCatching {
-                BitmapFactory.decodeByteArray(raw, 0, raw.size)?.asImageBitmap()
-            }.getOrNull()?.let { return@withContext it }
-        }
-
-        val manager = context.getSystemService(Context.USER_SERVICE) as? UserManager
-            ?: return@withContext null
+        if (raw == null || raw.isEmpty()) return@withContext null
 
         runCatching {
-            val method = UserManager::class.java.getMethod("getUserIcon", Integer.TYPE)
-            method.isAccessible = true
-            (method.invoke(manager, userId) as? Bitmap)?.asImageBitmap()
+            BitmapFactory.decodeByteArray(raw, 0, raw.size)?.asImageBitmap()
         }.getOrNull()
     }
 
@@ -1129,6 +1117,7 @@ private suspend fun loadAndroidUserAvatar(context: Context, userId: Int): ImageB
 @Composable
 private fun UsersProcessRow(
     process: UserProcessRow,
+    userId: Int,
     selected: Boolean,
     columns: List<UsersColumn>,
     widths: Map<UsersColumn, Int>,
@@ -1174,7 +1163,7 @@ private fun UsersProcessRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
 
-            UsersProcessIcon(process.packageName)
+            UsersProcessIcon(process.packageName, userId)
 
             Spacer(Modifier.width(8.dp))
 
@@ -1380,20 +1369,24 @@ private fun UsersStatusCell(
 }
 
 /**
- * 进程图标：Android 包进程按包名取应用图标（走 [ProcessIconCache] 缓存），
- * 取不到 / 没有包名时退回通用应用图标，不留空槽。
+ * 进程图标：Android 包进程按「包名 + Android 用户」取图标（走 [ProcessIconCache] 缓存）。
+ *
+ * 别的 Android 用户里装的包，在当前用户的 PackageManager 里是查不到的；
+ * 必须带上 userId 让缓存层按那个用户的 APK 路径解析。
  */
 @Composable
-private fun UsersProcessIcon(packageName: String?) {
+private fun UsersProcessIcon(packageName: String?, userId: Int) {
 
-    var icon by remember(packageName) {
-        mutableStateOf(packageName?.let { ProcessIconCache.cached(it) })
+    var icon by remember(packageName, userId) {
+        mutableStateOf(packageName?.let { ProcessIconCache.cached(it, userId) })
     }
 
-    LaunchedEffect(packageName) {
+    LaunchedEffect(packageName, userId) {
 
-        if (packageName != null && !ProcessIconCache.isKnown(packageName)) {
-            icon = withContext(Dispatchers.IO) { ProcessIconCache.load(packageName) }
+        if (packageName != null && !ProcessIconCache.isKnown(packageName, userId)) {
+            icon = withContext(Dispatchers.IO) {
+                ProcessIconCache.load(packageName, userId)
+            }
         }
     }
 

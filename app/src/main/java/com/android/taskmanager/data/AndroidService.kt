@@ -130,6 +130,10 @@ class AndroidService : Service() {
         /** 读用户头像文件的超时：图片很小，但提权通道首次建连可能慢一点。 */
         private const val USER_AVATAR_TIMEOUT_MS = 5_000L
 
+        /** 用户名的缓存时间：dumpsys user 只需偶尔跑一次。 */
+        private const val USER_NAME_CACHE_MS = 10 * 60_000L
+        private const val USER_NAME_TIMEOUT_MS = 3_000L
+
         /** 框架也没给出归属时，这个"查不到"的结论过多久再重试（进程可能刚起来还没登记）。 */
         private const val PROC_PACKAGE_MISS_TTL_MS = 60_000L
 
@@ -169,6 +173,11 @@ class AndroidService : Service() {
     /** 优先走哪条通路（auto / shell / root），同样由 UIService 下发。 */
     @Volatile
     private var identityMode: String = UpstreamIdentityMode.AUTO
+
+    /** 用户名的提权缓存：dumpsys user 很轻，但用户页每秒轮询，不能每秒都起 shell。 */
+    private val userNameLock = Any()
+    private var userNameCache: Map<Int, String> = emptyMap()
+    private var userNameCacheAt: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -869,36 +878,48 @@ class AndroidService : Service() {
      */
     private fun readPackageUidTable(): Map<Int, List<String>> {
 
-        val script = "cmd package list packages -3 -U 2>/dev/null; " +
-            "echo '@@ALL'; cmd package list packages -U 2>/dev/null"
+        // 只查当前用户会漏掉 10 / 11 这类副用户里安装的包：那些进程的 uid 是
+        // 1010xxxx，不在当前用户的包表里，图标 / 包名就会全部落空。
+        val userIds = runCatching { androidUserNames().keys }
+            .getOrDefault(emptySet())
+            .plus(Process.myUid() / 100000)
+            .sorted()
 
-        val output = runShell(script, PACKAGE_LIST_TIMEOUT_MS) ?: return emptyMap()
+        if (userIds.isEmpty()) return emptyMap()
 
         val thirdParty = HashMap<Int, MutableList<String>>(256)
         val all = HashMap<Int, MutableList<String>>(512)
 
-        var inAll = false
+        userIds.forEach { userId ->
 
-        output.lineSequence().forEach { raw ->
+            val script = "cmd package list packages -3 -U --user $userId 2>/dev/null; " +
+                "echo '@@ALL'; cmd package list packages -U --user $userId 2>/dev/null"
 
-            val line = raw.trim()
+            val output = runShell(script, PACKAGE_LIST_TIMEOUT_MS) ?: return@forEach
 
-            if (line == "@@ALL") {
-                inAll = true
+            var inAll = false
 
-                return@forEach
+            output.lineSequence().forEach { raw ->
+
+                val line = raw.trim()
+
+                if (line == "@@ALL") {
+                    inAll = true
+
+                    return@forEach
+                }
+
+                val match = packageUidLine.find(line) ?: return@forEach
+
+                val pkg = match.groupValues[1]
+                val uid = match.groupValues[2].toIntOrNull() ?: return@forEach
+
+                val target = if (inAll) all else thirdParty
+
+                val list = target.getOrPut(uid) { ArrayList(2) }
+
+                if (pkg !in list) list.add(pkg)
             }
-
-            val match = packageUidLine.find(line) ?: return@forEach
-
-            val pkg = match.groupValues[1]
-            val uid = match.groupValues[2].toIntOrNull() ?: return@forEach
-
-            val target = if (inAll) all else thirdParty
-
-            val list = target.getOrPut(uid) { ArrayList(2) }
-
-            if (pkg !in list) list.add(pkg)
         }
 
         val result = HashMap<Int, List<String>>(all.size + thirdParty.size)
@@ -1117,7 +1138,7 @@ class AndroidService : Service() {
      */
     private fun archivedMeta(pkg: String): PkgMeta? {
 
-        val path = apkPathFor(pkg) ?: return null
+        val path = apkPathFor(pkg, Process.myUid() / 100000) ?: return null
 
         val archive = runCatching { packageManager.getPackageArchiveInfo(path, 0) }.getOrNull()
             ?: return null
@@ -1247,40 +1268,49 @@ class AndroidService : Service() {
         return granted
     }
 
-    fun applicationIcon(pkg: String): Drawable? {
-        synchronized(iconLock) { if (iconCache.containsKey(pkg)) return iconCache[pkg] }
+    fun applicationIcon(pkg: String, userId: Int = Process.myUid() / 100000): Drawable? {
 
-        val icon = loadApplicationIcon(pkg)
+        val cacheKey = "$userId:$pkg"
+
+        synchronized(iconLock) {
+            if (iconCache.containsKey(cacheKey)) return iconCache[cacheKey]
+        }
+
+        val icon = loadApplicationIcon(pkg, userId)
 
         synchronized(iconLock) {
 
             if (iconCache.size >= ICON_CACHE_LIMIT) iconCache.clear()
 
-            iconCache[pkg] = icon
+            iconCache[cacheKey] = icon
         }
 
         return icon
     }
 
     /**
-     * 图标加载：① 本地 PackageManager 看得见这个包就直接 loadIcon；
-     * ② 看不见（Android 11 起普通应用受包可见性限制）就先用 shell 的 `pm path` 拿 APK 路径，
+     * 图标加载：当前用户可以直接用 PackageManager.loadIcon；
+     * 其他 Android 用户里的包在当前用户的 PackageManager 里往往不可见，也拿不到
+     * 那个用户的安装路径，所以先按 `pm path --user <id>` 取该用户的 APK 路径，
      * 再用 [android.content.pm.PackageManager.getPackageArchiveInfo] 解析归档并 loadIcon。
      */
-    private fun loadApplicationIcon(pkg: String): Drawable? {
+    private fun loadApplicationIcon(pkg: String, userId: Int): Drawable? {
 
-        try {
+        if (userId == Process.myUid() / 100000) {
 
-            val info = packageManager.getApplicationInfo(pkg, 0)
+            try {
 
-            info.loadIcon(packageManager)?.let { return it }
+                val info = packageManager.getApplicationInfo(pkg, 0)
 
-        } catch (e: Throwable) {
+                info.loadIcon(packageManager)?.let { return it }
 
-            // NameNotFoundException：包对本应用不可见，走下面 ②
+            } catch (e: Throwable) {
+
+                // NameNotFoundException：包对本应用不可见，走下面的归档解析
+            }
         }
 
-        val path = apkPathFor(pkg) ?: return null
+        val path = apkPathFor(pkg, userId) ?: return null
 
         // getPackageArchiveInfo 回的是 PackageInfo，图标挂在它的 applicationInfo 上
         val archive = try {
@@ -1309,19 +1339,33 @@ class AndroidService : Service() {
         }
     }
 
-    /** 一个包的 APK 路径（`pm path <包名>` 的第一条）；拿不到返回 null，也不会重复问。 */
-    private fun apkPathFor(pkg: String): String? {
+    /** 某个 Android 用户里一个包的 APK 路径；给详细信息页「打开位置」用。 */
+    fun applicationApkPath(pkg: String, userId: Int = Process.myUid() / 100000): String? =
+        apkPathFor(pkg, userId)
 
-        synchronized(iconLock) { if (apkPathCache.containsKey(pkg)) return apkPathCache[pkg] }
+    /** 某个 Android 用户里一个包的 APK 路径；拿不到返回 null，也不会重复问。 */
+    private fun apkPathFor(pkg: String, userId: Int): String? {
 
-        val output = runShell("pm path " + shellQuote(pkg), SHELL_TIMEOUT_MS)
+        val cacheKey = "$userId:$pkg"
+
+        synchronized(iconLock) {
+            if (apkPathCache.containsKey(cacheKey)) return apkPathCache[cacheKey]
+        }
+
+        // 其他用户里的包必须带 --user，否则 pm 只查当前用户，多半报 not found
+        val userArg = if (userId == Process.myUid() / 100000) "" else " --user $userId"
+
+        val output = runShell(
+            "pm path$userArg " + shellQuote(pkg),
+            SHELL_TIMEOUT_MS
+        )
 
         val path = output?.lineSequence()
             ?.map { it.trim() }
             ?.firstOrNull { it.startsWith("package:") && it.endsWith(".apk") }
             ?.removePrefix("package:")
 
-        synchronized(iconLock) { apkPathCache[pkg] = path }
+        synchronized(iconLock) { apkPathCache[cacheKey] = path }
 
         return path
     }
@@ -1449,18 +1493,74 @@ class AndroidService : Service() {
     }
 
     /**
+     * 读 Android 用户名字的兜底通道。
+     *
+     * `UserManager.getUserName()` / `getUsers()` 都要 MANAGE_USERS，普通应用调用会被
+     * SecurityException 拒绝，之前拿不到名字就会退回「用户 0」。这里用提权通道执行
+     * `dumpsys user`，从 `UserInfo{0:机主:...}` 里解析，结果缓存 10 分钟，
+     * 避免用户页每秒轮询都去起一次 shell。
+     */
+    fun androidUserNames(): Map<Int, String> {
+
+        // 没有提权通道就不要去起 shell：普通应用读了也只会超时
+        if (!privilegedMode) return emptyMap()
+
+        val now = SystemClock.elapsedRealtime()
+
+        synchronized(userNameLock) {
+            if (now - userNameCacheAt < USER_NAME_CACHE_MS) {
+                return userNameCache
+            }
+        }
+
+        val output = runShell("dumpsys user 2>/dev/null", USER_NAME_TIMEOUT_MS) ?: ""
+
+        val names = HashMap<Int, String>()
+
+        // 一行一条 UserInfo{<id>:<name>:<flags>}，name 本身可能带冒号
+        // （例如 "User with : (colon):10"），所以取 id 后的第一个冒号和右括号前的
+        // 最后一个冒号，不能只用简单正则切到第一个冒号。
+        output.lineSequence().forEach { line ->
+
+            val start = line.indexOf("UserInfo{")
+            if (start < 0) return@forEach
+
+            val content = line.substring(start + "UserInfo{".length)
+                .substringBefore('}')
+
+            val firstColon = content.indexOf(':')
+            val lastColon = content.lastIndexOf(':')
+
+            if (firstColon <= 0 || lastColon <= firstColon) return@forEach
+
+            val id = content.substring(0, firstColon).trim().toIntOrNull()
+                ?: return@forEach
+
+            val name = content.substring(firstColon + 1, lastColon).trim()
+            if (name.isNotEmpty()) names[id] = name
+        }
+
+        synchronized(userNameLock) {
+            userNameCache = names
+            userNameCacheAt = now
+        }
+
+        return names
+    }
+
+    /**
      * 读某个 Android 用户的头像原始 PNG/JPEG。
      *
      * Framework 的 `UserManager.getUserIcon()` 是隐藏且受 MANAGE_USERS 保护的接口，
-     * 普通应用拿不到；这里改读系统保存头像的固定路径。只有 root 通道能读
-     * `/data/system/users/<id>/photo.*`，Shizuku 的 shell 身份也读不到，
-     * 所以读失败就返回 null，由界面回退到通用账户图标。
+     * 普通应用拿不到；这里只走 root 读系统保存头像的固定路径
+     * `/data/system/users/<id>/photo.*`。Shizuku 的 shell 身份读不到这个目录，
+     * 所以不再回退到 shell；读失败就返回 null，由界面显示通用账户图标。
      */
     fun userAvatarPng(userId: Int): ByteArray? {
 
-        if (userId < 0) return null
+        if (userId < 0 || !privilegedMode) return null
 
-        val output = runShell(
+        val output = rootScript(
             "f=/data/system/users/$userId/photo.png; " +
                 "[ -f \"\$f\" ] || f=/data/system/users/$userId/photo.jpg; " +
                 "[ -f \"\$f\" ] && base64 \"\$f\" 2>/dev/null",

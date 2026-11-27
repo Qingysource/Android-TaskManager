@@ -2671,7 +2671,8 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
                 values = values,
                 // 启动时刻：-1 = 后端没给这个字段（不能拿 0 顶替，0 是合法值：init 的 starttime 就是 0）
                 startTicks = record.startTicks ?: -1L,
-                packageName = packageName
+                packageName = packageName,
+                uid = record.uid
             )
         }
     }
@@ -4185,10 +4186,11 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
             val meta = metas.firstOrNull { it.id == userId }
 
-            val fallbackLabel = if (userId < 0) {
-                AppStrings.s(R.string.users_unknown_user)
-            } else {
-                AppStrings.s(R.string.users_android_title, userId)
+            val fallbackLabel = when {
+                userId < 0 -> AppStrings.s(R.string.users_unknown_user)
+                // user 0 是系统主用户；名字接口都失败时不要再显示成「用户 0」
+                userId == 0 -> AppStrings.s(R.string.users_owner_default)
+                else -> AppStrings.s(R.string.users_android_title, userId)
             }
 
             val label = meta?.name
@@ -4926,12 +4928,23 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
     /**
      * 读 UserManager 的用户列表。`getUsers()` / `getUserInfo()` 都是隐藏 / SystemApi，
-     * 反射拿不到就返回空列表——页面退回"只按进程 uid 列用户"，不编造账户。
+     * 反射拿不到时至少把当前用户补上，用公开的 `getUserName()` 取账户名（如「机主」），
+     * 避免整页只剩「用户 0」这种没有用户名的兜底。
      */
     private fun androidUserMetas(): List<AndroidUserMeta> {
 
         val manager = getSystemService(Context.USER_SERVICE) as? UserManager
             ?: return emptyList()
+
+        val currentId = android.os.Process.myUid() / 100000
+
+        // UserManager 的用户名接口要 MANAGE_USERS，普通应用拿不到；用提权通道
+        // 的 dumpsys user 兜底（结果在 AndroidService 内缓存 10 分钟）。
+        val shellNames = AndroidService.instanceOrNull()?.androidUserNames().orEmpty()
+
+        val currentName = shellNames[currentId] ?: runCatching {
+            manager.userName?.trim()?.takeIf { it.isNotEmpty() }
+        }.getOrNull()
 
         val raw = try {
 
@@ -4943,21 +4956,61 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         } catch (_: Throwable) {
             null
-        } ?: return emptyList()
+        }
 
-        return raw.mapNotNull { info ->
+        // 隐藏接口不可用 / 只返回当前用户时，不能把 dumpsys 里已经拿到的其他用户名丢掉。
+        val fromManager = raw?.mapNotNull { info ->
 
             if (info == null) return@mapNotNull null
 
             val id = userInfoField(info, "id") as? Int ?: return@mapNotNull null
 
-            val name = userInfoField(info, "name") as? String
+            val name = shellNames[id]?.takeIf { it.isNotBlank() }
+                ?: userInfoField(info, "name") as? String
 
             AndroidUserMeta(
                 id = id,
                 name = name,
                 running = isAndroidUserRunning(manager, id)
             )
+        }.orEmpty()
+
+        // dumpsys 里有、getUsers() 没返回的用户也补上（部分 ROM 的 getUsers 只给当前用户）
+        val managerIds = fromManager.map { it.id }.toSet()
+
+        val metas = fromManager.map { meta ->
+            val shellName = shellNames[meta.id]?.takeIf { it.isNotBlank() }
+            if (shellName != null) meta.copy(name = shellName) else meta
+        } + shellNames
+            .filterKeys { it !in managerIds }
+            .map { (id, name) ->
+                AndroidUserMeta(
+                    id = id,
+                    name = name,
+                    running = isAndroidUserRunning(manager, id)
+                )
+            }
+
+        // 列表里没有当前用户，或者当前用户名字为空 / 只是「用户 N」兜底，
+        // 用 getUserName() 的公开结果补齐
+        val hasCurrent = metas.any { it.id == currentId }
+
+        val fallbackTitle = AppStrings.s(R.string.users_android_title, currentId)
+
+        val filled = metas.map { meta ->
+            if (meta.id == currentId &&
+                (meta.name.isNullOrBlank() || meta.name == fallbackTitle)
+            ) {
+                meta.copy(name = currentName ?: meta.name)
+            } else {
+                meta
+            }
+        }
+
+        return if (hasCurrent) {
+            filled
+        } else {
+            filled + AndroidUserMeta(currentId, currentName, true)
         }
     }
 

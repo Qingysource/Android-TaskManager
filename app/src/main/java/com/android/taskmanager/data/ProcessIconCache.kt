@@ -34,20 +34,31 @@ object ProcessIconCache {
     /** 缓存上限：超过就整表清空（图标很小，但没必要无限长）。 */
     private const val LIMIT = 256
 
+    /** 缓存键：同一个包在不同 Android 用户里是两份安装，路径 / 版本可能不同。 */
+    private fun key(pkg: String, userId: Int): String = "$userId:$pkg"
+
+    private fun currentUserId(): Int = android.os.Process.myUid() / 100000
+
     /** 已缓存的图标；没查过时返回 null（配合 [isKnown] 区分"没查"与"没有"）。 */
-    fun cached(pkg: String): ImageBitmap? = synchronized(lock) { icons[pkg] }
+    fun cached(pkg: String, userId: Int = currentUserId()): ImageBitmap? =
+        synchronized(lock) { icons[key(pkg, userId)] }
 
     /** 这个包是不是已经查过了（查过没有图标也算"知道"）。 */
-    fun isKnown(pkg: String): Boolean = synchronized(lock) { icons.containsKey(pkg) }
+    fun isKnown(pkg: String, userId: Int = currentUserId()): Boolean =
+        synchronized(lock) { icons.containsKey(key(pkg, userId)) }
 
     /** 阻塞加载一个包的图标；查不到返回 null。**只在 IO 线程调**。 */
-    fun load(pkg: String): ImageBitmap? {
+    fun load(pkg: String, userId: Int = currentUserId()): ImageBitmap? {
 
-        synchronized(lock) { if (icons.containsKey(pkg)) return icons[pkg] }
+        val cacheKey = key(pkg, userId)
+
+        synchronized(lock) { if (icons.containsKey(cacheKey)) return icons[cacheKey] }
 
         val bitmap = try {
 
-            drawableToImageBitmap(AndroidService.instanceOrNull()?.applicationIcon(pkg))
+            drawableToImageBitmap(
+                AndroidService.instanceOrNull()?.applicationIcon(pkg, userId)
+            )
 
         } catch (e: Throwable) {
 
@@ -58,7 +69,7 @@ object ProcessIconCache {
 
             if (icons.size >= LIMIT) icons.clear()
 
-            icons[pkg] = bitmap
+            icons[cacheKey] = bitmap
         }
 
         return bitmap
