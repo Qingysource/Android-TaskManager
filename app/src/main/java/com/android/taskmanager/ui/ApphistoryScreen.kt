@@ -38,6 +38,7 @@ import android.provider.Settings
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -238,18 +239,18 @@ fun ApphistoryScreen() {
             title = null,
 
             text = {
-                TextButton(
-                    onClick = {
-                        switchTarget = null
-                        launchAppActivity(context, target.packageName)
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = AppStrings.s(R.string.app_history_switch_to),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
+                Text(
+                    text = AppStrings.s(R.string.app_history_switch_to),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            switchTarget = null
+                            launchAppActivity(context, target.packageName)
+                        }
+                        .padding(horizontal = 4.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
             },
 
             confirmButton = {
