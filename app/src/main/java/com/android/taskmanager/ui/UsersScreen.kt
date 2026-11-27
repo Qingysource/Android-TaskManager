@@ -942,6 +942,15 @@ private fun UsersUserRow(
 
     val userWidth = widths[UsersColumn.USER] ?: UsersColumn.USER.defaultWidthDp
 
+    // 主标题：账户名（用户 N）。读不到账户名时 label 本身就是「用户 N」，不再重复追加。
+    val fallbackName = AppStrings.s(R.string.users_android_title, user.userId)
+
+    val displayName = if (user.userId < 0 || user.label == fallbackName) {
+        user.label
+    } else {
+        AppStrings.s(R.string.users_user_name, user.label, user.userId)
+    }
+
     Row(
         modifier = Modifier
             .width(totalWidth)
@@ -1009,7 +1018,7 @@ private fun UsersUserRow(
                 Column(Modifier.weight(1f)) {
 
                     Text(
-                        text = user.label,
+                        text = displayName,
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
@@ -1017,11 +1026,7 @@ private fun UsersUserRow(
                     )
 
                     Text(
-                        text = if (user.userId >= 0) {
-                            AppStrings.s(R.string.users_user_line, user.userId, user.processCount)
-                        } else {
-                            AppStrings.s(R.string.users_processes_count, user.processCount)
-                        },
+                        text = AppStrings.s(R.string.users_processes_count, user.processCount),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,

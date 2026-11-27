@@ -333,6 +333,7 @@
     <string name="users_mode_android">Android</string>
     <string name="users_mode_linux">Linux</string>
     <string name="users_android_title">User %1$d</string>
+    <string name="users_user_name">%1$s (User %2$d)</string>
     <string name="users_android_current">Current</string>
     <string name="users_android_metric_processes">Processes</string>
     <string name="users_android_metric_uids">UIDs</string>

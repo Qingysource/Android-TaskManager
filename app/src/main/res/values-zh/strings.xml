@@ -334,6 +334,7 @@
     <string name="users_mode_android">Android</string>
     <string name="users_mode_linux">Linux</string>
     <string name="users_android_title">用户 %1$d</string>
+    <string name="users_user_name">%1$s（用户%2$d）</string>
     <string name="users_android_current">当前</string>
     <string name="users_android_metric_processes">进程</string>
     <string name="users_android_metric_uids">UID</string>
