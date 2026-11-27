@@ -297,6 +297,7 @@
     <string name="app_history_col_upload">Upload</string>
     <string name="app_history_since">Since %1$s: resource usage for the current user account.</string>
     <string name="app_history_clear_history">Delete usage history</string>
+    <string name="app_history_switch_to">Switch to (T)</string>
     <string name="app_history_notification_unavailable">Android has no system-wide notification history counter; this column shows "-".</string>
     <string name="app_history_select_columns_title">Select columns</string>
     <string name="app_history_cpu_unavailable">CPU sampling channel unavailable; CPU time shows "-".</string>

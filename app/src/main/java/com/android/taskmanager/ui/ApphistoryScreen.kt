@@ -161,6 +161,9 @@ fun ApphistoryScreen() {
     // 行选择：整表单选；点同一行取消，点另一个包替换。轮询刷新后按包名保留选中
     var selectedPackage by remember { mutableStateOf<String?>(null) }
 
+    // 长按某一行弹出的「切换到」菜单目标
+    var switchTarget by remember { mutableStateOf<AppHistoryRow?>(null) }
+
     val listState = rememberLazyListState()
 
     val horizontalState = rememberScrollState()
@@ -221,6 +224,41 @@ fun ApphistoryScreen() {
                 saveVisibleAppHistoryColumns(context, next)
                 columnMenuVisible = false
             }
+        )
+    }
+
+    // 长按行：无标题对话框，上面只有一行「切换到(T)」，下面只有「取消」。
+    // 点「切换到」直接拉起该包的活动页；没有活动页的系统服务包也照样走启动流程，
+    // 启动失败静默吞掉，不弹错误。
+    switchTarget?.let { target ->
+
+        AlertDialog(
+            onDismissRequest = { switchTarget = null },
+
+            title = null,
+
+            text = {
+                TextButton(
+                    onClick = {
+                        switchTarget = null
+                        launchAppActivity(context, target.packageName)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = AppStrings.s(R.string.app_history_switch_to),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+
+            confirmButton = {
+                TextButton(onClick = { switchTarget = null }) {
+                    Text(AppStrings.s(R.string.common_cancel))
+                }
+            },
+
+            dismissButton = null
         )
     }
 
@@ -388,6 +426,10 @@ fun ApphistoryScreen() {
                                     onToggleSelect = {
                                         val pkg = row.packageName
                                         selectedPackage = if (selectedPackage == pkg) null else pkg
+                                    },
+                                    onLongPress = {
+                                        selectedPackage = row.packageName
+                                        switchTarget = row
                                     }
                                 )
                             }
@@ -509,7 +551,8 @@ private fun AppHistoryDataRow(
     totalWidth: androidx.compose.ui.unit.Dp,
     cpuAvailable: Boolean,
     selected: Boolean,
-    onToggleSelect: () -> Unit
+    onToggleSelect: () -> Unit,
+    onLongPress: () -> Unit
 ) {
 
     val background = if (selected) {
@@ -524,7 +567,10 @@ private fun AppHistoryDataRow(
             .height(34.dp)
             .background(background)
             .pointerInput(row.packageName) {
-                detectTapGestures(onTap = { onToggleSelect() })
+                detectTapGestures(
+                    onTap = { onToggleSelect() },
+                    onLongPress = { onLongPress() }
+                )
             },
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -889,6 +935,27 @@ private fun AppHistoryIcon(packageName: String) {
 }
 
 // ---------- 选择列持久化 ----------
+
+/**
+ * 长按「切换到」：直接拉起该包的活动页。
+ *
+ * 系统服务进程 / 没有 launcher 入口的包取不到启动 Intent，这里静默返回；
+ * startActivity 失败也全部吞掉，不弹错误——用户要求“启动不了也当启动过了”。
+ */
+private fun launchAppActivity(context: Context, packageName: String) {
+
+    val launchIntent = runCatching {
+        context.packageManager.getLaunchIntentForPackage(packageName)
+    }.getOrNull() ?: runCatching {
+        context.packageManager.getLeanbackLaunchIntentForPackage(packageName)
+    }.getOrNull() ?: return
+
+    launchIntent.addFlags(
+        Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+    )
+
+    runCatching { context.startActivity(launchIntent) }
+}
 
 private fun loadVisibleAppHistoryColumns(context: Context): Set<AppHistoryColumn> {
 

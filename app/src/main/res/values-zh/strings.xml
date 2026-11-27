@@ -298,6 +298,7 @@
     <string name="app_history_col_upload">上载</string>
     <string name="app_history_since">自 %1$s 以来，当前用户账户的资源使用情况。</string>
     <string name="app_history_clear_history">删除使用情况历史记录</string>
+    <string name="app_history_switch_to">切换到(T)</string>
     <string name="app_history_notification_unavailable">Android 没有系统级历史通知计数器，此列显示为「—」。</string>
     <string name="app_history_select_columns_title">选择列</string>
     <string name="app_history_cpu_unavailable">CPU 统计通道不可用，CPU 时间显示为「—」。</string>
