@@ -29,6 +29,7 @@ add_executable(
     Backend/Protocol.c
     Backend/Common.c
     Backend/ProcessSnapshot.c
+    Backend/ProcessControl.c
     Backend/DeviceSnapshot.c
     Backend/DeviceExtendedSnapshot.c
     Backend/CPUDevice.c

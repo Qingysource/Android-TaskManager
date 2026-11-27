@@ -44,6 +44,8 @@ import android.content.Context
 import android.content.Intent
 import com.android.taskmanager.service.ShizukuPermissionResult
 import com.android.taskmanager.service.ShizukuStatus
+import com.android.taskmanager.data.AppHistoryRow
+import com.android.taskmanager.data.AppHistoryTable
 import com.android.taskmanager.data.LinuxControlCode
 import com.android.taskmanager.data.LinuxField
 import com.android.taskmanager.data.LinuxPacket
@@ -1112,12 +1114,149 @@ interface IPageDataApi {
     fun killDetailProcess(pid: Int, startTicks: Long): ProcessActionResult
 
     /**
+     * 结束一整棵进程树（子孙自下而上先杀，最后杀目标本身）。
+     *
+     * 与 [killDetailProcess] 一样，pid + startTicks 都要对得上才动手。
+     * 长按菜单里的「结束进程树」用它；结果里的 reason 已经是可以直接显示的一句话。
+     */
+    fun killDetailProcessTree(pid: Int, startTicks: Long): ProcessActionResult
+
+    /**
+     * 设置某个进程的 nice 值（-20 最高 … 19 最低）。
+     *
+     * 需要 CAP_SYS_NICE（root）才能把 nice 调小（提高优先级）；
+     * 只有 shell 身份时通常只能往低处调，失败原因由后端 errno 翻成一句话。
+     */
+    fun setDetailProcessPriority(pid: Int, startTicks: Long, nice: Int): ProcessActionResult
+
+    /**
+     * 设置某个进程的 CPU 亲和性。
+     *
+     * @param mask 第 n 位 = 允许在 CPU n 上运行；0 视为无效（至少留一颗核）
+     */
+    fun setDetailProcessAffinity(pid: Int, startTicks: Long, mask: Long): ProcessActionResult
+
+    /** 读某个进程当前的调度状态（nice / 策略 / 亲和性 / 线程数）。读不到时返回 null。 */
+    fun detailProcessSchedInfo(pid: Int): ProcessSchedInfo?
+
+    /**
+     * 单独为**一行进程**做一次全字段查询（属性页专用）。
+     *
+     * 为什么要单独查：表格只按"当前勾选的可见列"发采集掩码，隐藏列的值根本不在行里，
+     * 属性页却要展示全部列。这里走一次标准的快照流程（掩码 = 全部字段），
+     * 让 UIService 照常合成 Android 侧字段，再从结果里挑出这一行，
+     * 而不是把整张表渲染到 UI 上（那会卡死）。
+     *
+     * 阻塞（一次全量 /proc 采集 + 行转换），**调用方必须放后台线程**。
+     *
+     * @param startTicks 一起核对启动时刻（PID 会复用）；< 0 时只按 pid 匹配
+     * @return 这一行的全字段快照；进程已退出 / 后端不在时返回 null
+     */
+    fun detailProcessFullRow(pid: Int, startTicks: Long): ProcessRow?
+
+    // ---------- 用户页：按进程属主 uid 分组的账户视图 ----------
+
+    /**
+     * 取「用户」页当前快照：一行一个属主 uid，行内带该 uid 下的全部进程。
+     *
+     * 数据全部来自标准进程快照（名称 / 状态 / CPU / RSS / IO 累计），
+     * 磁盘速率由相邻两次调用之间的 IO 字节增量算出来；网络只能按 uid 问
+     * TrafficStats，取不到时对应字段为 null（界面显示「—」），不拿 0 冒充。
+     *
+     * 阻塞（一轮 /proc 采集），**调用方必须放后台线程**。
+     */
+    fun usersTable(): UsersTable
+
+    // ---------- 用户页：Android 用户（多用户 / 工作资料）视图 ----------
+
+    /**
+     * 取「用户」页的 Android 视图：一行一个 Android 用户（userId），
+     * 汇总该用户名下所有进程的 CPU / 内存 / 磁盘 / 网络，并带按 uid 分组的应用列表。
+     *
+     * Android 用户由 `uid / 100000` 推导（系统 uid 归 user 0）；用户名和运行状态
+     * 尽量读 `UserManager.getUsers()` / `isUserRunning()`，读不到就退回「用户 N」。
+     * 只列运行中的用户（当前用户 + 有进程在跑的用户 + 明确 running 的用户）。
+     *
+     * 阻塞（内部复用 [usersTable] 的一轮 /proc 采集），**调用方必须放后台线程**。
+     */
+    fun androidUsersTable(): AndroidUsersTable
+
+    // ---------- 应用历史记录页：本机全部安装应用的 CPU / 累计网络 ----------
+
+    /**
+     * 进入应用历史记录页时调用一次：清零本页的 CPU 增量基线与网络累计，
+     * 让"自任务管理器（本页）启动以来"的统计从这一刻起算。页面离开后不必调用，
+     * 下次进入再调 [appHistoryBegin] 重新开账。
+     */
+    fun appHistoryBegin()
+
+    /**
+     * 取「应用历史记录」页当前快照：一行一个已安装应用（含系统应用），
+     * CPU 时间 = 该包名下全部进程自本页开账以来的 CPU 增量之和；
+     * 网络 = 自本页开账以来按 uid 汇总的移动 / Wi-Fi 下载、上载字节。
+     *
+     * 阻塞（一轮 /proc 采集 + 一次提权通道读网络计数），**调用方必须放后台线程**。
+     *
+     * 取不到的字段一律为 null（界面显示「—」，不拿 0 冒充）：
+     * CPU 通道（Linux 后端）不可用 → [AppHistoryTable.cpuAvailable] 为 false；
+     * 网络统计（NetworkStatsManager，需 appop GET_USAGE_STATS）
+     * 未授权 / 查询失败 → [AppHistoryTable.networkAvailable] 为 false。
+     */
+    fun appHistoryTable(): AppHistoryTable
+
+    /**
+     * 对一个 Android 用户做账户级动作（连接 / 注销 / 切换）。
+     *
+     * 走 `ActivityManager.startUserInBackground` / `stopUser` / `switchUser`，
+     * 这些是 @SystemApi / 隐藏接口：普通应用会被 SecurityException 拒绝，
+     * 调用方要把失败原因原样带到界面，不要假装成功。
+     *
+     * 阻塞（一次 Binder 调用），**调用方必须放后台线程**。
+     */
+    fun androidUserAction(action: AndroidUserAction, userId: Int): ProcessActionResult
+
+    /** 读某个进程的等待链（逐线程 state / wchan / syscall）。读不到时返回空结果。 */
+    fun detailProcessWaitChain(pid: Int): ProcessWaitChain?
+
+    /**
+     * 写一份精简 native 内存转储（ELF core，只含可读映射）到应用私有目录。
+     *
+     * 落盘路径由 UIService 决定（files/dump/tm_<pid>_<时间>.core），
+     * 用户可以在对话框里看到路径与大小；没有 root 时通常会被 EACCES 拒绝。
+     */
+    fun dumpDetailProcessMemory(pid: Int, startTicks: Long): ProcessDumpResult
+
+    /** 某个进程是否还有可用的启动时刻（没有就不能做任何"动手"的操作）。 */
+    fun detailProcessIsActionable(pid: Int, startTicks: Long): Boolean
+
+    /**
+     * 查这个包在 Android 侧登记的服务记录（「转到服务」用）。
+     *
+     * 阻塞（要走 shell / root 通道跑一次 dumpsys），**调用方必须放在后台线程**。
+     *
+     * @return 原始文本；null = 通道不可用或包名不可查询
+     */
+    fun detailProcessServices(pkg: String): String?
+
+    /**
      * 点了表头某一列：按它排序（同一列再点一次 -> 升降序翻转）。
      *
      * @param columnId null = 恢复原始顺序
      * @return true = 这一列存在且当前可见；false = 被忽略（隐藏列 / 不存在的列）
      */
     fun sortDetailTableBy(columnId: String?, descending: Boolean = true): Boolean
+
+    /**
+     * 用户拖表头列边界，改某一列的显示宽度（单位 dp）。
+     *
+     * 只改显示宽度：列集合、排序、采样需求都不动，所以不会触发一次重新采集。
+     * 宽度会被夹到合理区间（太窄看不见字、太宽挤掉别的列都不行）；
+     * 拖回出厂宽度等于恢复默认。改完写进 detail_view.json（和可见列同一个存档），下次打开照旧。
+     *
+     * @param columnId 列 id（见 [DetailColumnId]）；不存在的列直接返回 false
+     * @return true = 已记录并入队落盘
+     */
+    fun setDetailColumnWidth(columnId: String, widthDp: Int): Boolean
 
     /**
      * 点了某一行：把它设为"当前选中的进程"（传 null 取消选中）。
@@ -1171,7 +1310,14 @@ data class ProcessRow(
     val pid: Int,
     val name: String,
     val values: Map<String, String> = emptyMap(),
-    val startTicks: Long = -1L
+    val startTicks: Long = -1L,
+    /**
+     * 这一行所属应用的包名（Android 框架进程才有；Linux 原生进程为 null）。
+     *
+     * 与 [values] 里 `package_name` 那一格的区别：那一格是"给人看的显示值"（可能被置为
+     * 暂无数据文案），这里是**原始包名**，专供图标查询 / 搜索匹配这类需要真值的地方用。
+     */
+    val packageName: String? = null
 ) {
     /**
      * 行身份字符串：`pid/startTicks`（startTicks 未知时退化为 `pid`）。
@@ -1229,6 +1375,183 @@ data class ProcessActionResult(
     val ok: Boolean,
     val reason: String = "",
     val status: Int = 0
+)
+
+/**
+ * 一个进程当前的调度状态（优先级 / 亲和性对话框里显示"现在是什么"）。
+ *
+ * @param nice       nice 值（-20 最高 … 19 最低）
+ * @param policy     Linux 调度策略号（0=OTHER 1=FIFO 2=RR 3=BATCH 5=IDLE 6=DEADLINE）
+ * @param affinity   亲和性掩码：第 n 位 = 允许在 CPU n 上跑
+ * @param threads    线程数（等待链、亲和性都需要知道规模）
+ * @param cpuCount   系统逻辑 CPU 数（对话框据此列出可勾选的核心）
+ */
+data class ProcessSchedInfo(
+    val nice: Int = 0,
+    val policy: Int = 0,
+    val affinity: Long = 0L,
+    val threads: Int = 0,
+    val cpuCount: Int = 0
+)
+
+/**
+ * 等待链里的一条：一个线程正卡在哪里。
+ *
+ * @param tid    线程号
+ * @param state  内核状态字符（R/S/D/Z/T…）
+ * @param wchan  内核里正在等待的符号（读不到就是 "-"）
+ * @param syscall 当前系统调用（格式 "号 参数…"，读不到是 "-"）
+ * @param comm   线程名
+ */
+data class ProcessWaitEntry(
+    val tid: Int,
+    val state: Char,
+    val wchan: String,
+    val syscall: String,
+    val comm: String
+)
+
+/** 一次等待链查询的结果（线程列表 + 是否被上限截断）。 */
+data class ProcessWaitChain(
+    val entries: List<ProcessWaitEntry> = emptyList(),
+    val limit: Int = 0
+) {
+    val truncated: Boolean get() = limit > 0 && entries.size >= limit
+}
+
+/**
+ * 「用户」页：一个进程在用户行下面展开时的一行。
+ *
+ * @param state 内核状态的中文文案（已挂起 / 正在运行 …）；用户行只在整体挂起时显示
+ * @param networkBytesPerSecond null = 取不到（TrafficStats 不支持按 uid 统计）
+ */
+data class UserProcessRow(
+    val pid: Int,
+    val name: String,
+    val state: String,
+    val cpuPercent: Double,
+    val memoryBytes: Long,
+    val diskBytesPerSecond: Long,
+    val networkBytesPerSecond: Long? = null,
+    /** 启动时刻：进程操作（结束 / 转储 / 属性 / 转到详细信息）要拿它核对 PID 复用。 */
+    val startTicks: Long = -1L,
+    /** 进程自己报的 EXE_PATH；没有就为 null。 */
+    val exePath: String? = null,
+    /** Android 进程所属包名；Linux 原生进程为 null。用户页按它取应用图标。 */
+    val packageName: String? = null,
+    /**
+     * PACKAGE_NAME 列的显示值。packageName 为空时按详细信息页同样的规则从这里兜底取包名
+     * （去掉“包名（版本）”这种括号后缀）；没有这一列时为 null。
+     */
+    val packageDisplayName: String? = null
+)
+
+/**
+ * 「用户」页：一行用户（按进程属主 uid 分组）及其全部进程。
+ *
+ * 分组口径与 Windows 任务管理器的「用户」页对齐：一行 = 一个账户（这里是 uid），
+ * 展开后列出属于这个 uid 的进程；数值都是该 uid 下所有进程的和。
+ *
+ * @param userLabel  账户名，取自进程的「用户」列（`u0_a123 (10123)` 这类）；拿不到时退成 uid
+ * @param status     整个用户的状态；空串 = 不显示（只有全部进程都挂起时才写「已挂起」）
+ * @param networkBytesPerSecond null = 取不到
+ */
+data class UserGroupRow(
+    val uid: Int,
+    val userLabel: String,
+    val status: String,
+    val cpuPercent: Double,
+    val memoryBytes: Long,
+    val diskBytesPerSecond: Long,
+    val networkBytesPerSecond: Long?,
+    val processes: List<UserProcessRow> = emptyList()
+)
+
+/**
+ * 「用户」页整张表。
+ *
+ * @param totalNetworkBytesPerSecond null = 这台机器取不到按用户统计的网络速率
+ */
+data class UsersTable(
+    val groups: List<UserGroupRow> = emptyList(),
+    val totalCpuPercent: Double = 0.0,
+    val totalMemoryBytes: Long = 0L,
+    val totalDiskBytesPerSecond: Long = 0L,
+    val totalNetworkBytesPerSecond: Long? = null,
+    val refreshIntervalMs: Long = 0L,
+    val note: String = ""
+)
+
+/**
+ * 「用户」页的 Android 视图：一个 Android 用户（多用户 / 工作资料）的汇总。
+ *
+ * Android 的 uid 编码是 `userId * 100000 + appId`，所以拿进程属主 uid 除 100000
+ * 就能把进程归到具体的 Android 用户；这里再按 uid 分组（[groups]）展开成应用。
+ *
+ * @param appUidCount 该用户名下有运行进程的 uid 个数（不是安装包数：共享 uid 会合并）
+ * @param isCurrent   是不是本应用所在的用户（Process.myUid() 推导，不是猜的）
+ */
+data class AndroidUserSummary(
+    val userId: Int,
+    val label: String,
+    val isCurrent: Boolean,
+    val processCount: Int,
+    val appUidCount: Int,
+    val cpuPercent: Double,
+    val memoryBytes: Long,
+    val diskBytesPerSecond: Long,
+    val networkBytesPerSecond: Long?,
+    val groups: List<UserGroupRow> = emptyList(),
+    /** 已连接 / 运行中；空串 = 不显示（未知 uid 不冒充状态）。 */
+    val status: String = "",
+    /** 这个用户是不是 in running 状态；用户页只列 true 的。 */
+    val running: Boolean = true
+)
+
+/** 用户页长按用户菜单里的账户动作（都走 ActivityManager / UserManager 的系统接口）。 */
+enum class AndroidUserAction {
+    /** 先 startUserInBackground，再 switchUser。 */
+    CONNECT,
+
+    /** stopUser。 */
+    STOP,
+
+    /** switchUser。 */
+    SWITCH
+}
+
+/**
+ * 「用户」页的 Android 视图整张表。
+ *
+ * @param totalNetworkBytesPerSecond null = 取不到按用户统计的网络速率
+ */
+data class AndroidUsersTable(
+    val users: List<AndroidUserSummary> = emptyList(),
+    val totalUsers: Int = 0,
+    val totalProcessCount: Int = 0,
+    val totalCpuPercent: Double = 0.0,
+    val totalMemoryBytes: Long = 0L,
+    val totalDiskBytesPerSecond: Long = 0L,
+    val totalNetworkBytesPerSecond: Long? = null,
+    val refreshIntervalMs: Long = 0L
+)
+
+/**
+ * 内存转储的结果。
+ *
+ * @param path       写到哪里（应用私有目录下的绝对路径）
+ * @param bytes      实际写入的字节数
+ * @param segments   写了几个内存段
+ * @param permissionDenied 失败原因是存储权限不够（EACCES/EPERM）：
+ *                   普通权限模式下可以据此再申请一次「所有文件访问」后重试
+ */
+data class ProcessDumpResult(
+    val ok: Boolean,
+    val path: String = "",
+    val bytes: Long = 0L,
+    val segments: Int = 0,
+    val reason: String = "",
+    val permissionDenied: Boolean = false
 )
 
 /**

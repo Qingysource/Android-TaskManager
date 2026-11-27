@@ -768,7 +768,12 @@ private fun MainPage(
 
         } else if (chartSummary) {
 
-            PageContent(selectedPage, settingsProvider, onSettingChanged)
+            PageContent(
+                selectedPage,
+                settingsProvider,
+                onSettingChanged,
+                onNavigate = { selectedPage = it }
+            )
 
         } else if (isWide) {
             Row(Modifier.fillMaxSize()) {
@@ -857,7 +862,12 @@ private fun MainPage(
                             .weight(1f)
                             .fillMaxWidth()
                     ) {
-                        PageContent(selectedPage, settingsProvider, onSettingChanged)
+                        PageContent(
+                            selectedPage,
+                            settingsProvider,
+                            onSettingChanged,
+                            onNavigate = { selectedPage = it }
+                        )
                     }
                 }
             }
@@ -951,7 +961,12 @@ private fun MainPage(
                             .fillMaxSize()
                             .padding(innerPadding)
                     ) {
-                        PageContent(selectedPage, settingsProvider, onSettingChanged)
+                        PageContent(
+                            selectedPage,
+                            settingsProvider,
+                            onSettingChanged,
+                            onNavigate = { selectedPage = it }
+                        )
                     }
                 }
             }
@@ -1311,7 +1326,8 @@ private fun PageSearchField(
 private fun PageContent(
     page: TaskPage,
     settingsProvider: () -> SettingsValues,
-    onSettingChanged: (SettingKey, Any) -> Unit
+    onSettingChanged: (SettingKey, Any) -> Unit,
+    onNavigate: (TaskPage) -> Unit
 ) {
     when (pageStateOf(page)) {
         PageState.NOT_IMPLEMENTED -> {
@@ -1338,7 +1354,9 @@ private fun PageContent(
         TaskPage.Performance -> PerformanceScreen()
         TaskPage.AppHistory -> ApphistoryScreen()
         TaskPage.StartupApps -> StartupAppScreen()
-        TaskPage.Users -> UsersScreen()
+        TaskPage.Users -> UsersScreen(
+            onOpenDetails = { _, _ -> onNavigate(TaskPage.Details) }
+        )
         TaskPage.Details -> DetailsScreen()
         TaskPage.Services -> ServicesScreen()
         TaskPage.Debug -> DebugScreen()

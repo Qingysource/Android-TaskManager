@@ -173,10 +173,11 @@
  *           rss / peak_rss / rss_delta / active_private_rss / private_rss / shared_rss /
  *           vss / page_faults / page_faults_delta / nice / fd_count / thread_count /
  *           io_read_count / io_write_count / io_read_bytes / io_write_bytes /
- *           exe_path / cmdline / selinux / platform / arch / is_admin / nx_protect /
- *           android_priority（= /proc/<pid>/oom_score_adj，见 field_text_of）
+ *           exe_path / cmdline / selinux / platform / arch / is_admin / nx_protect
  *   - 归 Android 服务填（回 NOT_AVAILABLE）：package_name / target_sdk /
- *     description / isolation
+ *     description / android_priority / isolation —— 这五格是 Android Framework
+ *     的事实（包名、目标 SDK、应用名、框架优先级、是否框架管的进程），内核不知道，
+ *     由 AndroidService 以 shell / root 身份查询后补进快照，本后端不再冒充
  *   - 本版没有（回 UNSUPPORTED）：cpu_cycles（要 perf_event_open）、四个 GPU 字段
  *   - cet_protect：只有 x86 内核的 status 才报 x86_Thread_features，arm64 回 UNSUPPORTED
  *   - 首轮没有基准时 cpu_usage / rss_delta / page_faults_delta 回 NO_BASELINE
@@ -267,6 +268,23 @@
 #define TM_CTL_DUMP_STATE 3
 
 #define TM_CTL_SHUTDOWN 4
+
+/*
+ * 进程控制类动作码（REQ <seq> 3 0x0 <code> <pid> <start_ticks> [arg]）。
+ *
+ * 全部先核对 pid + start_ticks 才动手：PID 会被复用，只凭 pid 会动到另一个进程。
+ */
+#define TM_CTL_KILL_TREE 5
+
+#define TM_CTL_SET_PRIORITY 6
+
+#define TM_CTL_SET_AFFINITY 7
+
+#define TM_CTL_SCHED_INFO 8
+
+#define TM_CTL_WAIT_CHAIN 9
+
+#define TM_CTL_MEM_DUMP 10
 
 #define TM_STATUS_OK 0
 
@@ -596,7 +614,15 @@ typedef struct {
  */
 #define TM_OUT_EXTENDED_DEVICE_MAX 96
 
-#define TM_OUT_FIELD_MAX 20
+/**
+ * 一台设备的字段上限。
+ *
+ * 内存这一台自己就要 26 格（meminfo 那套统计 19 个 + 名称 + 标称容量 /
+ * 为硬件保留 / System RAM / 预留区并集 + 规格 + 厂商），原来写 20 时，
+ * 排在后面的标称容量、规格、厂商全被这个上限静默丢掉 —— 页面上就是
+ * "类型没有、厂商暂无数据"，而底层其实已经读到了。
+ */
+#define TM_OUT_FIELD_MAX 32
 
 #define TM_OUT_ID_MAX 32
 
@@ -933,6 +959,7 @@ typedef struct {
 #include "DeviceExtendedSnapshot.h"
 
 #include "ProcessSnapshot.h"
+#include "ProcessControl.h"
 
 #include "CPUDevice.h"
 

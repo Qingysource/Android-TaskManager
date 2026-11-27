@@ -405,14 +405,38 @@ object LinuxControlCode {
     /** 让服务优雅退出：后端收包后回执，再自己收循环。 */
     const val SHUTDOWN = 4
 
+    /** 结束一整棵进程树：arg = pid, start_ticks（服务端按 ppid 关系自下而上杀）。 */
+    const val KILL_TREE = 5
+
+    /** 设置 nice 值：arg = pid, start_ticks, nice（-20..19，需要 CAP_SYS_NICE 才能调高）。 */
+    const val SET_PRIORITY = 6
+
+    /** 设置 CPU 亲和性：arg = pid, start_ticks, 掩码（十六进制，第 n 位 = CPU n）。 */
+    const val SET_AFFINITY = 7
+
+    /** 读调度状态：arg = pid（nice / 调度策略 / 亲和性 / 线程数）。 */
+    const val SCHED_INFO = 8
+
+    /** 读等待链：arg = pid（逐线程 state / wchan / syscall）。 */
+    const val WAIT_CHAIN = 9
+
+    /** 写一份精简 native 内存转储：arg = pid, start_ticks, 输出路径。 */
+    const val MEM_DUMP = 10
+
     /** 合法范围。 */
-    val VALID: IntRange = KILL_PROCESS..SHUTDOWN
+    val VALID: IntRange = KILL_PROCESS..MEM_DUMP
 
     fun nameOf(code: Int): String = when (code) {
         KILL_PROCESS -> "KILL_PROCESS"
         REINIT -> "REINIT"
         DUMP_STATE -> "DUMP_STATE"
         SHUTDOWN -> "SHUTDOWN"
+        KILL_TREE -> "KILL_TREE"
+        SET_PRIORITY -> "SET_PRIORITY"
+        SET_AFFINITY -> "SET_AFFINITY"
+        SCHED_INFO -> "SCHED_INFO"
+        WAIT_CHAIN -> "WAIT_CHAIN"
+        MEM_DUMP -> "MEM_DUMP"
         else -> "UNKNOWN($code)"
     }
 }
@@ -721,6 +745,43 @@ object LinuxProtocol {
     fun buildKill(seq: Long, pid: Int, startTicks: Long): String =
         "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 " +
             "${LinuxControlCode.KILL_PROCESS} $pid $startTicks"
+
+    /**
+     * 组一个"结束进程树"控制请求：`REQ <seq> 3 0x0 5 <pid> <start_ticks>`。
+     *
+     * 服务端按 /proc 里的 ppid 关系自下而上杀，只动目标这棵子树。
+     */
+    fun buildKillTree(seq: Long, pid: Int, startTicks: Long): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 " +
+            "${LinuxControlCode.KILL_TREE} $pid $startTicks"
+
+    /** 组一个"设置 nice"控制请求：`REQ <seq> 3 0x0 6 <pid> <start_ticks> <nice>`。 */
+    fun buildSetPriority(seq: Long, pid: Int, startTicks: Long, nice: Int): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 " +
+            "${LinuxControlCode.SET_PRIORITY} $pid $startTicks $nice"
+
+    /** 组一个"设置亲和性"控制请求：第三段是十六进制掩码。 */
+    fun buildSetAffinity(seq: Long, pid: Int, startTicks: Long, mask: Long): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 " +
+            "${LinuxControlCode.SET_AFFINITY} $pid $startTicks 0x" +
+            java.lang.Long.toHexString(mask)
+
+    /** 组一个"读调度状态"控制请求：`REQ <seq> 3 0x0 8 <pid>`。 */
+    fun buildSchedInfo(seq: Long, pid: Int): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 ${LinuxControlCode.SCHED_INFO} $pid"
+
+    /** 组一个"读等待链"控制请求：`REQ <seq> 3 0x0 9 <pid>`。 */
+    fun buildWaitChain(seq: Long, pid: Int): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 ${LinuxControlCode.WAIT_CHAIN} $pid"
+
+    /**
+     * 组一个"内存转储"控制请求：`REQ <seq> 3 0x0 10 <pid> <start_ticks> <path>`。
+     *
+     * 路径里不能有空格（协议按空格切字段），调用方传应用私有目录下的绝对路径。
+     */
+    fun buildMemoryDump(seq: Long, pid: Int, startTicks: Long, path: String): String =
+        "$REQ_PREFIX $seq ${LinuxRequestType.CONTROL} 0x0 " +
+            "${LinuxControlCode.MEM_DUMP} $pid $startTicks $path"
 
     /**
      * 解析应答头：`PKG <seq> <isFromSvc> <typeCode> <maskHex> <status> <count>`。
@@ -1064,6 +1125,12 @@ class LinuxService : Service(), ILinuxServiceApi {
 
         /** 友好接口的默认等待上限：一次 /proc 遍历在真机上是毫秒级，这里只是留缓冲。 */
         const val DEFAULT_REQUEST_TIMEOUT_MS = 4_000L
+
+        /**
+         * 内存转储的等待上限：要逐页读 /proc/pid/mem 再写盘，几百 MB 的进程
+         * 会明显超过普通请求的 4 秒，单独给一个更宽的上限。
+         */
+        const val MEMORY_DUMP_TIMEOUT_MS = 30_000L
 
         /** 启动参数：true = 允许本服务用提权通道（Shizuku / root）拉起后端。 */
         const val EXTRA_PRIVILEGED_MODE = "linux_service_privileged_mode"
@@ -1951,11 +2018,152 @@ class LinuxService : Service(), ILinuxServiceApi {
         )
     }
 
+    /**
+     * 结束进程树：先杀子孙、最后杀目标本身。
+     *
+     * @param pid        目标进程
+     * @param startTicks 启动时刻（身份校验，缺了或对不上都不动手）
+     */
+    fun killProcessTree(pid: Int, startTicks: Long, timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
+
+        if (pid <= 0 || startTicks < 0L) {
+
+            append(AppStrings.s(R.string.lsvc_kill_rejected, pid, startTicks))
+
+            return null
+        }
+
+        if (!isProcessAlive(backend)) {
+
+            append(AppStrings.s(R.string.lsvc_kill_failed_not_running, pid))
+
+            return null
+        }
+
+        val seq = nextSeqOf()
+
+        return exchange(
+            seq,
+            LinuxProtocol.buildKillTree(seq, pid, startTicks),
+            LinuxRequestType.CONTROL,
+            0L,
+            timeoutMs
+        )
+    }
+
+    /**
+     * 设置 nice 值。
+     *
+     * 后端会先核对身份再 setpriority；调高优先级（让 nice 变小）需要 CAP_SYS_NICE，
+     * 普通身份会被 EPERM 拒绝 —— 回执里带 errno，调用方据此说清原因。
+     */
+    fun setProcessPriority(
+        pid: Int,
+        startTicks: Long,
+        nice: Int,
+        timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS
+    ): LinuxPacket? {
+
+        if (pid <= 0 || startTicks < 0L || nice !in -20..19) return null
+
+        if (!isProcessAlive(backend)) return null
+
+        val seq = nextSeqOf()
+
+        return exchange(
+            seq,
+            LinuxProtocol.buildSetPriority(seq, pid, startTicks, nice),
+            LinuxRequestType.CONTROL,
+            0L,
+            timeoutMs
+        )
+    }
+
+    /** 设置 CPU 亲和性：mask 第 n 位 = 允许在 CPU n 上运行（0 视为参数错误）。 */
+    fun setProcessAffinity(
+        pid: Int,
+        startTicks: Long,
+        mask: Long,
+        timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS
+    ): LinuxPacket? {
+
+        if (pid <= 0 || startTicks < 0L || mask == 0L) return null
+
+        if (!isProcessAlive(backend)) return null
+
+        val seq = nextSeqOf()
+
+        return exchange(
+            seq,
+            LinuxProtocol.buildSetAffinity(seq, pid, startTicks, mask),
+            LinuxRequestType.CONTROL,
+            0L,
+            timeoutMs
+        )
+    }
+
+    /** 读调度状态（nice / 策略 / 亲和性 / 线程数），对话框里显示"当前值"用。 */
+    fun schedInfo(pid: Int, timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
+
+        if (pid <= 0 || !isProcessAlive(backend)) return null
+
+        val seq = nextSeqOf()
+
+        return exchange(
+            seq,
+            LinuxProtocol.buildSchedInfo(seq, pid),
+            LinuxRequestType.CONTROL,
+            0L,
+            timeoutMs
+        )
+    }
+
+    /** 读等待链：每线程一行（tid / 状态 / wchan / syscall / 线程名）。 */
+    fun waitChain(pid: Int, timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? {
+
+        if (pid <= 0 || !isProcessAlive(backend)) return null
+
+        val seq = nextSeqOf()
+
+        return exchange(
+            seq,
+            LinuxProtocol.buildWaitChain(seq, pid),
+            LinuxRequestType.CONTROL,
+            0L,
+            timeoutMs
+        )
+    }
+
+    /**
+     * 写一份精简 native 内存转储（ELF core，只含可读映射）。
+     *
+     * @param path 输出文件绝对路径（不能含空格；由 UIService 放在应用私有目录下）
+     */
+    fun memoryDump(
+        pid: Int,
+        startTicks: Long,
+        path: String,
+        timeoutMs: Long = MEMORY_DUMP_TIMEOUT_MS
+    ): LinuxPacket? {
+
+        if (pid <= 0 || startTicks < 0L || path.isBlank()) return null
+
+        if (!isProcessAlive(backend)) return null
+
+        val seq = nextSeqOf()
+
+        return exchange(
+            seq,
+            LinuxProtocol.buildMemoryDump(seq, pid, startTicks, path),
+            LinuxRequestType.CONTROL,
+            0L,
+            timeoutMs
+        )
+    }
+
     /** 让后端丢掉采样基准，下一轮快照重新建立（增量字段会先回一轮 NO_BASELINE）。 */
     fun reinitialize(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? =
-        controlPackage(LinuxControlCode.REINIT, "", timeoutMs)
-
-    /** 后端内部状态（已处理请求数、基准状态等）。 */
+        controlPackage(LinuxControlCode.REINIT, "", timeoutMs)    /** 后端内部状态（已处理请求数、基准状态等）。 */
     fun dumpState(timeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS): LinuxPacket? =
         controlPackage(LinuxControlCode.DUMP_STATE, "", timeoutMs)
 

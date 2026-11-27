@@ -1052,31 +1052,6 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
         return text_result(out_status, second + 1);
     }
 
-    if (strcmp(key, "android_priority") == 0) {
-
-        // Android 的进程优先级就是 LMK 口径的 oom_score_adj：
-        // 负数 = 越不容易被杀（前台 / 常驻），正数 = 越先被回收。
-        // 这一格必须由 Linux 侧读：Android Framework 只能看到自己的 importance，
-        // 别人的 oom_score_adj 恰恰是提权身份才有权限打开的文件。
-        char path[TM_PATH_MAX];
-
-        snprintf(path, sizeof(path), "/proc/%d/oom_score_adj", cur->pid);
-
-        if (read_text_file(path, buffer, capacity) < 0) {
-            *out_status = TM_FIELD_STATUS_ACCESS_DENIED;
-
-            return NULL;
-        }
-
-        char *newline = strchr(buffer, '\n');
-
-        if (newline != NULL) {
-            *newline = '\0';
-        }
-
-        return text_result(out_status, buffer);
-    }
-
     if (strcmp(key, "peak_rss") == 0) {
 
         if (g_status_text[0] == '\0') {
@@ -1344,7 +1319,14 @@ static const char *field_text_of(const TmProcStat *cur, const char *key,
         return text_result(out_status, shadow_stack ? "1" : "0");
     }
 
-    // ---------- 本版拿不到 / 归 Android 服务填 ----------
+    // ---------- 归 Android 服务填 ----------
+    //
+    // 这五格全是 Android Framework 的事实，内核侧没有对应物：
+    // - package_name / target_sdk / description：包管理器（PackageManager）的东西；
+    // - android_priority：框架给进程分的优先级分档（由 AndroidService 以 shell 身份取；
+    //   它不是内核的 nice 值，别在这里拿 oom_score_adj 冒充）；
+    // - isolation：这个进程是否由 Android Framework 托管。
+    // 一律回 NOT_AVAILABLE，由 AndroidService 查询后补进快照。
 
     if (strcmp(key, "package_name") == 0 || strcmp(key, "target_sdk") == 0 ||
         strcmp(key, "description") == 0 || strcmp(key, "android_priority") == 0 ||

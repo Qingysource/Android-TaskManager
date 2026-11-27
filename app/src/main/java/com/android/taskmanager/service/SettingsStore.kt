@@ -782,13 +782,18 @@ object DetailViewStore {
     /** 存档字段："忽略实时更新速度"是否勾选（true = 页面不自动刷新）。 */
     private const val KEY_IGNORE_SPEED = "ignore_update_speed"
 
+    /** 存档字段：用户拖出来的列宽（列 id -> dp 整数）。 */
+    private const val KEY_COLUMN_WIDTHS = "column_widths"
+
     fun filePath(context: Context): File = File(File(context.filesDir, CONFIG_DIR), FILE_NAME)
 
-    /** 一次读出来的三样东西：可见列、进程范围、"忽略实时更新速度"。 */
+    /** 一次读出来的四样东西：可见列、列宽覆盖、进程范围、"忽略实时更新速度"。 */
     class Preferences(
         val visibleIds: MutableSet<String>,
         val scope: ProcessScope,
-        val ignoreUpdateSpeed: Boolean
+        val ignoreUpdateSpeed: Boolean,
+        /** 用户拖出来的列宽（列 id -> dp）；没拖过的列不在里面，用列定义里的出厂宽度。 */
+        val columnWidths: Map<String, Int> = emptyMap()
     )
 
     /**
@@ -833,17 +838,33 @@ object DetailViewStore {
                 .mapNotNull { index -> array.optString(index).takeIf { it.isNotBlank() } }
         }
 
+        // 列宽覆盖：只认"列定义里存在 + 宽为正数"的条目；其余（旧版本残留 / 手改坏了）丢掉，
+        // 让那一列退回出厂宽度，而不是把整份布局当成损坏
+        val widths: Map<String, Int> = json?.optJSONObject(KEY_COLUMN_WIDTHS)?.let { obj ->
+
+            val parsed = HashMap<String, Int>(obj.length())
+
+            obj.keys().forEach { id ->
+
+                val width = obj.optInt(id, 0)
+
+                if (id in knownIds && width > 0) parsed[id] = width
+            }
+
+            parsed
+        } ?: emptyMap()
+
         val ids = saved?.filter { it in knownIds }?.toCollection(LinkedHashSet())
 
         if (ids.isNullOrEmpty()) {
-            save(context, fallback, scope, ignoreSpeed)
+            save(context, fallback, scope, ignoreSpeed, widths)
 
-            return Preferences(fallback, scope, ignoreSpeed)
+            return Preferences(fallback, scope, ignoreSpeed, widths)
         }
 
         ids.add(DetailColumnId.NAME)
 
-        return Preferences(ids, scope, ignoreSpeed)
+        return Preferences(ids, scope, ignoreSpeed, widths)
     }
 
     /**
@@ -856,7 +877,8 @@ object DetailViewStore {
         context: Context,
         ids: Set<String>,
         scope: ProcessScope,
-        ignoreUpdateSpeed: Boolean
+        ignoreUpdateSpeed: Boolean,
+        columnWidths: Map<String, Int> = emptyMap()
     ): Boolean {
 
         if (ids.isEmpty()) return false
@@ -876,6 +898,16 @@ object DetailViewStore {
                 .put(KEY_VISIBLE_COLUMNS, array)
                 .put(KEY_PROCESS_SCOPE, scope.wire)
                 .put(KEY_IGNORE_SPEED, ignoreUpdateSpeed)
+
+            // 列宽覆盖：只写用户真拖过的列（没拖的列不在表里，读的时候用出厂宽度）
+            if (columnWidths.isNotEmpty()) {
+
+                val widths = JSONObject()
+
+                columnWidths.forEach { (id, width) -> widths.put(id, width) }
+
+                json.put(KEY_COLUMN_WIDTHS, widths)
+            }
 
             val tmp = File(dir, FILE_NAME + TMP_SUFFIX)
 

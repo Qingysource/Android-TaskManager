@@ -107,8 +107,13 @@ import kotlinx.coroutines.delay
 // 设置数据结构
 // =========================================================
 
-/** 反馈按钮打开的问题页面地址。换仓库只改这一行。 */
-private const val SETTINGS_FEEDBACK_URL = "https://github.com/Qingysource/Android-TaskManager/issues"
+/**
+ * 反馈按钮打开的问题页面地址。换仓库只改这一行。
+ *
+ * 详细信息页长按菜单里的「提供反馈」也走这一个地址（见 DetailsScreen），
+ * 所以是 internal 而不是 private：两处必须是同一个页面，不能各写一份。
+ */
+internal const val SETTINGS_FEEDBACK_URL = "https://github.com/Qingysource/Android-TaskManager/issues"
 
 /**
  * 一份完整的设置快照。

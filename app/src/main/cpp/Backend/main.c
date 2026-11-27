@@ -70,14 +70,52 @@ static bool handle_query_info(unsigned long long seq, int type)
 }
 
 /**
- * 处理 typeCode=3：`REQ <seq> 3 0x0 <code> [arg] [arg2]`，控制码见头部注释第三节。
+ * 把两个文本参数解析成 (pid, start_ticks)。
+ *
+ * -1 = 没给启动时刻（客户端拿不到就是拿不到，不能拿 0 顶替；0 是合法值，如 init）。
+ * 解析失败时 pid 置 0，让调用方按 BAD_ARGUMENT 处理。
+ */
+static bool parse_pid_and_start(const char *pid_text, const char *ticks_text,
+                                int *pid_out, long long *start_out)
+{
+    *pid_out = 0;
+    *start_out = -1;
+
+    if (pid_text != NULL && pid_text[0] != '\0') {
+
+        char *pid_end = NULL;
+        int pid = (int) strtol(pid_text, &pid_end, 10);
+
+        // 整段必须都是数字：不然 "12abc" 会被 strtol 解成 12
+        if (pid_end == pid_text || *pid_end != '\0') {
+            return false;
+        }
+
+        *pid_out = pid;
+    }
+
+    if (ticks_text != NULL && ticks_text[0] != '\0') {
+
+        char *ticks_end = NULL;
+        long long parsed = (long long) strtoll(ticks_text, &ticks_end, 10);
+
+        if (ticks_end != ticks_text && *ticks_end == '\0' && parsed >= 0) {
+            *start_out = parsed;
+        }
+    }
+
+    return *pid_out > 0 && *start_out >= 0;
+}
+
+/**
+ * 处理 typeCode=3：`REQ <seq> 3 0x0 <code> [arg] [arg2] [arg3]`，控制码见头部注释第三节。
  *
  * 回执与执行分开表达：ACCEPTED = 已受理但这一版没真做（KILL 只回执）；
  * OK = 已做完；BAD_ARGUMENT / PROCESS_EXITED = 没做成及原因。
  */
 static bool handle_control(TmBackend *backend, unsigned long long seq, int type,
                            const char *code_text, const char *argument,
-                           const char *argument2)
+                           const char *argument2, const char *argument3)
 {
     if (code_text == NULL || code_text[0] == '\0') {
 
@@ -170,7 +208,7 @@ static bool handle_control(TmBackend *backend, unsigned long long seq, int type,
                 // 原样回 errno，让客户端能说清"为什么没成"，而不是一律"失败"。
                 int saved_errno = errno;
 
-                reply_package_header(seq, type, 0ULL, TM_STATUS_INTERNAL, 0);
+                reply_package_header(seq, type, 0ULL, TM_STATUS_INTERNAL, 6);
                 printf("I code=%d\n", code);
                 printf("I action=kill\n");
                 printf("I pid=%d\n", pid);
@@ -187,7 +225,7 @@ static bool handle_control(TmBackend *backend, unsigned long long seq, int type,
                 return true;
             }
 
-            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 0);
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 5);
             printf("I code=%d\n", code);
             printf("I action=kill\n");
             printf("I pid=%d\n", pid);
@@ -236,6 +274,299 @@ static bool handle_control(TmBackend *backend, unsigned long long seq, int type,
             backend->running = false;
 
             return false;
+
+        case TM_CTL_KILL_TREE: {
+
+            int pid = 0;
+            long long start_ticks = -1;
+
+            if (!parse_pid_and_start(argument, argument2, &pid, &start_ticks)) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_BAD_ARGUMENT, 0);
+                print_info_line("error", "kill tree needs pid and start_ticks");
+
+                return true;
+            }
+
+            int killed = 0;
+            int failed = 0;
+            int saved_errno = 0;
+
+            bool ok = pc_kill_tree(pid, start_ticks, &killed, &failed, &saved_errno);
+
+            if (!ok) {
+
+                // ESRCH = 目标已经不在了（身份对不上也算这一类，语义是"不是那个进程了"）
+                int status = (saved_errno == ESRCH) ? TM_STATUS_PROCESS_EXITED : TM_STATUS_INTERNAL;
+
+                reply_package_header(seq, type, 0ULL, status, 8);
+                printf("I code=%d\n", code);
+                printf("I action=kill_tree\n");
+                printf("I pid=%d\n", pid);
+                printf("I killed=%d\n", killed);
+                printf("I failed=%d\n", failed);
+                printf("I executed=0\n");
+                printf("I errno=%d\n", saved_errno);
+
+                {
+                    char note_text[96];
+
+                    snprintf(note_text, sizeof(note_text), "kill tree failed, errno %d", saved_errno);
+                    print_info_line("error", note_text);
+                }
+
+                return true;
+            }
+
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 7);
+            printf("I code=%d\n", code);
+            printf("I action=kill_tree\n");
+            printf("I pid=%d\n", pid);
+            printf("I killed=%d\n", killed);
+            printf("I failed=%d\n", failed);
+            printf("I executed=1\n");
+            printf("I errno=%d\n", saved_errno);
+
+            return true;
+        }
+
+        case TM_CTL_SET_PRIORITY: {
+
+            int pid = 0;
+            long long start_ticks = -1;
+
+            if (!parse_pid_and_start(argument, argument2, &pid, &start_ticks)) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_BAD_ARGUMENT, 0);
+                print_info_line("error", "set priority needs pid and start_ticks");
+
+                return true;
+            }
+
+            int nice_value = (argument3 != NULL) ? atoi(argument3) : 0;
+            int saved_errno = 0;
+
+            bool ok = pc_set_priority(pid, start_ticks, nice_value, &saved_errno);
+
+            // 设置后无论成败都把"当前真实 nice"回给界面：被内核夹过也能显示实际值
+            int applied = -1;
+            int policy = -1;
+            unsigned long long mask = 0ULL;
+            int threads = 0;
+
+            // 单独一格 errno：读调度状态失败时不能把 setpriority 的错误码盖掉，
+            // 否则界面拿到的是"读不到 nice"的原因，而不是"设置失败"的原因。
+            int sched_errno = 0;
+
+            pc_sched_info(pid, &applied, &policy, &mask, &threads, &sched_errno);
+
+            if (!ok) {
+
+                int status = (saved_errno == ESRCH) ? TM_STATUS_PROCESS_EXITED : TM_STATUS_INTERNAL;
+
+                reply_package_header(seq, type, 0ULL, status, 7);
+                printf("I code=%d\n", code);
+                printf("I action=set_priority\n");
+                printf("I pid=%d\n", pid);
+                printf("I nice=%d\n", nice_value);
+                printf("I applied=%d\n", applied);
+                printf("I executed=0\n");
+                printf("I errno=%d\n", saved_errno);
+
+                return true;
+            }
+
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 5);
+            printf("I code=%d\n", code);
+            printf("I action=set_priority\n");
+            printf("I pid=%d\n", pid);
+            printf("I nice=%d\n", applied);
+            printf("I executed=1\n");
+
+            return true;
+        }
+
+        case TM_CTL_SET_AFFINITY: {
+
+            int pid = 0;
+            long long start_ticks = -1;
+
+            if (!parse_pid_and_start(argument, argument2, &pid, &start_ticks)) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_BAD_ARGUMENT, 0);
+                print_info_line("error", "set affinity needs pid and start_ticks");
+
+                return true;
+            }
+
+            // 第三段是十六进制掩码（可以带 0x 前缀）：第 n 位 = 允许在 CPU n 上跑
+            unsigned long long requested = 0ULL;
+
+            if (argument3 != NULL && argument3[0] != '\0') {
+
+                const char *mask_text = argument3;
+
+                if (mask_text[0] == '0' && (mask_text[1] == 'x' || mask_text[1] == 'X')) {
+                    mask_text += 2;
+                }
+
+                requested = strtoull(mask_text, NULL, 16);
+            }
+
+            int saved_errno = 0;
+
+            bool ok = pc_set_affinity(pid, start_ticks, requested, &saved_errno);
+
+            if (!ok) {
+
+                int status = (saved_errno == ESRCH) ? TM_STATUS_PROCESS_EXITED : TM_STATUS_INTERNAL;
+
+                reply_package_header(seq, type, 0ULL, status, 6);
+                printf("I code=%d\n", code);
+                printf("I action=set_affinity\n");
+                printf("I pid=%d\n", pid);
+                printf("I mask=0x%llx\n", requested);
+                printf("I executed=0\n");
+                printf("I errno=%d\n", saved_errno);
+
+                return true;
+            }
+
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 5);
+            printf("I code=%d\n", code);
+            printf("I action=set_affinity\n");
+            printf("I pid=%d\n", pid);
+            printf("I mask=0x%llx\n", requested);
+            printf("I executed=1\n");
+
+            return true;
+        }
+
+        case TM_CTL_SCHED_INFO: {
+
+            int pid = atoi(argument != NULL ? argument : "0");
+
+            int nice_value = 0;
+            int policy = -1;
+            unsigned long long mask = 0ULL;
+            int threads = 0;
+            int saved_errno = 0;
+
+            if (pid <= 0) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_BAD_ARGUMENT, 0);
+                print_info_line("error", "sched info needs a positive pid");
+
+                return true;
+            }
+
+            if (!pc_sched_info(pid, &nice_value, &policy, &mask, &threads, &saved_errno)) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_PROCESS_EXITED, 1);
+                printf("I errno=%d\n", saved_errno);
+
+                return true;
+            }
+
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 6);
+            printf("I pid=%d\n", pid);
+            printf("I nice=%d\n", nice_value);
+            printf("I policy=%d\n", policy);
+            printf("I affinity=0x%llx\n", mask);
+            printf("I threads=%d\n", threads);
+            printf("I cpus=%d\n", pc_present_cpu_count());
+
+            return true;
+        }
+
+        case TM_CTL_WAIT_CHAIN: {
+
+            int pid = atoi(argument != NULL ? argument : "0");
+
+            if (pid <= 0) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_BAD_ARGUMENT, 0);
+                print_info_line("error", "wait chain needs a positive pid");
+
+                return true;
+            }
+
+            char (*lines)[PC_WAIT_LINE_MAX] =
+                (char (*)[PC_WAIT_LINE_MAX]) malloc(sizeof(char[PC_WAIT_LINE_MAX]) * PC_WAIT_THREAD_MAX);
+
+            if (lines == NULL) {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_INTERNAL, 0);
+                print_info_line("error", "out of memory");
+
+                return true;
+            }
+
+            int count = pc_wait_chain(pid, lines);
+
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 3 + count);
+
+            printf("I pid=%d\n", pid);
+            printf("I threads=%d\n", count);
+            printf("I limit=%d\n", PC_WAIT_THREAD_MAX);
+
+            // 每条线程一行：t<序号>=<tid>\t<状态>\t<wchan>\t<syscall>\t<线程名>
+            for (int i = 0; i < count; i++) {
+                printf("I t%d=%s\n", i, lines[i]);
+            }
+
+            free(lines);
+
+            return true;
+        }
+
+        case TM_CTL_MEM_DUMP: {
+
+            int pid = 0;
+            long long start_ticks = -1;
+
+            if (!parse_pid_and_start(argument, argument2, &pid, &start_ticks) ||
+                argument3 == NULL || argument3[0] == '\0') {
+
+                reply_package_header(seq, type, 0ULL, TM_STATUS_BAD_ARGUMENT, 0);
+                print_info_line("error", "mem dump needs pid, start_ticks and output path");
+
+                return true;
+            }
+
+            long long bytes = 0;
+            int segments = 0;
+            int saved_errno = 0;
+
+            bool ok = pc_mem_dump(pid, start_ticks, argument3, &bytes, &segments, &saved_errno);
+
+            if (!ok) {
+
+                int status = (saved_errno == ESRCH) ? TM_STATUS_PROCESS_EXITED : TM_STATUS_INTERNAL;
+
+                reply_package_header(seq, type, 0ULL, status, 7);
+                printf("I code=%d\n", code);
+                printf("I action=mem_dump\n");
+                printf("I pid=%d\n", pid);
+                printf("I bytes=%lld\n", bytes);
+                printf("I segments=%d\n", segments);
+                printf("I executed=0\n");
+                printf("I errno=%d\n", saved_errno);
+
+                return true;
+            }
+
+            reply_package_header(seq, type, 0ULL, TM_STATUS_OK, 7);
+            printf("I code=%d\n", code);
+            printf("I action=mem_dump\n");
+            printf("I pid=%d\n", pid);
+            printf("I bytes=%lld\n", bytes);
+            printf("I segments=%d\n", segments);
+            printf("I executed=1\n");
+            print_info_line("path", argument3);
+
+            return true;
+        }
 
         default:
 
@@ -332,13 +663,15 @@ static bool handle_request(TmBackend *backend, const char *line)
         return handle_extended_snapshot(seq, (int) type);
     }
 
-    // 第四个字段之后：控制类的 code，再往后是两个参数（参数都不含空格）。
-    // KILL 用 `code pid start_ticks`，其余控制码忽略这两个字段。
+    // 第四个字段之后：控制类的 code，再往后是参数（参数都不含空格）。
+    // KILL 用 `code pid start_ticks`；优先级 / 亲和性 / 转储再用到第三个参数。
     char *code_text = strtok_r(NULL, " \t", &save);
 
     char *argument = (code_text == NULL) ? NULL : strtok_r(NULL, " \t", &save);
 
     char *argument2 = (argument == NULL) ? NULL : strtok_r(NULL, " \t", &save);
+
+    char *argument3 = (argument2 == NULL) ? NULL : strtok_r(NULL, " \t", &save);
 
     switch ((int) type) {
 
@@ -350,7 +683,7 @@ static bool handle_request(TmBackend *backend, const char *line)
             return handle_query_info(seq, (int) type);
 
         case TM_REQ_CONTROL:
-            return handle_control(backend, seq, (int) type, code_text, argument, argument2);
+            return handle_control(backend, seq, (int) type, code_text, argument, argument2, argument3);
 
         case TM_REQ_PING:
             return handle_ping(seq, (int) type);

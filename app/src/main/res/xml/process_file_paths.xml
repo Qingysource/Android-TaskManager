@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    「打开文件所在的位置」用的 FileProvider 路径表。
+
+    要覆盖的路径不在应用自己的目录里：
+      - Android 进程：/data/app/.../<包>/base.apk（PackageManager 给的 sourceDir）；
+      - 原生进程：/system/bin/xxx、/vendor/bin/xxx、/apex/... 这类绝对路径。
+    所以这里直接暴露根目录；能不能被别的应用读到仍由每次一条的
+    FLAG_GRANT_READ_URI_PERMISSION 决定，不是把整机文件系统对外公开。
+-->
+<paths>
+
+    <root-path
+        name="device_root"
+        path="/" />
+
+</paths>

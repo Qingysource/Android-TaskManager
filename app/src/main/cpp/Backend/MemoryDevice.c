@@ -405,11 +405,53 @@ static const char *const k_dram_type_names[] = {
 };
 
 /**
+ * 判断一段 dt 属性是不是"纯文本"，返回可用的文本长度。
+ *
+ * NUL 必须算成"不是文本"。原因：高通的 ddr_device_type 是 big-endian u32，
+ * 形如 00 00 00 08 —— 前三个字节全是 0。早先这里把 0 当可打印字符放过，
+ * 于是一路走进字符串分支，strstr 又在第一个 NUL 就停住，永远匹配不到
+ * "LPDDR5X" / "LPDDR5"，规格这一项就被整项丢掉（界面上就是"没了"）。
+ *
+ * 末尾的 NUL 先剥掉再判断：字符串形态的属性是 "LPDDR5\0" 这种以 NUL 收尾的，
+ * 不剥就会被误判成二进制。
+ *
+ * @return 文本长度（>0 才是文本）；0 = 不是文本，按二进制解释
+ */
+static int dram_text_length(const char *raw, int length)
+{
+    if (raw == NULL || length <= 0) {
+        return 0;
+    }
+
+    int trimmed = length;
+
+    while (trimmed > 0 && raw[trimmed - 1] == '\0') {
+        trimmed--;
+    }
+
+    if (trimmed <= 0) {
+        return 0;
+    }
+
+    for (int i = 0; i < trimmed; i++) {
+
+        unsigned char ch = (unsigned char) raw[i];
+
+        if (ch < 0x20 || ch > 0x7e) {
+            return 0;
+        }
+    }
+
+    return trimmed;
+}
+
+/**
  * 把一段 dt 属性解释成内存规格名。
  *
- * 属性可能是两种形态：
+ * 属性可能是三种形态：
  *   纯文本（compatible 之类的字符串表）—— 转大写后按关键字认，长的先认，
  *     否则 LPDDR5X 会被 LPDDR5 抢先匹配；
+ *   文本数字（有些内核把枚举导成 "8"）—— 当枚举值查表；
  *   二进制（高通 ddr_type，big-endian 的 u32）—— 小枚举值只有最后一个字节非零，
  *     取它当下标查表。
  *
@@ -421,23 +463,13 @@ static bool dram_spec_from_property(const char *raw, int length, char *out, int 
         return false;
     }
 
-    bool printable = true;
+    int text_length = dram_text_length(raw, length);
 
-    for (int i = 0; i < length; i++) {
-
-        unsigned char ch = (unsigned char) raw[i];
-
-        if (ch != 0 && (ch < 0x20 || ch > 0x7e)) {
-            printable = false;
-            break;
-        }
-    }
-
-    if (printable) {
+    if (text_length > 0) {
 
         char upper[64];
 
-        int count = length < (int) sizeof(upper) - 1 ? length : (int) sizeof(upper) - 1;
+        int count = text_length < (int) sizeof(upper) - 1 ? text_length : (int) sizeof(upper) - 1;
 
         for (int i = 0; i < count; i++) {
             upper[i] = (char) toupper((unsigned char) raw[i]);
@@ -454,6 +486,19 @@ static bool dram_spec_from_property(const char *raw, int length, char *out, int 
 
             if (strstr(upper, k_names[i]) != NULL) {
                 snprintf(out, (size_t) capacity, "%s", k_names[i]);
+                return true;
+            }
+        }
+
+        // 文本形态的枚举值："8" / "0x08" 都认，和二进制分支走同一张表
+        char *end = NULL;
+
+        long code = strtol(upper, &end, 0);
+
+        if (end != NULL && *end == '\0') {
+
+            if (code > 0 && code < TM_DRAM_TYPE_COUNT && k_dram_type_names[code] != NULL) {
+                snprintf(out, (size_t) capacity, "%s", k_dram_type_names[code]);
                 return true;
             }
         }
@@ -500,22 +545,423 @@ static long long read_dt_u32(const char *path)
 }
 
 /**
+ * 在 dt 根目录下的 memory* 节点里找某个标量属性（ddr_size 用）。
+ *
+ * qcom 的内存节点名常带地址后缀（memory@80000000），固定路径读不到时
+ * 就靠这一步把容量捞回来 —— 否则名称行只能退到 MemTotal，和商品标称对不上。
+ *
+ * @return 数值；-1 = 没找到
+ */
+static long long read_dt_u32_in_memory_nodes(const char *root, const char *property)
+{
+    if (root == NULL || property == NULL) {
+        return -1;
+    }
+
+    DIR *dir = opendir(root);
+
+    if (dir == NULL) {
+        return -1;
+    }
+
+    static char path[160];
+
+    long long value = -1;
+
+    struct dirent *entry = NULL;
+
+    while (value < 0 && (entry = readdir(dir)) != NULL) {
+
+        const char *name = entry->d_name;
+
+        if (name == NULL || strncmp(name, "memory", 6) != 0) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s/%s", root, name, property);
+
+        value = read_dt_u32(path);
+    }
+
+    closedir(dir);
+
+    return value;
+}
+
+/**
  * 内存规格：高通的 ddr_device_type 属性就是这套枚举，值即下标。
  *
- * 除了高通自己的位置，另外几个通用路径也顺手试一下，读不到就整项不发。
- * 值是二进制（big-endian u32），所以走 dram_spec_from_property 的二进制分支。
+ * 除了高通自己的位置，另外几个通用路径也顺手试一下；单个路径读不到时
+ * 再扫一遍 memory 节点里的属性名、最后退到 getprop —— 三手准备都在
+ * [read_dram_spec_once] 里，读到的结果按"不会变"缓存。
  */
-static bool read_dram_spec(char *out, int capacity)
+static bool read_dram_spec(char *out, int capacity);
+
+/** 内存颗粒厂商：dt 的 ddr_manufacturer_id 换成英文厂商码；同样带缓存与多路兜底。 */
+static bool read_dram_manufacturer(char *out, int capacity);
+
+/** 厂商属性解释函数在下面才定义，这里先声明：目录扫描要跨过定义顺序调用它。 */
+static bool dram_manufacturer_from_property(const char *raw, int length, char *out, int capacity);
+
+/**
+ * 扫一个 dt 目录，把名字符合规则的属性逐个解释一遍。
+ *
+ * 为什么要扫目录：不同厂商 / 不同内核把同一个枚举挂在不同的属性名下
+ * （ddr_type、ddr_device_type、qcom,ddr-type…），写死路径总有漏的；
+ * 目录名本身是稳定的，按关键字捞一遍更耐用。
+ *
+ * @param manufacturer true = 找厂商属性（名字含 manufactur）；
+ *                     false = 找规格属性（名字含 ddr 且含 type，且不是厂商属性）
+ * @return true = 有一个属性解释成功，out 里是结果
+ */
+static bool read_dram_dir_property(const char *directory, bool manufacturer,
+                                   char *out, int capacity)
+{
+    if (directory == NULL || out == NULL || capacity <= 0) {
+        return false;
+    }
+
+    DIR *dir = opendir(directory);
+
+    if (dir == NULL) {
+        return false;
+    }
+
+    static char property[64];
+
+    bool found = false;
+
+    struct dirent *entry = NULL;
+
+    while (!found && (entry = readdir(dir)) != NULL) {
+
+        const char *name = entry->d_name;
+
+        if (name == NULL || name[0] == '.') {
+            continue;
+        }
+
+        if (manufacturer) {
+
+            if (strstr(name, "manufactur") == NULL) {
+                continue;
+            }
+
+        } else {
+
+            // 规格属性：名字里要有 ddr/dram 之一、还要有 type，且不能是厂商属性
+            // （ddr_manufacturer_id 的最后一个字节是厂商码，当成枚举查表会得出错规格）
+            // 带 dram 这一支是给联发科留的：MTK 的 dt / 内核节点更常用 dram（dram_type）。
+            if ((strstr(name, "ddr") == NULL && strstr(name, "dram") == NULL)
+                || strstr(name, "type") == NULL
+                || strstr(name, "manufactur") != NULL) {
+                continue;
+            }
+        }
+
+        snprintf(property, sizeof(property), "%s/%s", directory, name);
+
+        static char raw[64];
+
+        int length = read_text_file(property, raw, (int) sizeof(raw));
+
+        if (length <= 0) {
+            continue;
+        }
+
+        found = manufacturer
+                ? dram_manufacturer_from_property(raw, length, out, capacity)
+                : dram_spec_from_property(raw, length, out, capacity);
+    }
+
+    closedir(dir);
+
+    return found;
+}
+
+/**
+ * 在 dt 根目录下找所有 memory* 节点，逐个扫一遍。
+ *
+ * 为什么要这一步：qcom 的 dt 里内存节点常常是 `memory@80000000` 这种带地址后缀的
+ * 名字，`/proc/device-tree/memory` 这个固定路径根本不存在 —— 只按固定路径找，
+ * 规格 / 厂商就会永远读不到（界面上看到的正是"这两项没了"）。
+ */
+static bool read_dram_memory_nodes(const char *root, bool manufacturer,
+                                   char *out, int capacity)
+{
+    if (root == NULL || out == NULL || capacity <= 0) {
+        return false;
+    }
+
+    DIR *dir = opendir(root);
+
+    if (dir == NULL) {
+        return false;
+    }
+
+    static char node[128];
+
+    bool found = false;
+
+    struct dirent *entry = NULL;
+
+    while (!found && (entry = readdir(dir)) != NULL) {
+
+        const char *name = entry->d_name;
+
+        if (name == NULL || strncmp(name, "memory", 6) != 0) {
+            continue;
+        }
+
+        snprintf(node, sizeof(node), "%s/%s", root, name);
+
+        found = read_dram_dir_property(node, manufacturer, out, capacity);
+    }
+
+    closedir(dir);
+
+    return found;
+}
+
+/**
+ * 最后一手：从 Android 属性里找。
+ *
+ * 有些内核不导出 dt 节点（或 SELinux 不放行），但会把同一个枚举抄进
+ * ro.boot.* 属性里。getprop 输出形如 `[ro.boot.ddr_type]: [8]`，
+ * 只认键名里带 ddr 的行；规格行要求键名带 type，避免把 ddr_size 当成规格。
+ *
+ * 这一步每个进程只跑一次（结果有缓存），启动时多一次 popen 可以接受。
+ */
+static bool read_dram_from_getprop(bool manufacturer, char *out, int capacity)
+{
+    FILE *pipe = popen("getprop 2>/dev/null | grep -i ddr", "r");
+
+    if (pipe == NULL) {
+        return false;
+    }
+
+    static char line[512];
+
+    bool found = false;
+
+    while (!found && fgets(line, (int) sizeof(line), pipe) != NULL) {
+
+        const char *key_end = strchr(line, ':');
+
+        if (key_end == NULL) {
+            continue;
+        }
+
+        if (manufacturer) {
+
+            if (strstr(line, "manufactur") == NULL) {
+                continue;
+            }
+
+        } else {
+
+            if (strstr(line, "type") == NULL || strstr(line, "manufactur") != NULL) {
+                continue;
+            }
+        }
+
+        const char *open = strchr(key_end, '[');
+        const char *close = (open != NULL) ? strchr(open, ']') : NULL;
+
+        if (open == NULL || close == NULL || close <= open + 1) {
+            continue;
+        }
+
+        const char *value = open + 1;
+        int length = (int) (close - value);
+
+        found = manufacturer
+                ? dram_manufacturer_from_property(value, length, out, capacity)
+                : dram_spec_from_property(value, length, out, capacity);
+    }
+
+    pclose(pipe);
+
+    return found;
+}
+
+/**
+ * 联发科一类平台的兜底来源：没有 ddr_device_type 属性，但可能把同一件事写在
+ * dram 专属的 proc / debugfs 节点里，或者抄进 chosen/bootargs、内核命令行。
+ *
+ * 前四条是 MTK dramc 驱动常见的位置（名称各家内核略有出入，存在才读）；
+ * 后两条是"启动参数里带 dram 型号"的情形。全部只读文本、只认关键词，
+ * 认不出来就整项不发 —— 不猜。
+ */
+static const char *const k_dram_text_paths[] = {
+    "/proc/dram_info",
+    "/proc/mtk_dram_info",
+    "/proc/dramc",
+    "/sys/kernel/debug/dramc/dram_info",
+    "/sys/kernel/debug/dramc/dram_type",
+    "/sys/kernel/debug/dramc/dramc_dvfs",
+    "/proc/device-tree/chosen/bootargs",
+    "/proc/cmdline"
+};
+
+/** 太长的文本不读（bootargs / dram_info 都在这个量级以内，读多了纯浪费）。 */
+#define TM_DRAM_TEXT_MAX 8192
+
+/**
+ * 从一段文本里认内存规格：只按关键词认，**不解释数字**。
+ *
+ * 为什么不复用 [dram_spec_from_property]：那个函数会把数字当"高通枚举下标"查表，
+ * 联发科的枚举顺序和高通不一样，硬解出来的数字会标错型号。这里只接受
+ * 文本里明确写着 LPDDR5X / LPDDR4X 这类型号名的情况。
+ *
+ * @return true = 认出来了
+ */
+static bool dram_spec_from_text(const char *text, char *out, int capacity)
+{
+    if (text == NULL || out == NULL || capacity <= 0) {
+        return false;
+    }
+
+    static char upper[TM_DRAM_TEXT_MAX];
+
+    size_t length = strlen(text);
+
+    if (length > sizeof(upper) - 1) {
+        length = sizeof(upper) - 1;
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        upper[i] = (char) toupper((unsigned char) text[i]);
+    }
+
+    upper[length] = '\0';
+
+    // 长的先认，否则 LPDDR5X 会被 LPDDR5 抢先匹配
+    static const char *const k_names[] = {
+        "LPDDR5X", "LPDDR5T", "LPDDR5", "LPDDR4X", "LPDDR4", "LPDDR3", "LPDDR2", "LPDDR1",
+        "DDR4", "DDR3", "DDR2"
+    };
+
+    for (int i = 0; i < (int) (sizeof(k_names) / sizeof(k_names[0])); i++) {
+
+        if (strstr(upper, k_names[i]) != NULL) {
+            snprintf(out, (size_t) capacity, "%s", k_names[i]);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 从一段**dram 专属**文本里认颗粒厂商。
+ *
+ * 只在 dram 专属节点上做这件事：厂商名（SAMSUNG / MICRON …）是普通英文单词，
+ * 放到 /proc/cmdline 这种大杂烩里去搜，容易搜到无关的命中，那比不显示更糟。
+ *
+ * @return true = 认出来了（输出英文厂商码，客户端再映射中文名）
+ */
+static bool dram_vendor_from_text(const char *text, char *out, int capacity)
+{
+    if (text == NULL || out == NULL || capacity <= 0) {
+        return false;
+    }
+
+    static char upper[TM_DRAM_TEXT_MAX];
+
+    size_t length = strlen(text);
+
+    if (length > sizeof(upper) - 1) {
+        length = sizeof(upper) - 1;
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        upper[i] = (char) toupper((unsigned char) text[i]);
+    }
+
+    upper[length] = '\0';
+
+    static const struct {
+        const char *keyword;
+        const char *code;
+
+    } k_vendors[] = {
+        { "SAMSUNG", "SAMSUNG" },
+        { "SKHYNIX", "HYNIX" },     // 文本里常写 SK hynix / SK Hynix
+        { "HYNIX", "HYNIX" },
+        { "MICRON", "MICRON" },
+        { "NANYA", "NANYA" },
+        { "WINBOND", "WINBOND" },
+        { "ELPIDA", "ELPIDA" },
+        { "QIMONDA", "QIMONDA" },
+        { "ESMT", "ESMT" },
+        { "ETRON", "ETRON" }
+    };
+
+    for (int i = 0; i < (int) (sizeof(k_vendors) / sizeof(k_vendors[0])); i++) {
+
+        if (strstr(upper, k_vendors[i].keyword) != NULL) {
+            snprintf(out, (size_t) capacity, "%s", k_vendors[i].code);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 扫一遍 [k_dram_text_paths]：规格认关键词，厂商只在 dram 专属节点里认
+ * （排除 chosen/bootargs 与 /proc/cmdline 两条大杂烩）。
+ */
+static bool read_dram_from_text_sources(bool manufacturer, char *out, int capacity)
+{
+    static char text[TM_DRAM_TEXT_MAX + 1];
+
+    int path_count = (int) (sizeof(k_dram_text_paths) / sizeof(k_dram_text_paths[0]));
+
+    // 厂商只认前几条 dram 专属节点
+    int limit = manufacturer ? 6 : path_count;
+
+    for (int i = 0; i < limit; i++) {
+
+        int length = read_text_file(k_dram_text_paths[i], text, (int) sizeof(text));
+
+        if (length <= 0) {
+            continue;
+        }
+
+        bool found = manufacturer
+                     ? dram_vendor_from_text(text, out, capacity)
+                     : dram_spec_from_text(text, out, capacity);
+
+        if (found) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 真正读一次规格（结果见 [read_dram_spec] 的缓存）。
+ *
+ * 顺序：已知 dt 路径 → memory 节点目录扫描 → 文本来源（联发科一类的 dram 节点 /
+ * 启动参数）→ getprop。
+ * 读不到就整项不发，页面那边名称行只写容量，不摆"未知规格"占位。
+ */
+static bool read_dram_spec_once(char *out, int capacity)
 {
     static const char *const k_paths[] = {
         "/proc/device-tree/memory/ddr_device_type",
+        "/proc/device-tree/memory/ddr_type",
         "/proc/device-tree/qcom,ddr-type",
         "/proc/device-tree/qcom,ddr_type",
+        "/proc/device-tree/qcom,ddr_device_type",
         "/proc/device-tree/ddr-type",
         "/proc/device-tree/ddr_type",
         "/proc/device-tree/dram/ddr_type",
-        "/proc/device-tree/memory/ddr_type",
         "/sys/firmware/devicetree/base/memory/ddr_device_type",
+        "/sys/firmware/devicetree/base/memory/ddr_type",
         "/sys/firmware/devicetree/base/qcom,ddr-type",
         "/sys/firmware/devicetree/base/ddr_type"
     };
@@ -536,7 +982,39 @@ static bool read_dram_spec(char *out, int capacity)
         }
     }
 
-    return false;
+    return read_dram_dir_property("/proc/device-tree/memory", false, out, capacity)
+           || read_dram_dir_property("/sys/firmware/devicetree/base/memory", false, out, capacity)
+           || read_dram_memory_nodes("/proc/device-tree", false, out, capacity)
+           || read_dram_memory_nodes("/sys/firmware/devicetree/base", false, out, capacity)
+           || read_dram_dir_property("/proc/device-tree", false, out, capacity)
+           || read_dram_from_text_sources(false, out, capacity)
+           || read_dram_from_getprop(false, out, capacity);
+}
+
+/**
+ * 内存规格（带缓存）。
+ *
+ * ddr_device_type / 颗粒型号在开机后不会变，而设备快照是每秒一份 ——
+ * 不缓存的话每秒都要扫目录 + 试十几条路径，纯浪费。
+ */
+static bool read_dram_spec(char *out, int capacity)
+{
+    static bool resolved = false;
+    static bool found = false;
+    static char cached[32];
+
+    if (!resolved) {
+
+        resolved = true;
+
+        found = read_dram_spec_once(cached, (int) sizeof(cached));
+    }
+
+    if (found && out != NULL && capacity > 0) {
+        snprintf(out, (size_t) capacity, "%s", cached);
+    }
+
+    return found;
 }
 
 /**
@@ -604,25 +1082,15 @@ static bool dram_manufacturer_from_property(const char *raw, int length, char *o
         return false;
     }
 
-    bool printable = true;
-
-    for (int i = 0; i < length; i++) {
-
-        unsigned char ch = (unsigned char) raw[i];
-
-        if (ch < 0x20 || ch > 0x7e) {
-            printable = false;
-            break;
-        }
-    }
+    int text_length = dram_text_length(raw, length);
 
     int code = -1;
 
-    if (printable) {
+    if (text_length > 0) {
 
         char text[16];
 
-        int count = length < (int) sizeof(text) - 1 ? length : (int) sizeof(text) - 1;
+        int count = text_length < (int) sizeof(text) - 1 ? text_length : (int) sizeof(text) - 1;
 
         memcpy(text, raw, (size_t) count);
 
@@ -650,18 +1118,21 @@ static bool dram_manufacturer_from_property(const char *raw, int length, char *o
 }
 
 /**
- * 内存颗粒厂商：先查 /proc/device-tree，再查 /sys/firmware/devicetree/base。
+ * 真正读一次厂商（结果见 [read_dram_manufacturer] 的缓存）。
  *
- * 两个路径都试一遍：Android 上 /proc/device-tree 通常是 /sys/firmware/devicetree/base
- * 的软链，但被裁过的系统 / SELinux 可能只放行其中一个。
- *
- * @return true = 读到了且编码认得出来；false = 调用方不要发这个字段
+ * 顺序：已知 dt 路径（含不带 _id 的别名）→ memory 节点目录扫描 → getprop。
+ * 都读不到就整项不发：页面那边"厂商"这一行跟着消失，不摆"未知"占位。
  */
-static bool read_dram_manufacturer(char *out, int capacity)
+static bool read_dram_manufacturer_once(char *out, int capacity)
 {
     static const char *const k_paths[] = {
         "/proc/device-tree/memory/ddr_manufacturer_id",
-        "/sys/firmware/devicetree/base/memory/ddr_manufacturer_id"
+        "/proc/device-tree/memory/ddr_manufacturer",
+        "/proc/device-tree/qcom,ddr-manufacturer-id",
+        "/proc/device-tree/qcom,ddr_manufacturer_id",
+        "/sys/firmware/devicetree/base/memory/ddr_manufacturer_id",
+        "/sys/firmware/devicetree/base/memory/ddr_manufacturer",
+        "/sys/firmware/devicetree/base/qcom,ddr-manufacturer-id"
     };
 
     static char raw[16];
@@ -679,7 +1150,40 @@ static bool read_dram_manufacturer(char *out, int capacity)
         }
     }
 
-    return false;
+    return read_dram_dir_property("/proc/device-tree/memory", true, out, capacity)
+           || read_dram_dir_property("/sys/firmware/devicetree/base/memory", true, out, capacity)
+           || read_dram_memory_nodes("/proc/device-tree", true, out, capacity)
+           || read_dram_memory_nodes("/sys/firmware/devicetree/base", true, out, capacity)
+           || read_dram_dir_property("/proc/device-tree", true, out, capacity)
+           || read_dram_from_text_sources(true, out, capacity)
+           || read_dram_from_getprop(true, out, capacity);
+}
+
+/**
+ * 内存颗粒厂商（带缓存）。
+ *
+ * 颗粒型号在开机后不会变，设备快照却每秒一份：不缓存就要每秒试七条路径
+ * 再扫两个目录，纯浪费。缓存里存的是英文码（SAMSUNG / MICRON …），
+ * 中文名由客户端按码映射。
+ */
+static bool read_dram_manufacturer(char *out, int capacity)
+{
+    static bool resolved = false;
+    static bool found = false;
+    static char cached[64];
+
+    if (!resolved) {
+
+        resolved = true;
+
+        found = read_dram_manufacturer_once(cached, (int) sizeof(cached));
+    }
+
+    if (found && out != NULL && capacity > 0) {
+        snprintf(out, (size_t) capacity, "%s", cached);
+    }
+
+    return found;
 }
 
 /**
@@ -688,11 +1192,43 @@ static bool read_dram_manufacturer(char *out, int capacity)
  * 为什么不用 MemTotal：那是内核能用的内存，已经被保留区啃掉一截，
  * 拿它当商品标称容量会少一档（8 GB 的机器显示 7.4 GB）。
  *
+ * 两个挂载点都试：/proc/device-tree 与 /sys/firmware/devicetree/base
+ * 在裁剪过的系统上可能只有一个能读。
+ *
  * @return 字节数；-1 = 读不到或值明显不对（0、超过 4 TB）
  */
 static long long read_dram_size_bytes(void)
 {
-    long long gigabytes = read_dt_u32("/proc/device-tree/memory/ddr_size");
+    static const char *const k_paths[] = {
+        "/proc/device-tree/memory/ddr_size",
+        "/sys/firmware/devicetree/base/memory/ddr_size"
+    };
+
+    long long gigabytes = -1;
+
+    for (int i = 0; i < (int) (sizeof(k_paths) / sizeof(k_paths[0])); i++) {
+
+        long long value = read_dt_u32(k_paths[i]);
+
+        if (value > 0) {
+            gigabytes = value;
+            break;
+        }
+    }
+
+    if (gigabytes <= 0) {
+
+        // 固定路径都没有：退到 memory@… 这类带地址后缀的节点
+        long long from_node = read_dt_u32_in_memory_nodes("/proc/device-tree", "ddr_size");
+
+        if (from_node <= 0) {
+            from_node = read_dt_u32_in_memory_nodes("/sys/firmware/devicetree/base", "ddr_size");
+        }
+
+        if (from_node > 0) {
+            gigabytes = from_node;
+        }
+    }
 
     if (gigabytes <= 0 || gigabytes > 4096) {
         return -1;

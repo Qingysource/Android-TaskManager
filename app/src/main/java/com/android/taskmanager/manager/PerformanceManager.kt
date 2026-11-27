@@ -398,11 +398,15 @@ class PerformanceManager internal constructor(appContext: Context) {
      *
      * 无线局域网按地区取舍（中国 WLAN、其它 Wi-Fi，见 [networkDisplayName]）；
      * 手机网络与以太网没有地区差异，写死中文。ETHERNET 与 OTHER 都算以太网，
-     * 所以 USB 网卡、扩展坞网口、底层分不出型号的接口会共用「以太网」这个名字。
+     * 所以 USB 网卡、扩展坞网口、底层分不出型号的接口会共用「以太网」这个名字；
+     * 其中 tun0…tunN 的隧道接口单独标成「以太网（VPN）」（见 [NetworkSnapshot.isVpnTunnel]），
+     * 其余以太网设备仍是「以太网」。
      */
     fun networkTypeName(network: NetworkSnapshot?): String = when {
 
         network?.isCellular() == true -> AppStrings.s(R.string.perf_type_cellular)
+
+        network?.isVpnTunnel() == true -> AppStrings.s(R.string.perf_ethernet_vpn)
 
         network?.isWired() == true -> AppStrings.s(R.string.perf_type_ethernet)
 
@@ -418,15 +422,46 @@ class PerformanceManager internal constructor(appContext: Context) {
      * 与磁盘 / GPU 那套"永远从 0 起"刻意不同（序号只在"确实有多块"时才有信息量）。
      * 但一段显示里不能既有"带号"又有"不带号"的同类：一块无线 + 一块手机网络时
      * 两条都不带号，没问题；同类出现第二块时才会看到「WLAN」「WLAN 1」。
+     *
+     * 这是**页面标题**用的全名：tun 隧道在这里写「以太网（VPN）」。
+     * 列表里的短名见 [networkShortTitle]。
      */
-    fun networkTitle(networks: List<NetworkSnapshot>, index: Int): String {
+    fun networkTitle(networks: List<NetworkSnapshot>, index: Int): String =
+        numberedNetworkTitle(networks, index) { networkTypeName(networks.getOrNull(it)) }
 
-        val typeName = networkTypeName(networks.getOrNull(index))
+    /**
+     * 侧栏 / 底部硬件条这类**列表里**的名字：与 [networkTitle] 同一套编号，
+     * 但 tun 隧道**不写 (VPN)**，与普通以太网共用「以太网」。
+     *
+     * 用户口径：列表只是"挑哪一页"，一行里塞「以太网（VPN）」又长又被窄格子截断；
+     * VPN 这层信息只在进入页面后由左上角标题（[networkTitle]）给出。
+     */
+    fun networkShortTitle(networks: List<NetworkSnapshot>, index: Int): String =
+        numberedNetworkTitle(networks, index) { networkShortTypeName(networks.getOrNull(it)) }
+
+    /** 列表里的网卡类型名：VPN 与普通以太网都写「以太网」。 */
+    fun networkShortTypeName(network: NetworkSnapshot?): String = when {
+
+        network?.isCellular() == true -> AppStrings.s(R.string.perf_type_cellular)
+
+        network?.isWired() == true -> AppStrings.s(R.string.perf_type_ethernet)
+
+        else -> networkDisplayName
+    }
+
+    /** 按"同名前缀"编号：第一块不带号，第二块起 1、2 … */
+    private fun numberedNetworkTitle(
+        networks: List<NetworkSnapshot>,
+        index: Int,
+        nameOf: (Int) -> String
+    ): String {
+
+        val typeName = nameOf(index.coerceAtLeast(0))
 
         var sameBefore = 0
 
         for (i in 0 until index.coerceAtLeast(0)) {
-            if (networkTypeName(networks.getOrNull(i)) == typeName) sameBefore++
+            if (nameOf(i) == typeName) sameBefore++
         }
 
         return if (sameBefore == 0) typeName else "$typeName $sameBefore"

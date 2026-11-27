@@ -43,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /**
@@ -72,6 +73,9 @@ internal fun PageShell(
     subtitle: String = "",
     showHeader: Boolean = false,
     scrollable: Boolean = true,
+    horizontalPadding: Dp = 24.dp,
+    topPadding: Dp = 8.dp,
+    bottomPadding: Dp = 24.dp,
     content: @Composable ColumnScope.() -> Unit = {}
 ) {
     Column(
@@ -84,7 +88,10 @@ internal fun PageShell(
                     Modifier
                 }
             )
-            .padding(24.dp),
+            // 顶部留白单独收窄：竖屏正文直接接在 TopAppBar（标题 + 搜索框）下面，
+            // 原来四面都 24dp 会在标题栏和内容之间空出约 24dp（480dpi 下就是 72px），
+            // 看起来像"页面没贴上去"。左右仍保持 24dp，底部也不动。
+            .padding(start = horizontalPadding, end = horizontalPadding, top = topPadding, bottom = bottomPadding),
 
         verticalArrangement = Arrangement.Top,
 

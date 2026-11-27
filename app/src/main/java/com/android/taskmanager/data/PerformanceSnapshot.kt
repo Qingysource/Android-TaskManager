@@ -1530,6 +1530,27 @@ data class NetworkSnapshot(
     fun isOther(): Boolean = roleKey() == NET_ROLE_OTHER
 
     /**
+     * 是不是 tun 隧道接口（tun0 / tun1 …）。
+     *
+     * 隧道接口在 sysfs 上没有 device 链接，底层 role 落到 OTHER，而 OTHER 被 [isWired]
+     * 归进"以太网这一族"，页面上就统一写成「以太网」。这里只按名字认 `tun` + 纯数字，
+     * 命中后**只改显示文案**（类型名 / 连接类型写成「以太网（VPN）」），
+     * 不动 [isWired] 与注册过滤 —— 其它以太网设备照旧写「以太网」。
+     *
+     * 不认 `tunl0`、`tun-abc` 这类名字：不是 tun0…tunN 的命名，仍按普通以太网显示。
+     */
+    fun isVpnTunnel(): Boolean {
+
+        val label = (iface ?: name)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+
+        if (!label.startsWith(TUN_IFACE_PREFIX)) return false
+
+        val suffix = label.substring(TUN_IFACE_PREFIX.length)
+
+        return suffix.isNotEmpty() && suffix.all { it in '0'..'9' }
+    }
+
+    /**
      * 是不是"以太网这一类"：ETHERNET 与 OTHER 合在一起。
      *
      * 手机 / 平板上的 USB 网卡、扩展坞网口，有的带 device 链接（判成 ETHERNET），
@@ -1538,7 +1559,8 @@ data class NetworkSnapshot(
      *
      * 需要知道的一层：tun0 / ipsec0 这类 VPN 接口也在 OTHER 里，只要有真地址
      * 就会显示成「以太网」—— 这是"其它适配器也算以太网"这个口径的直接结果。
-     * 以后要单独把 VPN 排除，只需在注册过滤里加一条名字前缀判断。
+     * tun0…tunN 的显示文案在 [isVpnTunnel] 处单独标成「以太网（VPN）」，
+     * 其它虚拟接口（ipsec / docker0 / dummy …）仍写「以太网」。
      */
     fun isWired(): Boolean = isEthernet() || isOther()
 
@@ -1586,7 +1608,8 @@ data class NetworkSnapshot(
      * 无线：底层给什么写什么（802.11ax / 802.11ac …），读不到写"不支持"。
      * 手机网络：底层现在拿不到制式（4G / 5G / LTE 要 TelephonyManager 那边的数据，
      * 走的是另一条通路），按产品口径默认写「手机网络」。
-     * 以太网：底层不发 link_type（网线也没有 802.11 代际这回事），默认写「以太网」。
+     * 以太网：底层不发 link_type（网线也没有 802.11 代际这回事），默认写「以太网」；
+     * 其中 tun0…tunN 的隧道接口写「以太网（VPN）」，判据见 [isVpnTunnel]。
      * 等以后底层把 link_type 发上来（比如 "5G NR" / "1000BASE-T"），
      * 第一个分支就直接显示真值 —— 升级点只在这一处。
      */
@@ -1595,6 +1618,7 @@ data class NetworkSnapshot(
         val value = linkType?.trim()
 
         return when {
+            isVpnTunnel() -> NETWORK_WIRED_VPN_LINK_TEXT
             !value.isNullOrEmpty() -> value
             isCellular() -> NETWORK_CELLULAR_LINK_TEXT
             isWired() -> NETWORK_WIRED_LINK_TEXT
@@ -1631,6 +1655,9 @@ internal const val NET_ROLE_ETHERNET = "ETHERNET"
 
 internal const val NET_ROLE_OTHER = "OTHER"
 
+/** tun 隧道接口的名字前缀：只认 tun + 纯数字（tun0 / tun1 …），见 [NetworkSnapshot.isVpnTunnel]。 */
+internal const val TUN_IFACE_PREFIX = "tun"
+
 /**
  * 手机网络的"连接类型"默认文案。
  *
@@ -1646,6 +1673,14 @@ internal val NETWORK_CELLULAR_LINK_TEXT: String get() = AppStrings.s(R.string.pe
  * 先按产品口径写「以太网」；以后底层发 "1000BASE-T" 之类的真值时会自动盖过去。
  */
 internal val NETWORK_WIRED_LINK_TEXT: String get() = AppStrings.s(R.string.perf_link_wired)
+
+/**
+ * tun 隧道接口的"连接类型"文案：以太网这一族里唯一要区分的子类。
+ *
+ * 隧道接口在底层被归到 OTHER（没有 device 链接），显示口径仍是"以太网这一类"，
+ * 但要按名字标出 VPN，见 [NetworkSnapshot.isVpnTunnel]；类型名与连接类型共用同一条文案。
+ */
+internal val NETWORK_WIRED_VPN_LINK_TEXT: String get() = AppStrings.s(R.string.perf_ethernet_vpn)
 
 /**
  * 网卡速率文案：按量级选 Kb / Mb（抄 Windows 的口径，写"Kbps"），

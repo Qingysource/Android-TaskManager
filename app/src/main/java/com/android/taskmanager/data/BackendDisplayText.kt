@@ -176,6 +176,25 @@ object BackendDisplayText {
     }
 
     /**
+     * 字节数 -> 「K」单位的统一写法：`1 K` / `1,000 K`（K 前有一个空格，千位带逗号）。
+     *
+     * 后端所有内存类字段（rss / peak_rss / rss_delta / 三个 private/shared rss / vss /
+     * GPU 专用与共享）发的都是**字节**，这一层统一折成 K 再显示；
+     * 非纯数字（`—`、`不支持`、调试注入的话术）原样返回，不把占位符算成 0。
+     */
+    fun kiloFromBytesText(value: String?): String {
+
+        val raw = value?.trim().orEmpty()
+
+        val bytes = raw.toLongOrNull() ?: return raw
+
+        // 四舍五入到整 K：1024 字节 -> 1 K，1,024,000 字节 -> 1,000 K
+        val kb = Math.round(bytes / 1024.0)
+
+        return String.format(Locale.US, "%,d K", kb)
+    }
+
+    /**
      * 详细信息表里"某一列的值"的统一入口：按列 id 决定用哪张映射表。
      *
      * 调用点只有 [LinuxProcessRecord.displayOf] 一个 —— 表格所有格子都从那里出来，
@@ -191,13 +210,34 @@ object BackendDisplayText {
 
             DetailColumnId.PLATFORM -> bitsText(raw)
 
-            DetailColumnId.IS_ADMIN, DetailColumnId.NX_PROTECT, DetailColumnId.CET_PROTECT -> yesNoText(raw)
+            DetailColumnId.IS_ADMIN, DetailColumnId.CET_PROTECT -> yesNoText(raw)
 
+            // NX 位只有"已启用"一种写法：没开 / 读不到一律留空，
+            // 不再写「否」——这一列关心的是保护有没有生效，不是二元判断。
+            DetailColumnId.NX_PROTECT -> if (raw.trim() == "1") {
+                AppStrings.s(R.string.data_nx_enabled)
+            } else {
+                ""
+            }
+
+            // 隔离状态只标一种：由 Android Framework 托管的进程写 AndroidContainer，
+            // 其余（未隔离 / 读不到）留空，靠"有没有字"区分，不写"未隔离"占位。
             DetailColumnId.ISOLATION -> when (raw.trim()) {
-                ISOLATION_YES -> AppStrings.s(R.string.data_isolated)
-                ISOLATION_NO -> AppStrings.s(R.string.data_not_isolated)
+                ISOLATION_YES -> AppStrings.s(R.string.data_isolation_container)
+                ISOLATION_NO -> ""
                 else -> raw
             }
+
+            // 以下都是字节数：统一按 K 显示（1 K / 1,000 K）
+            DetailColumnId.RSS,
+            DetailColumnId.PEAK_RSS,
+            DetailColumnId.RSS_DELTA,
+            DetailColumnId.ACTIVE_PRIVATE_RSS,
+            DetailColumnId.PRIVATE_RSS,
+            DetailColumnId.SHARED_RSS,
+            DetailColumnId.VSS,
+            DetailColumnId.GPU_DEDICATED_MEM,
+            DetailColumnId.GPU_SHARED_MEM -> kiloFromBytesText(raw)
 
             else -> raw
         }

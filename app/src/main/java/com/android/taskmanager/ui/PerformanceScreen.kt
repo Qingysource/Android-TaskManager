@@ -761,9 +761,11 @@ fun PerformanceScreen(hostedInOverlay: Boolean = false) {
                 HardwareSlot(
                     kind = HardwareKind.NETWORK,
                     diskIndex = index,
-                    // 大字是"设备类型名"（WLAN / 手机网络 / 以太网），
-                    // 同类第二块起才带序号（WLAN、WLAN 1 …）
-                    title = manager.networkTitle(networks, index),
+                    // 大字是"设备类型名"。列表里统一用短名（tun 隧道也写「以太网」），
+                    // VPN 这层信息只在进入页面后的左上角标题里写「以太网（VPN）」。
+                    title = manager.networkShortTitle(networks, index),
+                    // 竖屏底部横条与左栏大字同一份短名，避免窄格子截断
+                    shortTitle = manager.networkShortTitle(networks, index),
                     // 第二行是适配器名（wlan0 / rmnet_data0），与右栏右上角那个
                     // name 字段同源；**不要**和上面那行写一样 —— 重复的信息没意义
                     line2 = network.nameText(),
@@ -1378,6 +1380,14 @@ private fun memoryDetailLines(memory: MemorySnapshot?): List<Pair<String, String
 
         data.speedText()?.let { add(AppStrings.s(R.string.perf_speed) to it) }
 
+        // 内存规格（LPDDR5X / LPDDR4X / DDR4 …）：名称行右侧也带着它，但浮窗和窄屏会把
+        // 那一行截断（只剩容量），所以明细里单列一行。
+        // 底层真给了规格才画这一行 —— 读不到就整行不出现，不摆"暂无数据"占位。
+        data.specText
+            ?.takeIf { it.isNotBlank() }
+            ?.trim()
+            ?.let { add(AppStrings.s(R.string.perf_memory_spec) to it) }
+
         add(AppStrings.s(R.string.perf_slots_used) to data.slotsText())
 
         add(AppStrings.s(R.string.perf_form_factor) to data.formFactorText())
@@ -1391,12 +1401,12 @@ private fun memoryDetailLines(memory: MemorySnapshot?): List<Pair<String, String
         // 交换空间：已用/总量 一行收（例 0.8/4.0 GB），排在压缩内存下面
         data.swapText()?.let { add(AppStrings.s(R.string.perf_swap) to it) }
 
-        // 厂商这一行只在底层真报出来时才有：它来自 dt 的 ddr_manufacturer_id，
-        // 读不到或编码不在表里就整行不画（和AppStrings.s(R.string.perf_speed)同一规矩，不摆破折号占位）。
+        // 内存厂商：来自 dt 的 ddr_manufacturer_id。底层发了才画这一行，
+        // 读不到就整行不出现（不摆"暂无数据"）。
         // 后端发的是英文码（SAMSUNG / MICRON …），中文名由 BackendDisplayText 映射
-        data.manufacturer?.takeIf { it.isNotBlank() }?.let {
-            add(AppStrings.s(R.string.perf_manufacturer) to BackendDisplayText.memoryVendorText(it))
-        }
+        data.manufacturer
+            ?.takeIf { it.isNotBlank() }
+            ?.let { add(AppStrings.s(R.string.perf_memory_vendor) to BackendDisplayText.memoryVendorText(it)) }
     }
 }
 
@@ -2915,7 +2925,10 @@ private fun HardwareCompactBar(
 
             Box(
                 modifier = Modifier
-                    .width(PERFORMANCE_COMPACT_TAB_WIDTH)
+                    // 宽度只给下限：短标题（CPU / 磁盘 0 / WLAN）仍是 76dp 一格，
+                    // 长标题（「以太网（VPN）」）按文字长度自己撑开，不再被截成「以太网（…」。
+                    // 这一条横滑排列，格子变宽只是往右多占一点，不会压扁其它格。
+                    .widthIn(min = PERFORMANCE_COMPACT_TAB_WIDTH)
                     .height(PERFORMANCE_COMPACT_TAB_HEIGHT)
                     .clip(RoundedCornerShape(8.dp))
                     .background(
@@ -2933,6 +2946,9 @@ private fun HardwareCompactBar(
                 Text(
                     // 竖屏横条用短标题：磁盘仍是"磁盘 0"
                     text = slot.shortTitle,
+
+                    // 左右各留 10dp：格子随文字变宽后，长标题才不会顶到圆角背景的边
+                    modifier = Modifier.padding(horizontal = 10.dp),
 
                     style = MaterialTheme.typography.bodyMedium,
 

@@ -38,19 +38,39 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.app.usage.NetworkStats
+import android.app.usage.NetworkStatsManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.TrafficStats
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.os.UserHandle
+import android.os.UserManager
+import android.telephony.TelephonyManager
 import android.provider.Settings
 import android.util.Log
 
+// 内存转储落盘与时间戳：路径是应用私有目录，文件名带 pid 与时间，便于反复转储不互相覆盖
+import java.io.File
+
+import java.text.SimpleDateFormat
+
+import java.util.Date
+
+import java.util.Locale
+
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
@@ -71,10 +91,20 @@ import com.android.taskmanager.LinuxCommand
 import com.android.taskmanager.DetailColumn
 import com.android.taskmanager.DetailColumnId
 import com.android.taskmanager.ProcessActionResult
+import com.android.taskmanager.ProcessDumpResult
+import com.android.taskmanager.ProcessSchedInfo
+import com.android.taskmanager.ProcessWaitChain
+import com.android.taskmanager.ProcessWaitEntry
 import com.android.taskmanager.DetailTable
 import com.android.taskmanager.MainActivity
 import com.android.taskmanager.PermissionRequestResult
 import com.android.taskmanager.ProcessRow
+import com.android.taskmanager.AndroidUserSummary
+import com.android.taskmanager.AndroidUsersTable
+import com.android.taskmanager.AndroidUserAction
+import com.android.taskmanager.UserGroupRow
+import com.android.taskmanager.UserProcessRow
+import com.android.taskmanager.UsersTable
 import com.android.taskmanager.SettingKey
 import com.android.taskmanager.SettingsApi
 import com.android.taskmanager.SettingsCatalog
@@ -88,6 +118,8 @@ import com.android.taskmanager.UserCredentialState
 import com.android.taskmanager.normalizeThemeMode
 
 import com.android.taskmanager.data.AndroidService
+import com.android.taskmanager.data.AppHistoryRow
+import com.android.taskmanager.data.AppHistoryTable
 import com.android.taskmanager.data.BackendDisplayText
 import com.android.taskmanager.data.ProcessKey
 import com.android.taskmanager.data.LinuxService
@@ -133,6 +165,8 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         /** [OVERLAY-v1] 浮窗日志标签：adb logcat -s TMOverlay 即可只看浮窗相关。 */
         private const val TAG = "TMOverlay"
 
+    private const val USER_ACTION_TAG = "TMUserAction"
+
         /** 详细信息页的页名（与 MainActivity.navigationTitle 同一套文案）。 */
         private const val PAGE_DETAIL = "详细信息"
 
@@ -158,6 +192,15 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         )
 
         /**
+         * 详细信息页列宽的拖动范围（dp）。
+         *
+         * 下限 64：再窄连"PID"这种短数字都要折行，等于把列拖废了；
+         * 上限 640：够放 `com.android.settings（设置）` 这类长包名，又不至于一格占掉整屏。
+         */
+        private const val DETAIL_COLUMN_MIN_WIDTH_DP = 64
+        private const val DETAIL_COLUMN_MAX_WIDTH_DP = 640
+
+        /**
          * 置顶相关权限的巡检间隔（悬浮窗权限 + 无障碍权限）。
          *
          * 服务活着的期间一直跑，2 秒一次的开销可以忽略（一次 appops 查询 + 一次无障碍状态）。
@@ -181,6 +224,9 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
          * 立刻重采往往又把那一行读回来，看起来像"没杀掉"（用户实测的 bug）。
          */
         private const val KILL_REFRESH_DELAY_MS = 250L
+
+        /** 内存转储落到共享存储的哪个目录（`/storage/emulated/<用户 id>/Download`）。 */
+        private const val DUMP_DIRECTORY_NAME = "dump"
 
         /** 当前运行的实例；未启动 / 已销毁时为 null。 */
         @Volatile
@@ -1062,7 +1108,8 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     /** 全部列的定义：表头文案、列宽、按数值还是按字符串排序。 */
     private val detailColumns: List<DetailColumn> = listOf(
         DetailColumn(DetailColumnId.NAME, AppStrings.s(R.string.dcol_name), numeric = false, width = 180),
-        DetailColumn(DetailColumnId.PACKAGE_NAME, AppStrings.s(R.string.dcol_package), numeric = false, width = 160),
+        // 包名列比原来宽 60：现在这一格是"包名（应用名）"，例如 com.android.settings（设置）
+        DetailColumn(DetailColumnId.PACKAGE_NAME, AppStrings.s(R.string.dcol_package), numeric = false, width = 220),
         DetailColumn(DetailColumnId.PID, "PID", width = 72),
         DetailColumn(DetailColumnId.STATE, AppStrings.s(R.string.dcol_state), numeric = false, width = 88),
         DetailColumn(DetailColumnId.USER, AppStrings.s(R.string.dcol_user), numeric = false, width = 120),
@@ -1144,8 +1191,22 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         detailProcessScope = prefs.scope
         detailIgnoreUpdateSpeed = prefs.ignoreUpdateSpeed
 
+        // 用户拖出来的列宽也在这份文件里：装进来后，detailTable() 按它替换出厂宽度
+        synchronized(detailLock) {
+            detailColumnWidths.clear()
+            detailColumnWidths.putAll(prefs.columnWidths)
+        }
+
         prefs.visibleIds
     }
+
+    /**
+     * 用户拖表头拖动出来的列宽（列 id -> dp）；没拖过的列不在表里，用列定义里的出厂宽度。
+     *
+     * 只影响显示宽度，不改列集合、不改排序、不改采样需求。和可见列一起落在
+     * detail_view.json（[DetailViewStore]），下次打开照旧。
+     */
+    private val detailColumnWidths = HashMap<String, Int>()
 
     /**
      * 详细信息页当前的进程范围（左下角三档）。
@@ -1959,8 +2020,11 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
     /**
      * 详细信息页这一轮要采的掩码 = 它当前要显示的列（隐藏的列不采）。
      *
-     * 名称列固定并进来：它是每一行的标题（[ProcessRow.name]），
-     * 用户没勾它也必须有，否则行标题只能退化成 "pid 123"。
+     * 两列**无论是否勾选都要采**：
+     * - 名称列：它是每一行的标题（[ProcessRow.name]），用户没勾也得有，
+     *   否则行标题只能退化成 "pid 123"；同时它也是"同 uid 多包"时定包的依据
+     *   （后端这列取的是 cmdline 的 argv[0]，即完整进程名）；
+     * - cmdline 列：只是给用户看的完整命令行，不参与定包，可以不采。
      *
      * 将来这个页如果新增"只有选中进程才需要的列"，在这里并上即可，其它地方不用动。
      */
@@ -2549,9 +2613,24 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
      * 只做转换、不写表：什么时候把快照铺进表由调用方决定（调试页按钮 / 页面刷新），
      * 免得自动覆盖掉用户手动加入的 Test0 ~ Test10 测试行。
      */
-    fun linuxSnapshotToRows(packet: LinuxPacket): List<ProcessRow> =
+    fun linuxSnapshotToRows(packet: LinuxPacket): List<ProcessRow> {
 
-        packet.processes.map { record ->
+        // Android 侧字段：一轮一次判"哪些 pid 是 Android 框架进程"，之后只对这批进程取字段。
+        // 判定与取数都在 AndroidService 里（shell 身份跑一次命令 + 内存查表），
+        // 本服务只负责把结果并进行、把不是 Android 的进程写成"隔离状态：否"。
+        val android = AndroidService.instanceOrNull()
+
+        // 表是"全机完整"的才敢断言"不在表里 = 不是 Android 进程"；只有本地可见范围时不下结论
+        val androidTableComplete = android?.isPackageTableComplete() == true
+
+        val androidPids: Set<Int> = if (android != null) {
+
+            android.prepareRound(packet.processes.map { processKeyOf(it) })
+        } else {
+            emptySet()
+        }
+
+        return packet.processes.map { record ->
 
             val values = LinkedHashMap<String, String>(detailColumns.size)
 
@@ -2566,52 +2645,121 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
                 record.fieldOf(DetailColumnId.STATE)
             )
 
-            // Android 侧字段的接入点（现在什么都不做，见 enrichWithAndroid）
-            enrichWithAndroid(values, record)
+            // 行所属应用的包名（原始值）：Android 进程才有，给图标槽 / 搜索用
+            var packageName: String? = null
+
+            when {
+                // Android 框架进程：补齐五格
+                android != null && record.pid in androidPids -> {
+                    packageName = enrichWithAndroid(values, record, android)
+                }
+
+                // uid 取到了、包表也完整、但不在表里 = Linux 原生应用，这五格本来就没有
+                android != null && androidTableComplete && record.uid != null -> {
+                    values[DetailColumnId.ISOLATION] = BackendDisplayText.processColumnText(
+                        DetailColumnId.ISOLATION,
+                        BackendDisplayText.ISOLATION_NO
+                    )
+                }
+
+                // uid 都没取到 / AndroidService 没起来：不知道，保持 Linux 的"暂无数据"
+            }
 
             ProcessRow(
                 pid = record.pid,
                 name = record.fieldOf(DetailColumnId.NAME) ?: "pid ${record.pid}",
                 values = values,
                 // 启动时刻：-1 = 后端没给这个字段（不能拿 0 顶替，0 是合法值：init 的 starttime 就是 0）
-                startTicks = record.startTicks ?: -1L
+                startTicks = record.startTicks ?: -1L,
+                packageName = packageName
             )
         }
+    }
+
+    /**
+     * 从 Linux 原始行拼出 Android 侧的查询键。
+     *
+     * `processName` 用"名称"列的原始值：后端这一列取的是 cmdline 的 argv[0]（完整进程名，
+     * 例如 `com.android.systemui`、`com.android.systemui:screenshot`），
+     * 而同 uid 多包（uid 1000 下的 systemui / screenrecord 等）**只能靠进程名分辨**，
+     * 光有 uid 必然把别人的包名安错。
+     *
+     * 不用内核 comm 列：comm 被截到 15 字符（`com.android.sys`），对不上包名。
+     * 名称列缺失时退回 cmdline 的第一个参数（两者正常情况下是同一个东西）。
+     * 僵尸进程的名称是 `[comm]` 形式，方括号开头的一律当"没有进程名"。
+     */
+    private fun processKeyOf(record: LinuxProcessRecord): ProcessKey {
+
+        val fromName = record.fieldOf(DetailColumnId.NAME)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && !it.startsWith("[") }
+
+        val processName = fromName ?: record.fieldOf(DetailColumnId.CMDLINE)
+            ?.trim()
+            ?.substringBefore(' ')
+            ?.substringAfterLast('/')
+            ?.takeIf { it.isNotEmpty() }
+
+        return ProcessKey(
+            pid = record.pid,
+            startTicks = record.startTicks ?: -1L,
+            uid = record.uid,
+            processName = processName
+        )
+    }
 
     /**
      * 把 Android 服务才能拿到的字段并进一行。
      *
      * 只补 Linux 侧**明确回 NOT_AVAILABLE** 的五格：
      * package_name / target_sdk / description / android_priority / isolation。
-     * Linux 已经给出数值的列一概不碰 —— 重复采集等于白花一次 PackageManager 查询。
+     * 调用方已经先用 [AndroidService.prepareRound] 判过"这一行是 Android 进程"，
+     * 所以这里只有 Android 进程会进来，Linux 原生进程根本不查。
      *
-     * 调用形态是"按 pid 单查"：AndroidService 与本服务同进程，
-     * 这一次调用不是 IPC、不走协议、没有序列化，查询本体是 uid 索引里的一次取值。
+     * 调用形态是"一个进程问一次"：AndroidService 与本服务同进程，
+     * 这一次调用不是 IPC、不走协议，查询本体是内存里的一次查表
+     * （包 / uid 表与包信息都由它自己用 shell 身份预先取好）。
      *
-     * 失败语义：AndroidService 没起来、进程没有应用身份、这一格本来就没有值，
+     * 失败语义：这一格本来就没有值（例如不可见包的应用名、拿不到的分档），
      * 一律**保持原样**（Linux 的 `—（暂无数据）`），绝不填 0 或空串冒充有值。
      *
-     * @param values 已按 43 列铺好的显示值，就地覆盖
-     * @param record Linux 侧的原始行（pid / startTicks / uid 都是行身份的一部分）
+     * @param values  已按 43 列铺好的显示值，就地覆盖
+     * @param record  Linux 侧的原始行（pid / startTicks / uid 都是行身份的一部分）
+     * @param android 已在跑的 Android 服务实例（由调用方传入，避免每行再取一次）
+     * @return 这一行所属应用的**原始包名**（拿不到返回 null）；调用方把它放进
+     *         [ProcessRow.packageName]，图标槽按它查图。
      */
-    private fun enrichWithAndroid(values: MutableMap<String, String>, record: LinuxProcessRecord) {
+    private fun enrichWithAndroid(
+        values: MutableMap<String, String>,
+        record: LinuxProcessRecord,
+        android: AndroidService
+    ): String? {
 
-        val android = AndroidService.instanceOrNull() ?: return
-
-        val supplement = android.queryProcess(
-            ProcessKey(
-                pid = record.pid,
-                startTicks = record.startTicks ?: -1L,
-                uid = record.uid
-            )
-        ) ?: return
+        val supplement = android.queryProcess(processKeyOf(record)) ?: return null
 
         // 只覆盖确实拿到了的格：null 的字段保持 Linux 的状态文案
-        supplement.packageName?.let { values[DetailColumnId.PACKAGE_NAME] = it }
+        supplement.packageName?.let { pkg ->
+
+            // 包名后面跟上读到的应用名：`com.android.settings（设置）`。
+            // 名字读到什么就写什么（中文 / 英文 / 厂商自定义都照原样），不做语言改写；
+            // 名字还没补上的那几轮只显示包名，包信息补齐后下一轮自动变成"包名（名字）"。
+            val label = supplement.description?.trim()?.takeIf { it.isNotEmpty() && it != pkg }
+
+            values[DetailColumnId.PACKAGE_NAME] = if (label == null) pkg else "$pkg（$label）"
+        }
         supplement.targetSdk?.let { values[DetailColumnId.TARGET_SDK] = it.toString() }
         supplement.description?.let { values[DetailColumnId.DESCRIPTION] = it }
         supplement.androidPriority?.let { values[DetailColumnId.ANDROID_PRIORITY] = it.toString() }
-        supplement.isolation?.let { values[DetailColumnId.ISOLATION] = it }
+        // AndroidService 回的是协议码（ISOLATED / NOT_ISOLATED），落地成界面写法：
+        // 只给已隔离的行写 AndroidContainer，其余留空。
+        supplement.isolation?.let {
+            values[DetailColumnId.ISOLATION] = BackendDisplayText.processColumnText(
+                DetailColumnId.ISOLATION,
+                it
+            )
+        }
+
+        return supplement.packageName
     }
 
     /**
@@ -3146,7 +3294,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
 
         synchronized(detailLock) {
 
-            val visibleColumns = detailColumns.filter { it.id in detailVisibleIds }
+            val visibleColumns = detailColumns.filter { it.id in detailVisibleIds }.map { applyColumnWidth(it) }
 
             val sortId = detailSortColumnId
 
@@ -3159,7 +3307,7 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             return DetailTable(
                 columns = visibleColumns,
                 // 全量列定义：给"选择列"对话框画复选框（顺序固定，不随勾选变化）
-                allColumns = detailColumns,
+                allColumns = detailColumns.map { applyColumnWidth(it) },
                 rows = orderedRows,
                 sortColumnId = sortId,
                 sortDescending = detailSortDescending,
@@ -3173,6 +3321,54 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
                 note = detailNote
             )
         }
+    }
+
+    /**
+     * 把列定义里的出厂宽度换成用户拖出来的宽度（没拖过就原样返回）。
+     *
+     * 调用方都在 [detailLock] 里（[detailTable] 的读取路径），所以这里不再单独加锁。
+     */
+    private fun applyColumnWidth(column: DetailColumn): DetailColumn {
+
+        val width = detailColumnWidths[column.id] ?: return column
+
+        return if (width == column.width) column else column.copy(width = width)
+    }
+
+    /**
+     * 用户拖表头列边界改了某一列的宽度。
+     *
+     * 约定：
+     * - 宽度夹在 [DETAIL_COLUMN_MIN_WIDTH_DP]..[DETAIL_COLUMN_MAX_WIDTH_DP]：拖不出"一个字都看不见"的列，
+     *   也拖不出宽到把别的列全挤到屏幕外的列；
+     * - 拖回和出厂宽度一样就等于"恢复默认"，把这个覆盖删掉（存档里不留冗余项）；
+     * - 只改显示宽度：列集合、排序、采样都不动，所以不需要为此重新采一次快照。
+     *
+     * 注意：没有"一键恢复默认列宽"的入口（用户明确不要这个功能），
+     * 想把某列变回去就把它的边界拖回原来的宽度；列宽存档损坏/整份重建时会退回出厂宽度。
+     *
+     * @return true = 列存在且宽度已记录 + 已排进落盘队列
+     */
+    override fun setDetailColumnWidth(columnId: String, widthDp: Int): Boolean {
+
+        if (detailColumns.none { it.id == columnId }) return false
+
+        val width = widthDp.coerceIn(DETAIL_COLUMN_MIN_WIDTH_DP, DETAIL_COLUMN_MAX_WIDTH_DP)
+
+        synchronized(detailLock) {
+
+            val defaultWidth = detailColumns.first { it.id == columnId }.width
+
+            if (width == defaultWidth) {
+                detailColumnWidths.remove(columnId)
+            } else {
+                detailColumnWidths[columnId] = width
+            }
+        }
+
+        saveDetailViewState()
+
+        return true
     }
 
     /**
@@ -3302,9 +3498,10 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
             val snapshot = detailVisibleIds.toSet()
             val scopeSnapshot = detailProcessScope
             val ignoreSnapshot = detailIgnoreUpdateSpeed
+            val widthsSnapshot = detailColumnWidths.toMap()
 
             detailViewSaveExecutor.execute {
-                DetailViewStore.save(this, snapshot, scopeSnapshot, ignoreSnapshot)
+                DetailViewStore.save(this, snapshot, scopeSnapshot, ignoreSnapshot, widthsSnapshot)
             }
         }
     }
@@ -3485,15 +3682,1483 @@ class UIService : Service(), IUIServiceApi, ISettingsChangeSink, IPageDataApi, I
         return ProcessActionResult(false, reason, packet.status)
     }
 
-    /** 把"列布局 + 范围 + 忽略开关"整份写盘（后台线程，几十字节）。 */
+    /** 把后端回的 errno 翻成一句给用户看的话（EPERM 与 EACCES 都说"权限不够"）。 */
+    private fun errnoReason(errno: Int): String = when (errno) {
+        1, 13 -> AppStrings.s(R.string.svc_access_denied)
+        2, 3 -> AppStrings.s(R.string.svc_process_exited)
+        12 -> AppStrings.s(R.string.svc_out_of_memory)
+        22 -> AppStrings.s(R.string.svc_bad_argument)
+        30 -> AppStrings.s(R.string.svc_read_only_fs)
+        else -> AppStrings.s(R.string.svc_errno_generic, errno)
+    }
+
+    /**
+     * 结束一整棵进程树。
+     *
+     * 与单杀共用同一套身份纪律：pid + startTicks 缺一不可；
+     * 后端自下而上杀，成功后同样延后 1 秒重采（立刻采会把刚死的行又读回来）。
+     */
+    override fun killDetailProcessTree(pid: Int, startTicks: Long): ProcessActionResult {
+
+        if (pid <= 0) {
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_no_process_selected), LinuxPacketStatus.BAD_ARGUMENT)
+        }
+
+        if (startTicks < 0L) {
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_no_start_time), LinuxPacketStatus.BAD_ARGUMENT)
+        }
+
+        val linux = LinuxService.instanceOrNull()
+            ?: return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_not_ready), LinuxPacketStatus.UNSUPPORTED)
+
+        val packet = linux.killProcessTree(pid, startTicks, linuxRequestTimeoutMs)
+            ?: return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_no_reply), LinuxPacketStatus.INTERNAL)
+
+        scheduleDetailRefreshAfterKill()
+
+        if (packet.isOk) {
+            return ProcessActionResult(true, "", LinuxPacketStatus.OK)
+        }
+
+        val reason = when (packet.status) {
+            LinuxPacketStatus.PROCESS_EXITED -> AppStrings.s(R.string.svc_process_exited)
+            LinuxPacketStatus.UNSUPPORTED -> AppStrings.s(R.string.svc_not_supported)
+            LinuxPacketStatus.BAD_ARGUMENT -> AppStrings.s(R.string.svc_bad_argument)
+            LinuxPacketStatus.ACCEPTED -> AppStrings.s(R.string.svc_accepted_only)
+            else -> errnoReason(packet.info["errno"]?.trim()?.toIntOrNull() ?: 1)
+        }
+
+        return ProcessActionResult(false, reason, packet.status)
+    }
+
+    /** 设置 nice：身份核对与错误翻译都在后端，这里只负责发命令 + 排一次重采。 */
+    override fun setDetailProcessPriority(pid: Int, startTicks: Long, nice: Int): ProcessActionResult {
+
+        if (pid <= 0 || startTicks < 0L) {
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_no_start_time), LinuxPacketStatus.BAD_ARGUMENT)
+        }
+
+        if (nice !in -20..19) {
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_bad_argument), LinuxPacketStatus.BAD_ARGUMENT)
+        }
+
+        val linux = LinuxService.instanceOrNull()
+            ?: return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_not_ready), LinuxPacketStatus.UNSUPPORTED)
+
+        val packet = linux.setProcessPriority(pid, startTicks, nice, linuxRequestTimeoutMs)
+            ?: return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_no_reply), LinuxPacketStatus.INTERNAL)
+
+        // 成功与否都重采一次：成功要看到新的 nice 列，失败也可能是因为进程刚退出
+        scheduleDetailRefreshAfterKill()
+
+        if (packet.isOk) {
+            return ProcessActionResult(true, "", LinuxPacketStatus.OK)
+        }
+
+        val reason = when (packet.status) {
+            LinuxPacketStatus.PROCESS_EXITED -> AppStrings.s(R.string.svc_process_exited)
+            LinuxPacketStatus.BAD_ARGUMENT -> AppStrings.s(R.string.svc_bad_argument)
+            else -> errnoReason(packet.info["errno"]?.trim()?.toIntOrNull() ?: 1)
+        }
+
+        return ProcessActionResult(false, reason, packet.status)
+    }
+
+    /** 设置 CPU 亲和性（掩码的第 n 位 = CPU n）。 */
+    override fun setDetailProcessAffinity(pid: Int, startTicks: Long, mask: Long): ProcessActionResult {
+
+        if (pid <= 0 || startTicks < 0L) {
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_no_start_time), LinuxPacketStatus.BAD_ARGUMENT)
+        }
+
+        if (mask == 0L) {
+            return ProcessActionResult(false, AppStrings.s(R.string.svc_bad_argument), LinuxPacketStatus.BAD_ARGUMENT)
+        }
+
+        val linux = LinuxService.instanceOrNull()
+            ?: return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_not_ready), LinuxPacketStatus.UNSUPPORTED)
+
+        val packet = linux.setProcessAffinity(pid, startTicks, mask, linuxRequestTimeoutMs)
+            ?: return ProcessActionResult(false, AppStrings.s(R.string.svc_linux_no_reply), LinuxPacketStatus.INTERNAL)
+
+        if (packet.isOk) {
+            return ProcessActionResult(true, "", LinuxPacketStatus.OK)
+        }
+
+        val reason = when (packet.status) {
+            LinuxPacketStatus.PROCESS_EXITED -> AppStrings.s(R.string.svc_process_exited)
+            LinuxPacketStatus.BAD_ARGUMENT -> AppStrings.s(R.string.svc_bad_argument)
+            else -> errnoReason(packet.info["errno"]?.trim()?.toIntOrNull() ?: 1)
+        }
+
+        return ProcessActionResult(false, reason, packet.status)
+    }
+
+    /** 读当前调度状态；后端没回包就返回 null（对话框会显示"读不到，仍然可以设置"）。 */
+    override fun detailProcessSchedInfo(pid: Int): ProcessSchedInfo? {
+        val packet = LinuxService.instanceOrNull()?.schedInfo(pid, linuxRequestTimeoutMs) ?: return null
+
+        if (!packet.isOk) return null
+
+        return ProcessSchedInfo(
+            nice = packet.info["nice"]?.trim()?.toIntOrNull() ?: 0,
+            policy = packet.info["policy"]?.trim()?.toIntOrNull() ?: 0,
+            affinity = packet.info["affinity"]?.trim()?.removePrefix("0x")?.toLongOrNull(16) ?: 0L,
+            threads = packet.info["threads"]?.trim()?.toIntOrNull() ?: 0,
+            cpuCount = packet.info["cpus"]?.trim()?.toIntOrNull() ?: 0
+        )
+    }
+
+    /**
+     * 单独为一行进程查一次全字段（属性页专用）。
+     *
+     * 直接复用标准快照流程：掩码传 [LinuxField.ALL]，让后端把 43 列全采一遍，
+     * 再走 [linuxSnapshotToRows] 照常合成 Android 侧字段（包名 / 目标 SDK / 分档 / 隔离），
+     * 最后只从结果里挑出目标那一行 —— 不把整表铺进 UI，页面只多一次后台查询。
+     *
+     * 代价是这一轮会把整机 /proc 扫一遍（几百行，毫秒级），换来的是：
+     * 即使用户在「选择列」里把某列关掉，属性页照样有值。
+     */
+    override fun detailProcessFullRow(pid: Int, startTicks: Long): ProcessRow? {
+
+        if (pid <= 0) return null
+
+        val packet = GetDataFromLinuxSvc(LinuxField.ALL) ?: return null
+
+        if (!packet.isOk) return null
+
+        val rows = linuxSnapshotToRows(packet)
+
+        // 身份：pid + 启动时刻；启动时刻未知（< 0）时才只比 pid
+        return rows.firstOrNull { row ->
+            row.pid == pid && (startTicks < 0L || row.startTicks == startTicks)
+        }
+    }
+
+    // ------------------------------------------------------------
+    // 用户页：按属主 uid 分组的账户视图
+    // ------------------------------------------------------------
+
+    /** 相邻两次 usersTable() 之间算速率用的基线（IO 累计字节 / TrafficStats 字节数）。 */
+    private val usersRateLock = Any()
+
+    private var usersPrevAtMs = 0L
+
+    private val usersPrevIoBytes = HashMap<Int, Long>()
+
+    private val usersPrevNetBytes = HashMap<Int, Long>()
+
+    // ---------- 应用历史记录页：自开账以来的 CPU 增量 + 网络累计 ----------
+
+    /** 应用历史记录页的累加器与基线都只在本锁内读写。 */
+    private val appHistoryLock = Any()
+
+    /** 本页轮询间隔：只在页面可见时跑，离开即停，不常驻高频采样。 */
+    private val APP_HISTORY_POLL_MS = 2_000L
+
+    /** 进程身份 `pid/startTicks` -> 上一次读到的累计 CPU 秒数（C 后端 cpu_time）。 */
+    private val appHistoryProcCpuBase = HashMap<String, Double>()
+
+    /** 包名 -> 自开账以来累计 CPU 毫秒。 */
+    private val appHistoryCpuMillis = HashMap<String, Long>()
+
+    /** 一个 uid 的收发字节（某一网络类型、某一时间窗内的合计）。 */
+    private class AppHistoryUidBytes(val rx: Long, val tx: Long)
+
+    /** 包名 -> 自开账以来的网络字节（按类型 + 方向）。 */
+    private class AppHistoryNetAccum {
+        var mobileRx = 0L
+        var mobileTx = 0L
+        var wifiRx = 0L
+        var wifiTx = 0L
+    }
+
+    private val appHistoryNetBytes = HashMap<String, AppHistoryNetAccum>()
+
+    /** 开账时刻（wall clock ms）：网络统计窗口的左边界基准。 */
+    private var appHistoryBeginMs = 0L
+
+    /**
+     * NetworkStats 历史桶的时长：本机（Android 15）为 1 小时，桶边界对齐整点。
+     *
+     * 服务端只返回"整体落在查询区间内"的桶，落在当前小时的那半个桶会被整个剔掉
+     * （实测窗口 [开账, now] 与 [整点, 下一个整点] 都是 buckets=0）。
+     */
+    private val APP_HISTORY_HOUR_MS = 60L * 60L * 1000L
+
+    /** 是否需要在本轮（后台线程）确认一次 appops GET_USAGE_STATS。 */
+    private var appHistoryUsageOpPending = false
+
+    /** 使用情况访问是否已确认 allow；false = 网络列显示「—」。 */
+    private var appHistoryUsageOpGranted = false
+
+
+    /**
+     * 组一张「用户」表：一行一个 uid，行内是它的全部进程。
+     *
+     * 每次都走一次标准快照（只要 8 个字段：名称 / 状态 / 用户 / CPU / RSS / IO 读写 / 可执行路径），
+     * 磁盘速率由两次调用之间的 IO 累计增量除以时间差得到；
+     * 网络按 uid 问 TrafficStats（进程级拿不到），不支持时字段为 null。
+     */
+    override fun usersTable(): UsersTable {
+
+        val mask = LinuxField.NAME or LinuxField.STATE or LinuxField.USER or
+            LinuxField.CPU_USAGE or LinuxField.RSS or
+            LinuxField.IO_READ_BYTES or LinuxField.IO_WRITE_BYTES or
+            LinuxField.EXE_PATH
+
+        val linux = LinuxService.instanceOrNull() ?: return UsersTable()
+
+        // 走自己的请求、不写 linuxSnapshotCache：这张表只要 7 个字段，
+        // 塞进共享缓存会把详细信息页要用的全字段包换成"缺列"的包。
+        // 但要和详细信息页共用同一把快照闸门，避免两轮 /proc 采集互相覆盖应答。
+        val packet = run {
+
+            linuxSnapshotLock.lock()
+
+            try {
+                linux.snapshot(mask, ProcessScope.ALL, linuxRequestTimeoutMs)
+            } finally {
+                linuxSnapshotLock.unlock()
+            }
+        }
+
+        val snapshot = packet?.takeIf { it.isOk } ?: return UsersTable()
+
+        val now = SystemClock.elapsedRealtime()
+
+        // 速率基线在这里读走一份快照：后面算速率时不再碰共享字段（并发调用不会互相改值）
+        var elapsedSeconds = 0.0
+
+        var previousIo: Map<Int, Long> = emptyMap()
+
+        var previousNet: Map<Int, Long> = emptyMap()
+
+        synchronized(usersRateLock) {
+
+            elapsedSeconds = if (usersPrevAtMs > 0L) {
+                (now - usersPrevAtMs) / 1000.0
+            } else {
+                0.0
+            }
+
+            previousIo = HashMap(usersPrevIoBytes)
+
+            previousNet = HashMap(usersPrevNetBytes)
+        }
+
+        val nextIo = HashMap<Int, Long>(snapshot.processes.size)
+
+        val nextNet = HashMap<Int, Long>()
+
+        val grouped = LinkedHashMap<Int, MutableList<UserProcessRow>>()
+
+        val labels = HashMap<Int, String>()
+
+        val suspendedOnly = HashMap<Int, Boolean>()
+
+        // 同一 uid 在循环里会出现很多次：TrafficStats 只问一遍（值可能为 null，用 containsKey 区分）
+        val netTotals = HashMap<Int, Long?>()
+
+        // 用户页只算"应用进程"：uid 0（root）和 1000..9999（system / shell / 系统服务）
+        // 是 Linux 内核内置账户，不属于任何 Android 用户，不能塞进「机主」。
+        // 10000 起才是 Android 应用 uid（user 0 的 appId 10000..99999）。
+        val androidService = AndroidService.instanceOrNull()
+
+        val androidPids = androidService?.prepareRound(
+            snapshot.processes.map { processKeyOf(it) }
+        ) ?: emptySet()
+
+        snapshot.processes.forEach { record ->
+
+            val uid = record.uid ?: -1
+
+            if (uid < 10000) return@forEach
+
+            val processKey = processKeyOf(record)
+
+            val name = record.displayOf(DetailColumnId.NAME)
+
+            val rawState = record.fieldOf(DetailColumnId.STATE).orEmpty()
+
+            val cpu = record.fieldOf(DetailColumnId.CPU_USAGE)?.toDoubleOrNull() ?: 0.0
+
+            val rss = record.fieldOf(DetailColumnId.RSS)?.toLongOrNull() ?: 0L
+
+            // 磁盘：IO 累计字节（读 + 写）；第一次没有基线，速率按 0 处理
+            val ioTotal = (record.fieldOf(DetailColumnId.IO_READ_BYTES)?.toLongOrNull() ?: 0L) +
+                (record.fieldOf(DetailColumnId.IO_WRITE_BYTES)?.toLongOrNull() ?: 0L)
+
+            nextIo[record.pid] = ioTotal
+
+            val previous = previousIo[record.pid]
+
+            val diskRate = if (elapsedSeconds > 0.0 && previous != null && ioTotal >= previous) {
+                ((ioTotal - previous) / elapsedSeconds).toLong()
+            } else {
+                0L
+            }
+
+            // 网络按 uid：进程级没有可靠来源，只有用户行能显示
+            val uidNet = if (netTotals.containsKey(uid)) {
+                netTotals[uid]
+            } else {
+                readUidNetworkBytes(uid).also { netTotals[uid] = it }
+            }
+
+            if (uidNet != null) nextNet[uid] = uidNet
+
+            if (!labels.containsKey(uid)) {
+                labels[uid] = record.fieldOf(DetailColumnId.USER)?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: if (uid >= 0) "uid $uid" else AppStrings.s(R.string.users_unknown_user)
+            }
+
+            val isSuspended = rawState == "T" || rawState == "t"
+
+            suspendedOnly[uid] = (suspendedOnly[uid] ?: true) && isSuspended
+
+            grouped.getOrPut(uid) { ArrayList() }.add(
+                UserProcessRow(
+                    pid = record.pid,
+                    name = name,
+                    state = if (isSuspended) AppStrings.s(R.string.users_process_suspended) else "",
+                    cpuPercent = cpu,
+                    memoryBytes = rss,
+                    diskBytesPerSecond = diskRate,
+                    networkBytesPerSecond = null,
+                    startTicks = record.startTicks ?: -1L,
+                    exePath = record.fieldOf(DetailColumnId.EXE_PATH)?.trim()?.takeIf { it.isNotEmpty() },
+                    packageName = if (record.pid in androidPids) {
+                        androidService?.queryProcess(processKey)?.packageName
+                    } else {
+                        null
+                    },
+                    packageDisplayName = record.fieldOf(DetailColumnId.PACKAGE_NAME)
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                )
+            )
+        }
+
+        // 每个 uid 的网络速率：累计字节的增量 / 两次采样的时间差（首次没有基线 → 0）
+        val uidNetRates = HashMap<Int, Long>()
+
+        nextNet.forEach { (uid, total) ->
+
+            val previous = previousNet[uid]
+
+            uidNetRates[uid] = if (elapsedSeconds > 0.0 && previous != null && total >= previous) {
+                ((total - previous) / elapsedSeconds).toLong()
+            } else {
+                0L
+            }
+        }
+
+        val groups = grouped.map { (uid, processes) ->
+
+            val cpu = processes.sumOf { it.cpuPercent }
+
+            val memory = processes.sumOf { it.memoryBytes }
+
+            val disk = processes.sumOf { it.diskBytesPerSecond }
+
+            val net = uidNetRates[uid]
+
+            UserGroupRow(
+                uid = uid,
+                userLabel = labels[uid]
+                    ?: if (uid >= 0) "uid $uid" else AppStrings.s(R.string.users_unknown_user),
+                // 只有整组进程都挂起时才写「已挂起」，否则留空（不冒充"运行中"）
+                status = if (suspendedOnly[uid] == true) {
+                    AppStrings.s(R.string.users_group_suspended)
+                } else {
+                    ""
+                },
+                cpuPercent = cpu,
+                memoryBytes = memory,
+                diskBytesPerSecond = disk,
+                networkBytesPerSecond = if (net != null) net else null,
+                processes = processes.sortedWith(
+                    compareByDescending<UserProcessRow> { it.cpuPercent }
+                        .thenBy { it.name }
+                )
+            )
+        }
+
+        synchronized(usersRateLock) {
+
+            usersPrevAtMs = now
+
+            usersPrevIoBytes.clear()
+
+            usersPrevIoBytes.putAll(nextIo)
+
+            usersPrevNetBytes.clear()
+
+            usersPrevNetBytes.putAll(nextNet)
+        }
+
+        return UsersTable(
+            groups = groups.sortedWith(
+                compareByDescending<UserGroupRow> { it.cpuPercent }
+                    .thenBy { it.userLabel }
+            ),
+            totalCpuPercent = groups.sumOf { it.cpuPercent },
+            totalMemoryBytes = groups.sumOf { it.memoryBytes },
+            totalDiskBytesPerSecond = groups.sumOf { it.diskBytesPerSecond },
+            totalNetworkBytesPerSecond = groups
+                .mapNotNull { it.networkBytesPerSecond }
+                .takeIf { it.isNotEmpty() }
+                ?.sum(),
+            refreshIntervalMs = pollIntervalMs(settingsSnapshot.updateSpeed)
+        )
+    }
+
+    /**
+     * 用户页头像原始字节：交给界面解码。
+     *
+     * 头像文件在 `/data/system/users/<id>/photo.*`，只有 root 通道读得到；
+     * 读不到返回 null，界面用通用账户图标兜底。
+     */
+    fun androidUserAvatar(userId: Int): ByteArray? {
+        return AndroidService.instanceOrNull()?.userAvatarPng(userId)
+    }
+
+    /**
+     * 「用户」页的 Android 视图：只贴 Android 的用户机制，不再提供 Linux 账户视图。
+     *
+     * Android 已经完全改写了账户模型，内核里只剩系统内置 uid；真正的"用户"是
+     * UserManager 里的 userId。进程归属直接用 uid 反推：
+     * `userId = uid / 100000`，`appId = uid % 100000`（系统 uid / 隔离进程归 user 0）。
+     *
+     * 页面只列"正在运行"的用户：当前用户一定在；其它用户要么有进程在跑，要么
+     * `UserManager.isUserRunning` 明确为 true，停用的用户不显示——这里是任务管理器，
+     * 不是用户管理器。
+     *
+     * 用户名 / 状态来自 UserManager（隐藏接口，失败就退回"用户 N"，不猜机主 / 工作资料）。
+     */
+    override fun androidUsersTable(): AndroidUsersTable {
+
+        val linux = usersTable()
+
+        val currentUserId = android.os.Process.myUid() / 100000
+
+        val grouped = LinkedHashMap<Int, MutableList<UserGroupRow>>()
+
+        linux.groups.forEach { group ->
+
+            val userId = androidUserIdOf(group.uid)
+
+            grouped.getOrPut(userId) { ArrayList() }.add(group)
+        }
+
+        val metas = androidUserMetas()
+
+        // 只收"当前用户 + 明确在运行的用户 + 确实有进程在跑的用户"
+        val userIds = LinkedHashSet<Int>()
+
+        userIds += currentUserId
+
+        metas.filter { it.running }.forEach { userIds += it.id }
+
+        grouped.keys.filter { it >= 0 }.forEach { userIds += it }
+
+        // uid -1 只在一行都读不到属主时出现：保留为「未知用户」，不混进别的账户
+        if (grouped.containsKey(-1)) userIds += -1
+
+        val users = userIds.map { userId ->
+
+            val groups = grouped[userId].orEmpty().sortedWith(
+                compareByDescending<UserGroupRow> { it.cpuPercent }
+                    .thenBy { it.userLabel }
+            )
+
+            val cpu = groups.sumOf { it.cpuPercent }
+
+            val memory = groups.sumOf { it.memoryBytes }
+
+            val disk = groups.sumOf { it.diskBytesPerSecond }
+
+            val net = groups.mapNotNull { it.networkBytesPerSecond }
+                .takeIf { it.isNotEmpty() }
+                ?.sum()
+
+            val meta = metas.firstOrNull { it.id == userId }
+
+            val fallbackLabel = if (userId < 0) {
+                AppStrings.s(R.string.users_unknown_user)
+            } else {
+                AppStrings.s(R.string.users_android_title, userId)
+            }
+
+            val label = meta?.name
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: fallbackLabel
+
+            val status = when {
+                userId < 0 -> ""
+                userId == currentUserId -> AppStrings.s(R.string.users_status_connected)
+                else -> AppStrings.s(R.string.users_status_running)
+            }
+
+            AndroidUserSummary(
+                userId = userId,
+                label = label,
+                isCurrent = userId == currentUserId,
+                processCount = groups.sumOf { it.processes.size },
+                appUidCount = groups.size,
+                cpuPercent = cpu,
+                memoryBytes = memory,
+                diskBytesPerSecond = disk,
+                networkBytesPerSecond = net,
+                groups = groups,
+                status = status,
+                running = true
+            )
+        }
+
+        return AndroidUsersTable(
+            users = users.sortedWith(
+                compareByDescending<AndroidUserSummary> { it.isCurrent }
+                    .thenByDescending { it.cpuPercent }
+                    .thenBy { it.userId }
+            ),
+            totalUsers = users.size,
+            totalProcessCount = users.sumOf { it.processCount },
+            totalCpuPercent = users.sumOf { it.cpuPercent },
+            totalMemoryBytes = users.sumOf { it.memoryBytes },
+            totalDiskBytesPerSecond = users.sumOf { it.diskBytesPerSecond },
+            totalNetworkBytesPerSecond = users
+                .mapNotNull { it.networkBytesPerSecond }
+                .takeIf { it.isNotEmpty() }
+                ?.sum(),
+            refreshIntervalMs = linux.refreshIntervalMs
+        )
+    }
+
+    // ---------- 应用历史记录页：CPU 增量 + 网络累计（自 appHistoryBegin 开账） ----------
+
+    override fun appHistoryBegin() {
+
+        synchronized(appHistoryLock) {
+
+            appHistoryProcCpuBase.clear()
+            appHistoryCpuMillis.clear()
+            appHistoryNetBytes.clear()
+
+            appHistoryBeginMs = System.currentTimeMillis()
+
+            // 开账时只做"待确认"标记：真正去 shell 里 appops 授予放到后台采样里做
+            appHistoryUsageOpPending = true
+            appHistoryUsageOpGranted = false
+        }
+    }
+
+    override fun appHistoryTable(): AppHistoryTable {
+
+        val androidService = AndroidService.instanceOrNull()
+
+        // ---- CPU：C 后端快照，按 pid/startTicks 记基线、采增量，包名归属走 AndroidService ----
+        val mask = LinuxField.NAME or LinuxField.CPU_TIME
+
+        val linux = LinuxService.instanceOrNull()
+
+        val packet = linux?.let {
+
+            linuxSnapshotLock.lock()
+
+            try {
+                it.snapshot(mask, ProcessScope.ALL, linuxRequestTimeoutMs)
+            } finally {
+                linuxSnapshotLock.unlock()
+            }
+        }
+
+        val snapshot = packet?.takeIf { it.isOk }
+
+        val cpuAvailable = snapshot != null
+
+        val runningPackages = HashSet<String>()
+
+        if (snapshot != null && androidService != null) {
+
+            val androidPids = androidService.prepareRound(
+                snapshot.processes.map { processKeyOf(it) }
+            )
+
+            snapshot.processes.forEach { record ->
+
+                val cpuSec = record.fieldOf(DetailColumnId.CPU_TIME)?.toDoubleOrNull()
+                    ?: return@forEach
+
+                val procKey = "${record.pid}/${record.startTicks ?: -1L}"
+
+                val pkg = if (record.pid in androidPids) {
+                    androidService.queryProcess(processKeyOf(record))?.packageName
+                } else {
+                    null
+                }
+
+                if (pkg != null) runningPackages += pkg
+
+                synchronized(appHistoryLock) {
+
+                    val prev = appHistoryProcCpuBase[procKey]
+
+                    if (prev == null) {
+
+                        // 第一次见到这个进程：只记基线，不把"进程历史 CPU"算进本页
+                        appHistoryProcCpuBase[procKey] = cpuSec
+
+                    } else {
+
+                        val deltaMs = ((cpuSec - prev) * 1000.0)
+                            .coerceAtLeast(0.0)
+                            .toLong()
+
+                        appHistoryProcCpuBase[procKey] = cpuSec
+
+                        if (pkg != null && deltaMs > 0L) {
+
+                            appHistoryCpuMillis.merge(pkg, deltaMs, Long::plus)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 网络：NetworkStatsManager 历史统计，按 uid 累加 RX+TX ----
+        // 桶按整点对齐、且只返回"已经结算完"的桶：区间没覆盖整个桶时该桶会被剔掉
+        // （实测 [开账, now]、[整点, 下一个整点] 都是 buckets=0）。
+        // 于是窗口取"开账所在整点 → 最近一个已结算整点"；开账后还没走完一个整点时，
+        // 回退成"最近一个已结算的整小时"，保证页面上立刻有真实数字而不是 0 B。
+        val networkUsageGranted = ensureAppHistoryUsageAccess(androidService)
+
+        val beginMs = synchronized(appHistoryLock) { appHistoryBeginMs }
+
+        val nowMs = System.currentTimeMillis()
+
+        /** 最近一个已结算的整点边界（当前小时开始时刻）。 */
+        val settledMs = nowMs - (nowMs % APP_HISTORY_HOUR_MS)
+
+        /** 开账时刻所在整点。 */
+        val openHourMs = beginMs - (beginMs % APP_HISTORY_HOUR_MS)
+
+        val queryStartMs = if (openHourMs < settledMs) openHourMs else settledMs - 3L * APP_HISTORY_HOUR_MS
+
+        val queryEndMs = settledMs
+
+        val queryable = networkUsageGranted && beginMs > 0L
+
+        val mobileRaw: Map<Int, AppHistoryUidBytes>? =
+            if (queryable) queryMobileUidBytes(queryStartMs, queryEndMs) else null
+
+        val wifiRaw: Map<Int, AppHistoryUidBytes>? =
+            if (queryable) queryUidBytes(ConnectivityManager.TYPE_WIFI, null, queryStartMs, queryEndMs) else null
+
+        // 两种网络各自独立判定：哪一种查不到，该列整列「—」
+        val mobileAvailable = mobileRaw != null
+
+        val wifiAvailable = wifiRaw != null
+
+        val networkAvailable = mobileAvailable || wifiAvailable
+
+        if (androidService != null && (mobileRaw != null || wifiRaw != null)) {
+
+            val byPackage = HashMap<String, AppHistoryNetAccum>()
+
+            // 共享 uid 多包时只归第一个候选包，不重复计给全部包
+            fun accumulateTotals(source: Map<Int, AppHistoryUidBytes>, mobile: Boolean) {
+
+                source.forEach { (uid, bytes) ->
+
+                    val pkg = androidService.packagesForUid(uid)?.firstOrNull() ?: return@forEach
+
+                    val accum = byPackage.getOrPut(pkg) { AppHistoryNetAccum() }
+
+                    if (mobile) {
+                        accum.mobileRx += bytes.rx
+                        accum.mobileTx += bytes.tx
+                    } else {
+                        accum.wifiRx += bytes.rx
+                        accum.wifiTx += bytes.tx
+                    }
+                }
+            }
+
+            mobileRaw?.let { accumulateTotals(it, mobile = true) }
+
+            wifiRaw?.let { accumulateTotals(it, mobile = false) }
+
+            synchronized(appHistoryLock) {
+                appHistoryNetBytes.clear()
+                appHistoryNetBytes.putAll(byPackage)
+            }
+        } else {
+
+            synchronized(appHistoryLock) { appHistoryNetBytes.clear() }
+        }
+
+        // ---- 应用清单：getInstalledApplications（QUERY_ALL_PACKAGES 下含系统应用） ----
+        val pm = applicationContext.packageManager
+
+        val entries = try {
+            pm.getInstalledApplications(0)
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        val rows = entries.map { info ->
+
+            val pkg = info.packageName
+
+            val label = runCatching { info.loadLabel(pm)?.toString() }
+                .getOrNull()
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() && it != pkg } ?: pkg
+
+            val net = synchronized(appHistoryLock) { appHistoryNetBytes[pkg] }
+
+            AppHistoryRow(
+                packageName = pkg,
+                label = label,
+                cpuTimeMillis = synchronized(appHistoryLock) { appHistoryCpuMillis[pkg] ?: 0L },
+                mobileRxBytes = if (mobileAvailable) net?.mobileRx ?: 0L else null,
+                mobileTxBytes = if (mobileAvailable) net?.mobileTx ?: 0L else null,
+                wifiRxBytes = if (wifiAvailable) net?.wifiRx ?: 0L else null,
+                wifiTxBytes = if (wifiAvailable) net?.wifiTx ?: 0L else null,
+                // Android 无系统级历史通知计数器：恒为 null，界面显示「—」，不伪造 0
+                notificationCount = null,
+                systemApp = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
+                running = pkg in runningPackages
+            )
+        }.sortedWith(
+            compareByDescending<AppHistoryRow> { it.cpuTimeMillis }
+                .thenByDescending { it.running }
+                .thenBy { it.label.lowercase() }
+        )
+
+        return AppHistoryTable(
+            rows = rows,
+            cpuAvailable = cpuAvailable,
+            networkAvailable = networkAvailable,
+            networkSource = if (networkAvailable) "network_stats" else "",
+            refreshIntervalMs = APP_HISTORY_POLL_MS,
+            beginMs = beginMs
+        )
+    }
+
+    /**
+     * 确认本应用是否持有 appop GET_USAGE_STATS（按 uid 读网络统计的前提）。
+     *
+     * 只在 [appHistoryBegin] 之后的第一轮采样里真正去 shell 里授予并回读，
+     * 之后直接复用结果；[appHistoryBegin] 每次进入页面会重新标记一次，
+     * 所以身份切换 / 页面重进都会重新确认。
+     */
+    private fun ensureAppHistoryUsageAccess(androidService: AndroidService?): Boolean {
+
+        val pending = synchronized(appHistoryLock) { appHistoryUsageOpPending }
+
+        if (!pending) return synchronized(appHistoryLock) { appHistoryUsageOpGranted }
+
+        val granted = androidService?.ensureUsageStatsAppOp() == true
+
+        synchronized(appHistoryLock) {
+            appHistoryUsageOpGranted = granted
+            appHistoryUsageOpPending = false
+        }
+
+        return granted
+    }
+
+    /**
+     * 移动网络：先按 `subscriberId = null` 查（持有 PACKAGE_USAGE_STATS 时多数 ROM 接受），
+     * 抛异常再退到当前 SIM 的 subscriberId 重试一次；都失败返回 null（该列显示「—」）。
+     *
+     * 不退回 xt_qtaguid：Android 15 / 该 ROM 上这个 proc 节点已经不存在。
+     */
+    private fun queryMobileUidBytes(startMs: Long, endMs: Long): Map<Int, AppHistoryUidBytes>? {
+
+        queryUidBytes(ConnectivityManager.TYPE_MOBILE, null, startMs, endMs)?.let { return it }
+
+        val subscriberId = runCatching {
+            (applicationContext.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager)
+                ?.subscriberId
+        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+
+        return queryUidBytes(ConnectivityManager.TYPE_MOBILE, subscriberId, startMs, endMs)
+    }
+
+    /**
+     * 一次 NetworkStatsManager 查询（等价于"查所有 uid"的公开入口）：uid -> 收发字节。
+     *
+     * 用 `queryDetails`（API 29+，语义就是"所有 UID 的明细"）；`queryDetailsForAll`
+     * 不在公开 SDK 里（[android-37 android.jar] 上根本没有这个方法），所以不照抄那个名字。
+     * 低版本设备没有 queryDetails → 抛错被吞掉，返回 null（该列显示「—」）。
+     *
+     * 桶的处理：公开的 Bucket 只暴露 state，不暴露 set。
+     * 优先用 `STATE_ALL`（聚合口径）；某些 ROM 只给 default / foreground 分桶，
+     * 这时才把其它 state 的桶相加，避免同一段流量被算两遍。
+     * uid < 0 的行（UID_ALL 汇总行、已卸载 uid、tethering）不归属到任何包。
+     *
+     * @return null = 查询本身失败（未授权 / 参数不被接受 / 该 API 版本不支持），
+     *         调用方按「这一列不可用」处理；空 Map = 查询成功但该窗口没有流量
+     */
+    private fun queryUidBytes(
+        networkType: Int,
+        subscriberId: String?,
+        startMs: Long,
+        endMs: Long
+    ): Map<Int, AppHistoryUidBytes>? {
+
+        val nsm = applicationContext.getSystemService(Context.NETWORK_STATS_SERVICE)
+            as? NetworkStatsManager ?: return null
+
+        val stats = try {
+            nsm.queryDetails(networkType, subscriberId, startMs, endMs)
+        } catch (e: Throwable) {
+            return null
+        }
+
+        val aggregated = HashMap<Int, LongArray>()   // uid -> [rx, tx]，只收 STATE_ALL
+        val split = HashMap<Int, LongArray>()        // uid -> [rx, tx]，default / foreground 分桶
+
+        try {
+
+            val bucket = NetworkStats.Bucket()
+
+            while (stats.hasNextBucket()) {
+
+                stats.getNextBucket(bucket)
+
+                val uid = bucket.uid
+
+                if (uid < 0) continue
+
+                val target =
+                    if (bucket.state == NetworkStats.Bucket.STATE_ALL) aggregated else split
+
+                val slot = target.getOrPut(uid) { LongArray(2) }
+
+                slot[0] += bucket.rxBytes
+                slot[1] += bucket.txBytes
+            }
+
+        } catch (e: Throwable) {
+            // 读到一半出错：已经读到的桶仍然有用，不整体作废
+        } finally {
+            runCatching { stats.close() }
+        }
+
+        val result = HashMap<Int, AppHistoryUidBytes>(split.size + aggregated.size)
+
+        split.forEach { (uid, v) -> result[uid] = AppHistoryUidBytes(v[0], v[1]) }
+
+        // STATE_ALL 覆盖同名 uid 的分桶合计
+        aggregated.forEach { (uid, v) -> result[uid] = AppHistoryUidBytes(v[0], v[1]) }
+
+        return result
+    }
+
+    /**
+     * 对一个 Android 用户做连接 / 注销 / 切换。
+     *
+     * 全部委托给子进程执行 `/system/bin/am`：Shizuku 提供 shell 身份，root 提供 uid 0。
+     * 不在本进程里反射 ActivityManager —— 那只是把 Binder 调用身份继续留在普通应用 uid，
+     * 必然被 INTERACT_ACROSS_USERS_FULL 拒绝。
+     */
+    override fun androidUserAction(action: AndroidUserAction, userId: Int): ProcessActionResult {
+
+        if (userId < 0) {
+
+            return ProcessActionResult(
+                ok = false,
+                reason = AppStrings.s(R.string.users_action_invalid_user)
+            )
+        }
+
+        // 这里**不再**反射 ActivityManager.switchUser / stopUser / startUserInBackground。
+        // UIService 无论用户选了什么身份，进程本身仍是普通应用 uid（本机 10423）；
+        // Binder.getCallingUid() 看到的也是它，所以直调隐藏 API 只会拿到 SecurityException。
+        // 用户操作统一交给子进程里的 `am` / `cmd activity`：
+        // Shizuku 给 shell 身份，root 给 uid 0。
+        val privileged = runAndroidUserActionPrivileged(action, userId)
+
+        if (privileged == null) {
+
+            return ProcessActionResult(
+                ok = false,
+                reason = AppStrings.s(R.string.users_action_no_privileged)
+            )
+        }
+
+        if (privileged.ok) return privileged
+
+        return ProcessActionResult(
+            ok = false,
+            reason = if (privileged.reason.isNotBlank()) {
+                AppStrings.s(R.string.users_action_shell_failed, privileged.reason)
+            } else {
+                AppStrings.s(R.string.users_action_no_privileged)
+            }
+        )
+    }
+
+    /**
+     * 用 Shell(adb) / root 身份执行用户切换。
+     *
+     * 为什么必须走 `am` / `cmd activity` 而不是再反射：`switchUser` / `stopUser` /
+     * `startUserInBackground` 在 ActivityManagerService 里统一检查
+     * `INTERACT_ACROSS_USERS_FULL`，普通应用拿不到；而 `com.android.shell` 在本机已被授予
+     * `INTERACT_ACROSS_USERS_FULL` 和 `CREATE_USERS`，所以由 shell 身份启动的命令才能过权限检查。
+     *
+     * @return null = 两条提权通道都不可用；非 null = 命令已执行（可能成功或失败）
+     */
+    private fun runAndroidUserActionPrivileged(
+        action: AndroidUserAction,
+        userId: Int
+    ): ProcessActionResult? {
+
+        val prefixes = androidUserCommandPrefixes()
+
+        var anyPrefixStarted = false
+        var firstFailure: ProcessActionResult? = null
+
+        for (prefix in prefixes) {
+
+            val result = runAndroidUserActionWithPrefix(action, userId, prefix)
+
+            if (result == null) continue
+
+            anyPrefixStarted = true
+
+            if (result.ok) return result
+
+            if (firstFailure == null) firstFailure = result
+        }
+
+        return if (anyPrefixStarted) firstFailure else null
+    }
+
+    /**
+     * 命令入口的两个方案：
+     * 1. `/system/bin/am` —— 标准 AOSP 入口；
+     * 2. `/system/bin/cmd activity` —— `am` 被 OEM 删掉 / 被 OEM 额外限制时的备用入口。
+     *    它直接调用 activity 系统服务的 shell command，能力与 `am` 对齐。
+     */
+    private fun androidUserCommandPrefixes(): List<List<String>> {
+
+        val prefixes = ArrayList<List<String>>()
+
+        if (File("/system/bin/am").exists()) {
+            prefixes.add(listOf("/system/bin/am"))
+        }
+
+        if (File("/system/bin/cmd").exists()) {
+            prefixes.add(listOf("/system/bin/cmd", "activity"))
+        }
+
+        // 两个都探测不到也保留标准入口，让下面返回真实的执行错误，而不是静默无操作
+        if (prefixes.isEmpty()) {
+            prefixes.add(listOf("/system/bin/am"))
+        }
+
+        return prefixes
+    }
+
+    private fun runAndroidUserActionWithPrefix(
+        action: AndroidUserAction,
+        userId: Int,
+        prefix: List<String>
+    ): ProcessActionResult? {
+
+        Log.i(
+            USER_ACTION_TAG,
+            "尝试入口 ${prefix.joinToString(" ")}，action=$action user=$userId"
+        )
+
+        when (action) {
+
+            AndroidUserAction.CONNECT -> {
+
+                // 先把目标用户拉起来；已经在运行的用户这条命令会报错，但不影响后面的切换
+                val start = runPrivilegedCommand(
+                    prefix + listOf("start-user", userId.toString()),
+                    timeoutSeconds = 8
+                ) ?: return null
+
+                val switch = runPrivilegedCommand(
+                    prefix + listOf("switch-user", userId.toString()),
+                    timeoutSeconds = 8
+                ) ?: return null
+
+                return if (switch.ok) {
+                    ProcessActionResult(ok = true)
+                } else {
+                    ProcessActionResult(
+                        ok = false,
+                        reason = switch.reason.ifBlank { start.reason }
+                    )
+                }
+            }
+
+            AndroidUserAction.STOP -> {
+
+                val stop = runPrivilegedCommand(
+                    prefix + listOf("stop-user", userId.toString()),
+                    timeoutSeconds = 10
+                ) ?: return null
+
+                return if (stop.ok) {
+                    ProcessActionResult(ok = true)
+                } else {
+                    ProcessActionResult(ok = false, reason = stop.reason)
+                }
+            }
+
+            AndroidUserAction.SWITCH -> {
+
+                val switch = runPrivilegedCommand(
+                    prefix + listOf("switch-user", userId.toString()),
+                    timeoutSeconds = 8
+                ) ?: return null
+
+                return if (switch.ok) {
+                    ProcessActionResult(ok = true)
+                } else {
+                    ProcessActionResult(ok = false, reason = switch.reason)
+                }
+            }
+        }
+    }
+
+    private data class PrivilegedCommandResult(
+        val ok: Boolean,
+        val reason: String = ""
+    )
+
+    /**
+     * 跑一条提权命令：按用户当前身份决定先试 root 还是 Shizuku(shell)，一条失败再换另一条。
+     *
+     * root 不再用 `new ProcessBuilder("su","-c",...)` 起一次性进程：那会让 Magisk 每条命令
+     * 都当成新进程再弹一次授权框。这里改成复用 RootManager 的长驻 root shell。
+     */
+    private fun runPrivilegedCommand(
+        command: List<String>,
+        timeoutSeconds: Long
+    ): PrivilegedCommandResult? {
+
+        val preferRoot = credentialIdentity == SettingsCatalog.CREDENTIAL_ROOT
+
+        val channels = if (preferRoot) {
+            listOf("root", "shizuku")
+        } else {
+            listOf("shizuku", "root")
+        }
+
+        var anyChannelStarted = false
+        var firstFailure: PrivilegedCommandResult? = null
+
+        for (channel in channels) {
+
+            val result = if (channel == "root") {
+                runRootPrivilegedCommand(command, timeoutSeconds)
+            } else {
+                runShizukuPrivilegedCommand(command, timeoutSeconds)
+            }
+
+            if (result == null) {
+                Log.i(
+                    USER_ACTION_TAG,
+                    "通道 $channel 不可用，跳过：${command.joinToString(" ")}"
+                )
+                continue
+            }
+
+            anyChannelStarted = true
+
+            Log.i(
+                USER_ACTION_TAG,
+                "通道 $channel 执行 ${command.joinToString(" ")} -> ok=${result.ok} " +
+                    "reason=${result.reason}"
+            )
+
+            if (result.ok) return result
+
+            if (firstFailure == null) firstFailure = result
+        }
+
+        return if (anyChannelStarted) firstFailure else null
+    }
+
+    private fun runShizukuPrivilegedCommand(
+        command: List<String>,
+        timeoutSeconds: Long
+    ): PrivilegedCommandResult? {
+
+        val process = try {
+
+            ShizukuManager.newShellProcess(command)
+
+        } catch (error: Throwable) {
+
+            Log.i(
+                USER_ACTION_TAG,
+                "Shizuku 起进程异常：${error.javaClass.simpleName} ${error.message ?: ""}"
+            )
+
+            null
+        } ?: return null
+
+        return awaitPrivilegedCommand(process, timeoutSeconds)
+    }
+
+    private fun runRootPrivilegedCommand(
+        command: List<String>,
+        timeoutSeconds: Long
+    ): PrivilegedCommandResult? {
+
+        val result = try {
+
+            RootManager.execCommandForced(command, timeoutSeconds * 1000L)
+
+        } catch (error: Throwable) {
+
+            Log.i(
+                USER_ACTION_TAG,
+                "root 长驻 shell 执行异常：${error.javaClass.simpleName} ${error.message ?: ""}"
+            )
+
+            null
+        } ?: return null
+
+        val output = result.output
+
+        if (result.exitCode != 0) {
+            return PrivilegedCommandResult(
+                ok = false,
+                reason = output.ifBlank { "exit ${result.exitCode}" }
+            )
+        }
+
+        // `am` / `cmd` 有时即使失败也返回 0，错误只写在输出里
+        val looksLikeError = output.contains("Error", ignoreCase = true) ||
+            output.contains("Exception", ignoreCase = true) ||
+            output.contains("Permission Denial", ignoreCase = true)
+
+        return if (looksLikeError) {
+            PrivilegedCommandResult(ok = false, reason = output)
+        } else {
+            PrivilegedCommandResult(ok = true)
+        }
+    }
+
+    private fun awaitPrivilegedCommand(
+        process: Process,
+        timeoutSeconds: Long
+    ): PrivilegedCommandResult {
+
+        val finished = try {
+
+            process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+
+        } catch (_: Throwable) {
+            process.destroy()
+            return PrivilegedCommandResult(
+                ok = false,
+                reason = AppStrings.s(R.string.users_action_shell_timeout)
+            )
+        }
+
+        if (!finished) {
+
+            process.destroy()
+
+            return PrivilegedCommandResult(
+                ok = false,
+                reason = AppStrings.s(R.string.users_action_shell_timeout)
+            )
+        }
+
+        val output = try {
+
+            val out = process.inputStream.bufferedReader().use { it.readText() }
+            val err = process.errorStream.bufferedReader().use { it.readText() }
+
+            (out + "\n" + err).trim()
+
+        } catch (_: Throwable) {
+            ""
+        }
+
+        val exit = try {
+            process.exitValue()
+        } catch (_: Throwable) {
+            -1
+        }
+
+        if (exit != 0) {
+            return PrivilegedCommandResult(
+                ok = false,
+                reason = output.ifBlank { "exit $exit" }
+            )
+        }
+
+        // `am` 有时即使失败也返回 0，错误只写在输出里
+        val looksLikeError = output.contains("Error", ignoreCase = true) ||
+            output.contains("Exception", ignoreCase = true) ||
+            output.contains("Permission Denial", ignoreCase = true)
+
+        return if (looksLikeError) {
+            PrivilegedCommandResult(ok = false, reason = output)
+        } else {
+            PrivilegedCommandResult(ok = true)
+        }
+    }
+
+    /** UserManager 里的一个用户：id + 名字 + 是否运行。 */
+    private data class AndroidUserMeta(
+        val id: Int,
+        val name: String?,
+        val running: Boolean
+    )
+
+    /**
+     * 读 UserManager 的用户列表。`getUsers()` / `getUserInfo()` 都是隐藏 / SystemApi，
+     * 反射拿不到就返回空列表——页面退回"只按进程 uid 列用户"，不编造账户。
+     */
+    private fun androidUserMetas(): List<AndroidUserMeta> {
+
+        val manager = getSystemService(Context.USER_SERVICE) as? UserManager
+            ?: return emptyList()
+
+        val raw = try {
+
+            val method = UserManager::class.java.getDeclaredMethod("getUsers")
+
+            method.isAccessible = true
+
+            method.invoke(manager) as? List<*>
+
+        } catch (_: Throwable) {
+            null
+        } ?: return emptyList()
+
+        return raw.mapNotNull { info ->
+
+            if (info == null) return@mapNotNull null
+
+            val id = userInfoField(info, "id") as? Int ?: return@mapNotNull null
+
+            val name = userInfoField(info, "name") as? String
+
+            AndroidUserMeta(
+                id = id,
+                name = name,
+                running = isAndroidUserRunning(manager, id)
+            )
+        }
+    }
+
+    /** 读 UserInfo 的字段：先走 public field，再走 declared field（不同版本字段可见性不一样）。 */
+    private fun userInfoField(info: Any, name: String): Any? {
+
+        val type = info.javaClass
+
+        return try {
+
+            type.getField(name).get(info)
+
+        } catch (_: Throwable) {
+
+            try {
+
+                type.getDeclaredField(name).apply { isAccessible = true }.get(info)
+
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    /** `UserManager.isUserRunning(int)` 优先，再试 `isUserRunning(UserHandle)`。 */
+    private fun isAndroidUserRunning(manager: UserManager, userId: Int): Boolean {
+
+        try {
+
+            val method = UserManager::class.java
+                .getDeclaredMethod("isUserRunning", Int::class.javaPrimitiveType!!)
+
+            method.isAccessible = true
+
+            (method.invoke(manager, userId) as? Boolean)?.let { return it }
+
+        } catch (_: Throwable) {
+            // 换 UserHandle 版本再试
+        }
+
+        return try {
+
+            val handle = UserHandle.getUserHandleForUid(userId * 100000)
+
+            val method = UserManager::class.java
+                .getDeclaredMethod("isUserRunning", UserHandle::class.java)
+
+            method.isAccessible = true
+
+            (method.invoke(manager, handle) as? Boolean) ?: false
+
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** 属主 uid -> Android 用户 id；未知属主（-1）保持 -1，界面单独显示"未知用户"。 */
+    private fun androidUserIdOf(uid: Int): Int = when {
+
+        uid < 0 -> -1
+
+        // 系统 uid / 隔离进程（90000-99999）都属于 user 0
+        uid < 100000 -> 0
+
+        else -> uid / 100000
+    }
+
+    /** 按 uid 读累计网络字节（收发之和）；取不到返回 null（不拿 0 冒充）。 */
+    private fun readUidNetworkBytes(uid: Int): Long? {
+
+        // 未知属主（uid 没带上）不参与网络统计
+        if (uid < 0) return null
+
+        return try {
+
+            val rx = TrafficStats.getUidRxBytes(uid)
+
+            val tx = TrafficStats.getUidTxBytes(uid)
+
+            // -1 = 该 uid 不支持统计（个别 uid / ROM）；返回 null，由界面显示「—」
+            if (rx < 0L || tx < 0L) null else rx + tx
+
+        } catch (_: Exception) {
+
+            null
+        }
+    }
+
+    /** 读等待链：t0..tN 依次取，缺一个就停（服务端按顺序输出）。 */
+    override fun detailProcessWaitChain(pid: Int): ProcessWaitChain? {
+
+        val packet = LinuxService.instanceOrNull()?.waitChain(pid, linuxRequestTimeoutMs) ?: return null
+
+        if (!packet.isOk) return null
+
+        val limit = packet.info["limit"]?.trim()?.toIntOrNull() ?: 0
+
+        val entries = ArrayList<ProcessWaitEntry>()
+
+        for (index in 0 until (limit.takeIf { it > 0 } ?: 64)) {
+
+            val line = packet.info["t$index"] ?: break
+
+            val parts = line.split('\t')
+
+            val tid = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: continue
+
+            entries += ProcessWaitEntry(
+                tid = tid,
+                state = parts.getOrNull(1)?.trim()?.firstOrNull() ?: '?',
+                wchan = parts.getOrNull(2)?.trim().orEmpty().ifEmpty { "-" },
+                syscall = parts.getOrNull(3)?.trim().orEmpty().ifEmpty { "-" },
+                comm = parts.getOrNull(4)?.trim().orEmpty()
+            )
+        }
+
+        return ProcessWaitChain(entries = entries, limit = limit)
+    }
+
+    /**
+     * 写一份精简 native 内存转储。
+     *
+     * 落在**共享存储**的 Download 下（`/storage/emulated/<用户 id>/Download/…`），
+     * 用户拔线用文件管理器就能拿到；`Environment.getExternalStorageDirectory()`
+     * 在机主（用户 0）上就是 `/storage/emulated/0`，多用户 / 分身会自动给出对应目录，
+     * 不把 0 写死。
+     *
+     * 后端以 root 身份写同一个路径，所以即使应用自己没拿到 MANAGE_EXTERNAL_STORAGE，
+     * 只要是 root / adb 身份照样能落盘；不是 root 时写不进去，errno（EACCES/EPERM）
+     * 原样回来，页面按统一口径弹「无法完成该操作。拒绝访问。」
+     *
+     * 大小直接用后端回包的 bytes，不靠 `File.length()`：Android 11+ 没拿到
+     * 全盘权限时，应用读别的目录里的文件会被当成 0 字节，那会把成功的转储误报成空文件。
+     */
+    override fun dumpDetailProcessMemory(pid: Int, startTicks: Long): ProcessDumpResult {
+
+        if (pid <= 0 || startTicks < 0L) {
+            return ProcessDumpResult(false, reason = AppStrings.s(R.string.svc_no_start_time))
+        }
+
+        val linux = LinuxService.instanceOrNull()
+            ?: return ProcessDumpResult(false, reason = AppStrings.s(R.string.svc_linux_not_ready))
+
+        // 固定放在共享存储根下的 dump/（不是 Download）：目录由 root 后端在写之前自己建，
+        // 应用这边不去 mkdir，也不去申请存储权限 —— shell / root 模式下不需要。
+        val directory = File(Environment.getExternalStorageDirectory(), DUMP_DIRECTORY_NAME)
+
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
+        val file = File(directory, "taskmanager_${pid}_$stamp.dmp")
+
+        val packet = linux.memoryDump(pid, startTicks, file.absolutePath, LinuxService.MEMORY_DUMP_TIMEOUT_MS)
+
+        if (packet == null) {
+
+            file.delete()
+
+            return ProcessDumpResult(false, reason = AppStrings.s(R.string.svc_linux_no_reply))
+        }
+
+        if (!packet.isOk) {
+
+            file.delete()
+
+            val errno = packet.info["errno"]?.trim()?.toIntOrNull() ?: 1
+
+            return ProcessDumpResult(
+                ok = false,
+                reason = errnoReason(errno),
+                // EACCES / EPERM：写不进共享存储，普通权限模式下 UI 会再申请一次全盘访问后重试
+                permissionDenied = errno == 1 || errno == 13
+            )
+        }
+
+        return ProcessDumpResult(
+            ok = true,
+            path = file.absolutePath,
+            bytes = packet.info["bytes"]?.trim()?.toLongOrNull() ?: 0L,
+            segments = packet.info["segments"]?.trim()?.toIntOrNull() ?: 0
+        )
+    }
+
+    /** 这一行能不能做"动手"的操作：pid > 0 且启动时刻已知。 */
+    override fun detailProcessIsActionable(pid: Int, startTicks: Long): Boolean =
+        pid > 0 && startTicks >= 0L
+
+    /** 查这个包在 Android 侧登记的服务记录（阻塞，UI 必须放后台线程）。 */
+    override fun detailProcessServices(pkg: String): String? =
+        AndroidService.instanceOrNull()?.serviceRecords(pkg)
+
+    /** 把"列布局 + 列宽 + 范围 + 忽略开关"整份写盘（后台线程，几十字节）。 */
     private fun saveDetailViewState() {
 
         val ids = detailVisibleIds.toSet()
         val scope = detailProcessScope
         val ignore = detailIgnoreUpdateSpeed
 
+        val widths = synchronized(detailLock) { detailColumnWidths.toMap() }
+
         detailViewSaveExecutor.execute {
-            DetailViewStore.save(this, ids, scope, ignore)
+            DetailViewStore.save(this, ids, scope, ignore, widths)
         }
     }
 
